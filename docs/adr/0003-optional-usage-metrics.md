@@ -12,8 +12,9 @@ ProviderやCLIによってToken、cached Token、reasoning Token、quota、費�
 ## Decision
 
 UsageMetricsの各値とsourceを任意にし、RunMetrics全体もUsageMetricsなしで保存できる。
-値がある場合は`provider_reported`、`estimated`、`not_available`のsourceで由来を示す。
-コスト計算はPhase 0で実装しない。欠損は0へ変換せず、比較時に欠損として扱う。
+ただし、いずれかの値がある場合は`provider_reported`または`estimated`のsourceで由来を
+示す。`not_available`は全数値が欠損している場合だけ許可する。コスト計算はPhase 0で
+実装しない。欠損は0へ変換せず、比較時に欠損として扱う。
 
 ## Consequences
 
@@ -21,4 +22,3 @@ UsageMetricsの各値とsourceを任意にし、RunMetrics全体もUsageMetrics�
 - Provider報告値と推定値を区別できる。
 - コスト最適化の比較では欠測biasを明示する必要がある。
 - 将来、通貨、価格表version、単位を含む別契約が必要になる可能性がある。
-

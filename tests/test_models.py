@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from agentlab.models import CapabilityReport, ExperimentSpec, RunMetrics, UsageMetrics
+from agentlab.models import CapabilityReport, ExperimentSpec, RunMetrics, RunResult, UsageMetrics
 
 
 def test_valid_experiment_spec_can_be_loaded(
@@ -168,6 +168,73 @@ def test_run_metrics_round_trip_with_null_usage_values() -> None:
     assert restored.usage_metrics is not None
     assert restored.usage_metrics.input_tokens is None
     assert restored.usage_metrics.estimated_api_cost is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "source"),
+    [
+        ("input_tokens", 100, "provider_reported"),
+        ("estimated_api_cost", 1.25, "estimated"),
+    ],
+)
+def test_usage_values_with_available_source_are_valid(
+    field: str,
+    value: int | float,
+    source: str,
+) -> None:
+    metrics = UsageMetrics.model_validate({field: value, "source": source})
+
+    assert getattr(metrics, field) == value
+
+
+def test_usage_value_requires_source() -> None:
+    with pytest.raises(ValidationError, match="require source"):
+        UsageMetrics(input_tokens=100)
+
+
+def test_not_available_source_rejects_usage_values() -> None:
+    with pytest.raises(ValidationError, match="not_available"):
+        UsageMetrics(input_tokens=100, source="not_available")
+
+
+@pytest.mark.parametrize("field", ["estimated_api_cost", "quota_consumption"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_usage_float_values_must_be_finite(field: str, value: float) -> None:
+    with pytest.raises(ValidationError):
+        UsageMetrics.model_validate({field: value, "source": "estimated"})
+
+
+def test_run_result_rejects_timezone_naive_recorded_at() -> None:
+    metrics = RunMetrics(
+        quality_gate_pass=True,
+        acceptance_tests_passed=1,
+        acceptance_tests_total=1,
+        regression_failures=0,
+        lint_errors=0,
+        typecheck_errors=0,
+        agent_duration_ms=1,
+        evaluation_duration_ms=1,
+        total_duration_ms=2,
+        agent_call_count=1,
+        retry_count=0,
+        changed_files=[],
+        added_lines=0,
+        deleted_lines=0,
+    )
+
+    with pytest.raises(ValidationError, match="recorded_at must be timezone-aware"):
+        RunResult(
+            schema_version="1.0",
+            run_id="run-001",
+            experiment_id="workflow-smoke",
+            task_id="smoke-task",
+            workflow="one_shot",
+            provider="replay",
+            repetition_index=0,
+            execution_mode="replay",
+            recorded_at=datetime(2026, 7, 25, 9, 0, 0),
+            metrics=metrics,
+        )
 
 
 def test_execution_mode_has_no_implicit_live_default(

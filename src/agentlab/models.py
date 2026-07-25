@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ContractModel(BaseModel):
@@ -157,30 +157,57 @@ class ExperimentSpec(ContractModel):
 
 
 class UsageMetrics(ContractModel):
-    input_tokens: int | None = Field(default=None, ge=0)
-    cached_input_tokens: int | None = Field(default=None, ge=0)
-    output_tokens: int | None = Field(default=None, ge=0)
-    reasoning_output_tokens: int | None = Field(default=None, ge=0)
-    estimated_api_cost: float | None = Field(default=None, ge=0)
-    quota_consumption: float | None = Field(default=None, ge=0)
+    input_tokens: int | None = Field(default=None, ge=0, strict=True)
+    cached_input_tokens: int | None = Field(default=None, ge=0, strict=True)
+    output_tokens: int | None = Field(default=None, ge=0, strict=True)
+    reasoning_output_tokens: int | None = Field(default=None, ge=0, strict=True)
+    estimated_api_cost: float | None = Field(
+        default=None,
+        ge=0,
+        strict=True,
+        allow_inf_nan=False,
+    )
+    quota_consumption: float | None = Field(
+        default=None,
+        ge=0,
+        strict=True,
+        allow_inf_nan=False,
+    )
     source: UsageMetricSource | None = None
+
+    @model_validator(mode="after")
+    def values_must_have_an_available_source(self) -> UsageMetrics:
+        numeric_values = (
+            self.input_tokens,
+            self.cached_input_tokens,
+            self.output_tokens,
+            self.reasoning_output_tokens,
+            self.estimated_api_cost,
+            self.quota_consumption,
+        )
+        has_value = any(value is not None for value in numeric_values)
+        if has_value and self.source is None:
+            raise ValueError("usage metric values require source")
+        if has_value and self.source is UsageMetricSource.NOT_AVAILABLE:
+            raise ValueError("source not_available requires all usage metric values to be null")
+        return self
 
 
 class RunMetrics(ContractModel):
-    quality_gate_pass: bool
-    acceptance_tests_passed: int = Field(ge=0)
-    acceptance_tests_total: int = Field(ge=0)
-    regression_failures: int = Field(ge=0)
-    lint_errors: int = Field(ge=0)
-    typecheck_errors: int = Field(ge=0)
-    agent_duration_ms: int = Field(ge=0)
-    evaluation_duration_ms: int = Field(ge=0)
-    total_duration_ms: int = Field(ge=0)
-    agent_call_count: int = Field(ge=0)
-    retry_count: int = Field(ge=0)
+    quality_gate_pass: bool = Field(strict=True)
+    acceptance_tests_passed: int = Field(ge=0, strict=True)
+    acceptance_tests_total: int = Field(ge=0, strict=True)
+    regression_failures: int = Field(ge=0, strict=True)
+    lint_errors: int = Field(ge=0, strict=True)
+    typecheck_errors: int = Field(ge=0, strict=True)
+    agent_duration_ms: int = Field(ge=0, strict=True)
+    evaluation_duration_ms: int = Field(ge=0, strict=True)
+    total_duration_ms: int = Field(ge=0, strict=True)
+    agent_call_count: int = Field(ge=0, strict=True)
+    retry_count: int = Field(ge=0, strict=True)
     changed_files: list[str]
-    added_lines: int = Field(ge=0)
-    deleted_lines: int = Field(ge=0)
+    added_lines: int = Field(ge=0, strict=True)
+    deleted_lines: int = Field(ge=0, strict=True)
     usage_metrics: UsageMetrics | None = None
 
     @model_validator(mode="after")
@@ -194,8 +221,20 @@ class RunResult(ContractModel):
     schema_version: Literal["1.0"]
     run_id: str = Field(min_length=1)
     experiment_id: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
+    workflow: Workflow
+    provider: Provider
+    repetition_index: int = Field(ge=0)
+    execution_mode: ExecutionMode
     recorded_at: datetime
     metrics: RunMetrics
+
+    @field_validator("recorded_at")
+    @classmethod
+    def recorded_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("recorded_at must be timezone-aware")
+        return value
 
 
 class CapabilityReport(ContractModel):

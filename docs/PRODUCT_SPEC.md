@@ -23,7 +23,8 @@ AIコーディングエージェントの評価は、課題や品質Gateだけ�
 4. 実験Spec、実行証跡、評価結果を紐付け、意思決定の根拠を再確認する。
 5. 検証済みの知見を標準手順へ反映する。
 
-Phase 0ではSpec検証とローカルCLI能力確認だけを実行できる。
+Phase 1ではSpec検証、ローカルCLI能力確認、および保存済み合成RecordingのReplayだけを
+実行できる。
 
 ## 機能要件
 
@@ -35,17 +36,30 @@ Phase 0ではSpec検証とローカルCLI能力確認だけを実行できる。
 - Replay/Liveの設定は実行モードと一致し、Liveは
   `require_explicit_confirmation: true`の明示入力を必須とする。
 - RunMetricsは品質、時間、呼出回数、変更量を表現する。
-- UsageMetricsは欠損可能で、欠損しても結果を保存できる。
+- UsageMetricsは欠損可能で、欠損しても結果を保存できる。値がある場合はsourceを必須と
+  し、`not_available`と数値の併存を拒否する。
 - `agentlab validate` はYAMLを検証し、失敗理由と非0終了コードを返す。
 - `agentlab doctor` はCodex/Antigravity CLIを読み取り専用で調査し、人間向けまたは
   JSONでCapabilityReportを返す。
 - commandが利用不可の場合、CapabilityReportは実行path、version、supported能力を
   報告済みとして扱わない。
 
+### Phase 1
+
+- UTF-8 JSONL Recordingは`run_started`と`run_completed`を各1件だけ保持する。
+- Recording loaderはschema、未知field、型、重複key、有限数、sequence、ID、時刻順を
+  厳密に検証する。
+- ReplayはSpecとRecordingのtask、workflow、provider、反復を照合する。
+- RunResultはRecordingの完了時刻と保存済みMetricsから決定論的に生成する。
+- 相対的なRecording pathはExperimentSpecファイルの親directoryを基準にする。
+- Resultは完成済み一時fileからatomicに公開する。通常時は既存fileを置換せず、
+  `--force`時だけreplaceする。SpecとRecordingは常に上書き対象外とする。
+- Replayは外部AI、network、外部CLI、品質Gateコマンドを呼び出さない。
+
 ### 将来要件
 
-- Replay Provider、隔離Runner、品質Gate実行、証跡保存、Live Provider、集計と比較
-  レポートを段階的に追加する。実装順はROADMAPに従う。
+- 隔離Runner、品質Gate実行、証跡保存、Live Provider、集計と比較レポートを段階的に
+  追加する。実装順はROADMAPに従う。
 
 ## 非機能要件
 
@@ -60,13 +74,14 @@ Phase 0ではSpec検証とローカルCLI能力確認だけを実行できる。
 
 ## Non-goals
 
-Phase 0では以下を実装しない。
+Phase 1では以下を実装しない。
 
 - Codex/AntigravityのLive課題実行、OpenAI/Gemini API
-- Replayや品質Gateの実行、Docker、Git worktree
+- 品質Gateの実行、Docker、Git worktree
 - Java/Python/React Task Fixture、LLM Judge、コスト計算、比較レポート
 - GitHub ActionsからのLive実行、独立レビューエージェント
 - 一般的なモデル能力ランキング
+- 複数task、複数treatment、複数反復のscheduler
 
 ## 成功条件
 
@@ -76,3 +91,4 @@ Phase 0では以下を実装しない。
 - Capability Matrixは実測事実と`not_verified`を分離する。
 - Provider境界、Record/Replay、任意Usage指標の意思決定がADRに残る。
 - READMEが実装済み範囲と未実装範囲を正確に表す。
+- 合成Recordingから同一内容・同一byte列のRunResultを外部呼出しなしで生成できる。

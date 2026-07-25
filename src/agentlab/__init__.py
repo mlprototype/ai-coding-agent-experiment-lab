@@ -7,14 +7,17 @@ from agentlab.models import (
     RunResult,
     UsageMetrics,
 )
+from agentlab.recording import ReplayRecording, RunCompletedEvent, RunStartedEvent
 
 __all__ = [
     "CapabilityReport",
     "ExperimentSpec",
+    "ReplayRecording",
+    "RunCompletedEvent",
     "RunMetrics",
     "RunResult",
+    "RunStartedEvent",
     "UsageMetrics",
 ]
 
 __version__ = "0.1.0"
-
