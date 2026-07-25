@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, NoReturn
 
 from pydantic import Field, ValidationError, field_validator
 
@@ -25,14 +25,14 @@ def _timezone_aware(value: datetime, field_name: str) -> datetime:
 
 class RunStartedEvent(ContractModel):
     schema_version: Literal["1.0"]
-    sequence: int = Field(ge=0)
+    sequence: int = Field(ge=0, strict=True)
     event_type: Literal["run_started"]
     run_id: str = Field(min_length=1)
     experiment_id: str = Field(min_length=1)
     task_id: str = Field(min_length=1)
     workflow: Workflow
     provider: Provider
-    repetition_index: int
+    repetition_index: int = Field(strict=True)
     occurred_at: datetime
 
     @field_validator("occurred_at")
@@ -43,7 +43,7 @@ class RunStartedEvent(ContractModel):
 
 class RunCompletedEvent(ContractModel):
     schema_version: Literal["1.0"]
-    sequence: int = Field(ge=0)
+    sequence: int = Field(ge=0, strict=True)
     event_type: Literal["run_completed"]
     run_id: str = Field(min_length=1)
     experiment_id: str = Field(min_length=1)
@@ -67,12 +67,47 @@ class ReplayRecording:
     completed: RunCompletedEvent
 
 
+class _DuplicateKeyError(ValueError):
+    def __init__(self, key: str) -> None:
+        super().__init__(key)
+        self.key = key
+
+
+class _NonFiniteNumberError(ValueError):
+    pass
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateKeyError(key)
+        result[key] = value
+    return result
+
+
+def _reject_non_finite_number(value: str) -> NoReturn:
+    raise _NonFiniteNumberError(value)
+
+
 def _parse_event(path: Path, line_number: int, line: str) -> RecordingEvent:
     try:
-        raw = json.loads(line)
+        raw = json.loads(
+            line,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_non_finite_number,
+        )
     except json.JSONDecodeError as error:
         raise RecordingLoadError(
             f"{path}: JSONL line {line_number}: invalid JSON: {error.msg}"
+        ) from error
+    except _DuplicateKeyError as error:
+        raise RecordingLoadError(
+            f"{path}: JSONL line {line_number}: duplicate JSON key {error.key!r}"
+        ) from error
+    except _NonFiniteNumberError as error:
+        raise RecordingLoadError(
+            f"{path}: JSONL line {line_number}: non-finite JSON number {error}"
         ) from error
 
     if not isinstance(raw, dict):

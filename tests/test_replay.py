@@ -8,7 +8,13 @@ from typing import Any
 import pytest
 import yaml
 
-from agentlab.models import ExecutionMode, ExperimentSpec, RunResult, Workflow
+from agentlab.models import (
+    ExecutionMode,
+    ExperimentSpec,
+    RunResult,
+    UsageMetricSource,
+    Workflow,
+)
 from agentlab.recording import ReplayRecording, load_replay_recording
 from agentlab.replay import (
     ReplayError,
@@ -115,6 +121,57 @@ def test_existing_output_is_not_overwritten_without_force(tmp_path: Path) -> Non
     assert output_path.read_text(encoding="utf-8") == "original"
 
 
+@pytest.mark.parametrize("force", [False, True])
+def test_output_must_not_be_the_experiment_spec(tmp_path: Path, force: bool) -> None:
+    spec_path = _write_case(tmp_path)
+    original_bytes = spec_path.read_bytes()
+
+    with pytest.raises(ReplayError, match="ExperimentSpec"):
+        run_replay(spec_path, spec_path, force=force)
+
+    assert spec_path.read_bytes() == original_bytes
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_output_must_not_be_the_recording(tmp_path: Path, force: bool) -> None:
+    spec_path = _write_case(tmp_path)
+    recording_path = spec_path.parent / "recordings" / "input.jsonl"
+    original_bytes = recording_path.read_bytes()
+
+    with pytest.raises(ReplayError, match="Replay Recording"):
+        run_replay(spec_path, recording_path, force=force)
+
+    assert recording_path.read_bytes() == original_bytes
+
+
+def test_output_must_not_alias_spec_through_dotdot(tmp_path: Path) -> None:
+    spec_path = _write_case(tmp_path)
+    alias_path = spec_path.parent / "recordings" / ".." / spec_path.name
+
+    with pytest.raises(ReplayError, match="ExperimentSpec"):
+        run_replay(spec_path, alias_path, force=True)
+
+
+def test_output_symlink_must_not_alias_recording(tmp_path: Path) -> None:
+    spec_path = _write_case(tmp_path)
+    recording_path = spec_path.parent / "recordings" / "input.jsonl"
+    alias_path = tmp_path / "recording-alias.json"
+    alias_path.symlink_to(recording_path)
+
+    with pytest.raises(ReplayError, match="Replay Recording"):
+        run_replay(spec_path, alias_path, force=True)
+
+
+def test_output_hard_link_must_not_alias_recording(tmp_path: Path) -> None:
+    spec_path = _write_case(tmp_path)
+    recording_path = spec_path.parent / "recordings" / "input.jsonl"
+    alias_path = tmp_path / "recording-hard-link.json"
+    alias_path.hardlink_to(recording_path)
+
+    with pytest.raises(ReplayError, match="Replay Recording"):
+        run_replay(spec_path, alias_path, force=True)
+
+
 def test_write_failure_removes_temporary_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -134,6 +191,73 @@ def test_write_failure_removes_temporary_file(
 
     assert not failing_output.exists()
     assert list(failing_output.parent.iterdir()) == []
+
+
+def test_link_failure_removes_temporary_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path = _write_case(tmp_path)
+    initial_output = tmp_path / "initial.json"
+    result = run_replay(spec_path, initial_output)
+    failing_output = tmp_path / "link-failure" / "result.json"
+
+    def fail_link(_source: Path, _destination: Path) -> None:
+        raise OSError("link failed")
+
+    monkeypatch.setattr("agentlab.replay.os.link", fail_link)
+
+    with pytest.raises(ReplayError, match="link failed"):
+        write_run_result(result, failing_output)
+
+    assert not failing_output.exists()
+    assert list(failing_output.parent.iterdir()) == []
+
+
+def test_fsync_failure_removes_temporary_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path = _write_case(tmp_path)
+    initial_output = tmp_path / "initial.json"
+    result = run_replay(spec_path, initial_output)
+    failing_output = tmp_path / "fsync-failure" / "result.json"
+
+    def fail_fsync(_file_descriptor: int) -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr("agentlab.replay.os.fsync", fail_fsync)
+
+    with pytest.raises(ReplayError, match="fsync failed"):
+        write_run_result(result, failing_output)
+
+    assert not failing_output.exists()
+    assert list(failing_output.parent.iterdir()) == []
+
+
+def test_result_writer_rejects_non_finite_json(
+    tmp_path: Path,
+) -> None:
+    spec_path = _write_case(tmp_path)
+    initial_output = tmp_path / "initial.json"
+    result = run_replay(spec_path, initial_output)
+    usage = result.metrics.usage_metrics
+    assert usage is not None
+    invalid_usage = usage.model_copy(
+        update={
+            "estimated_api_cost": float("inf"),
+            "source": UsageMetricSource.ESTIMATED,
+        }
+    )
+    invalid_metrics = result.metrics.model_copy(update={"usage_metrics": invalid_usage})
+    invalid_result = result.model_copy(update={"metrics": invalid_metrics})
+    output_path = tmp_path / "non-finite" / "result.json"
+
+    with pytest.raises(ReplayError, match="non-finite JSON number"):
+        write_run_result(invalid_result, output_path)
+
+    assert not output_path.exists()
+    assert list(output_path.parent.iterdir()) == []
 
 
 def test_output_directory_failure_is_reported(

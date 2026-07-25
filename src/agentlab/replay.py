@@ -49,6 +49,34 @@ def resolve_recording_path(spec_path: Path, recording_path: str) -> Path:
     return spec_path.parent / configured_path
 
 
+def _paths_refer_to_same_file(first: Path, second: Path) -> bool:
+    try:
+        if first.resolve(strict=False) == second.resolve(strict=False):
+            return True
+    except (OSError, RuntimeError):
+        pass
+
+    try:
+        return first.samefile(second)
+    except OSError:
+        return False
+
+
+def protect_replay_inputs(
+    output_path: Path,
+    spec_path: Path,
+    recording_path: Path,
+) -> None:
+    for input_name, input_path in (
+        ("ExperimentSpec", spec_path),
+        ("Replay Recording", recording_path),
+    ):
+        if _paths_refer_to_same_file(output_path, input_path):
+            raise ReplayError(
+                f"output must not overwrite or alias the input {input_name}: {input_path}"
+            )
+
+
 def validate_recording_against_spec(
     spec: ExperimentSpec,
     recording: ReplayRecording,
@@ -97,12 +125,16 @@ def validate_recording_against_spec(
 
 
 def _deterministic_json(result: RunResult) -> bytes:
-    payload = json.dumps(
-        result.model_dump(mode="json"),
-        ensure_ascii=False,
-        indent=2,
-        sort_keys=True,
-    )
+    try:
+        payload = json.dumps(
+            result.model_dump(mode="json"),
+            allow_nan=False,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    except ValueError as error:
+        raise ReplayError(f"result contains a non-finite JSON number: {error}") from error
     return f"{payload}\n".encode()
 
 
@@ -165,6 +197,7 @@ def run_replay(
         raise ReplayError("replay settings are required")
 
     recording_path = resolve_recording_path(spec_path, spec.replay.recording_path)
+    protect_replay_inputs(output_path, spec_path, recording_path)
     recording = load_replay_recording(recording_path)
     validate_recording_against_spec(spec, recording)
     result = (provider or ReplayProvider()).create_result(recording)

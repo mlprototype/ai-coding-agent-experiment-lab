@@ -14,6 +14,8 @@
 - Phase 1 Replayから外部AI、network、subprocess、品質Gateコマンドを呼び出さない。
 - 相対的なRecording pathはExperimentSpecファイルの親directoryを基準に解決する。
 - 合成RecordingをProvider性能の実験結果として扱わない。
+- `--force`でも入力SpecやRecording、そのsymlink/hard linkを上書きしない。
+- Recordingでは型強制、重複JSON key、非有限数を許可しない。
 - Live実行を追加する場合は明示的opt-in、Record、redaction、timeout、停止条件を必須に
   する。
 - 外部コマンドは引数配列で起動し、`shell=True`を使用しない。

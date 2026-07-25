@@ -48,6 +48,7 @@ uv run mypy src
 `doctor` はローカルコマンドの存在、バージョン、helpだけを確認します。ログイン、API呼び
 出し、AIタスク実行はしません。`replay`も外部処理を実行せず、Specファイルからの相対
 pathでRecordingを読みます。既存Resultを明示的に置換する場合だけ`--force`を指定します。
+`--force`でも入力元のExperimentSpecやRecording、そのsymlink/hard linkは置換できません。
 
 サンプルRecordingはReplay pipelineを検証するための合成fixtureです。Provider性能の
 実験結果ではありません。形式と検証規則は

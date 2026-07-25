@@ -36,7 +36,8 @@ Phase 1ではSpec検証、ローカルCLI能力確認、および保存済み合
 - Replay/Liveの設定は実行モードと一致し、Liveは
   `require_explicit_confirmation: true`の明示入力を必須とする。
 - RunMetricsは品質、時間、呼出回数、変更量を表現する。
-- UsageMetricsは欠損可能で、欠損しても結果を保存できる。
+- UsageMetricsは欠損可能で、欠損しても結果を保存できる。値がある場合はsourceを必須と
+  し、`not_available`と数値の併存を拒否する。
 - `agentlab validate` はYAMLを検証し、失敗理由と非0終了コードを返す。
 - `agentlab doctor` はCodex/Antigravity CLIを読み取り専用で調査し、人間向けまたは
   JSONでCapabilityReportを返す。
@@ -46,11 +47,13 @@ Phase 1ではSpec検証、ローカルCLI能力確認、および保存済み合
 ### Phase 1
 
 - UTF-8 JSONL Recordingは`run_started`と`run_completed`を各1件だけ保持する。
-- Recording loaderはschema、未知field、sequence、ID、時刻順を厳密に検証する。
+- Recording loaderはschema、未知field、型、重複key、有限数、sequence、ID、時刻順を
+  厳密に検証する。
 - ReplayはSpecとRecordingのtask、workflow、provider、反復を照合する。
 - RunResultはRecordingの完了時刻と保存済みMetricsから決定論的に生成する。
 - 相対的なRecording pathはExperimentSpecファイルの親directoryを基準にする。
-- Resultは既存fileを暗黙に上書きせず、一時fileとatomic replaceで保存する。
+- Resultは完成済み一時fileからatomicに公開する。通常時は既存fileを置換せず、
+  `--force`時だけreplaceする。SpecとRecordingは常に上書き対象外とする。
 - Replayは外部AI、network、外部CLI、品質Gateコマンドを呼び出さない。
 
 ### 将来要件

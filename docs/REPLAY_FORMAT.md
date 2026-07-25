@@ -4,7 +4,9 @@
 
 Phase 1のReplay Recordingは、外部AIや品質Gateを再実行せず、保存済みMetricsから1件の
 RunResultを再構成するためのUTF-8 JSONL契約である。1行が1個のJSON objectで、空行は
-許可しない。各eventは`extra="forbid"`で未知fieldを拒否する。
+許可しない。各eventは`extra="forbid"`で未知fieldを拒否する。重複JSON key、`NaN`、
+`Infinity`、`-Infinity`を拒否し、integerとboolean fieldの文字列・boolean等からの
+暗黙変換を行わない。
 
 Phase 1で扱うeventは`run_started`と`run_completed`の2件だけである。途中event、tool
 call、stdout/stderr、diff、EvidenceはPhase 1の契約に含めない。
@@ -36,7 +38,9 @@ call、stdout/stderr、diff、EvidenceはPhase 1の契約に含めない。
 | `occurred_at` | timezone-aware datetime | 開始時刻以後の完了時刻 |
 | `metrics` | `RunMetrics` | 保存済みの評価値 |
 
-UsageMetricsの各値は`null`でもよい。欠損を0へ変換しない。
+UsageMetricsの各値は`null`でもよく、欠損を0へ変換しない。いずれかの数値が存在する
+場合は`source`を必須とする。`source: not_available`の場合はすべての数値を`null`に
+限定する。float値は有限かつ非負とする。
 
 ## Recording不変条件
 
@@ -45,7 +49,8 @@ UsageMetricsの各値は`null`でもよい。欠損を0へ変換しない。
 - 両eventの`run_id`と`experiment_id`は一致する。
 - 完了時刻は開始時刻より前でなく、両時刻はtimezone-awareとする。
 - JSON構文エラーはRecording pathとJSONL行番号を伴うエラーにする。
-- 不正UTF-8、JSON object以外、未知field、未対応schema/eventを拒否する。
+- 不正UTF-8、JSON object以外、未知field、未対応schema/event、型不一致、重複key、
+  非有限数を拒否する。
 
 破損またはschema不一致のRecordingからResultを生成せず、出力fileも作成しない。
 
@@ -71,7 +76,10 @@ SpecとRecordingから同じbyte列を生成する。
 
 既存Resultはデフォルトで上書きせず、明示的な`--force`を要求する。保存には同じdirectory
 の完成済み一時fileを使い、通常保存は既存fileを置換しないatomic link、`--force`時は
-`os.replace`を使用する。失敗時は一時fileを除去する。
+`os.replace`を使用する。出力JSONでも非有限数を許可しない。失敗時は一時fileを除去する。
+
+ExperimentSpecとReplay Recordingは入力証跡であり、`--force`でも出力先に指定できない。
+`..`や絶対/相対pathの違いだけでなく、symlinkとhard linkによる同一fileも拒否する。
 
 サンプルRecordingはpipeline確認用の合成fixtureであり、Provider性能を示す実験結果では
 ない。

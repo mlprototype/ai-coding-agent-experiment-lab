@@ -170,6 +170,40 @@ def test_run_metrics_round_trip_with_null_usage_values() -> None:
     assert restored.usage_metrics.estimated_api_cost is None
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "source"),
+    [
+        ("input_tokens", 100, "provider_reported"),
+        ("estimated_api_cost", 1.25, "estimated"),
+    ],
+)
+def test_usage_values_with_available_source_are_valid(
+    field: str,
+    value: int | float,
+    source: str,
+) -> None:
+    metrics = UsageMetrics.model_validate({field: value, "source": source})
+
+    assert getattr(metrics, field) == value
+
+
+def test_usage_value_requires_source() -> None:
+    with pytest.raises(ValidationError, match="require source"):
+        UsageMetrics(input_tokens=100)
+
+
+def test_not_available_source_rejects_usage_values() -> None:
+    with pytest.raises(ValidationError, match="not_available"):
+        UsageMetrics(input_tokens=100, source="not_available")
+
+
+@pytest.mark.parametrize("field", ["estimated_api_cost", "quota_consumption"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_usage_float_values_must_be_finite(field: str, value: float) -> None:
+    with pytest.raises(ValidationError):
+        UsageMetrics.model_validate({field: value, "source": "estimated"})
+
+
 def test_run_result_rejects_timezone_naive_recorded_at() -> None:
     metrics = RunMetrics(
         quality_gate_pass=True,

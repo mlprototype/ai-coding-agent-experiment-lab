@@ -103,6 +103,28 @@ def test_rejects_invalid_utf8(tmp_path: Path) -> None:
         load_replay_recording(path)
 
 
+def test_reports_missing_recording_file(tmp_path: Path) -> None:
+    path = tmp_path / "missing.jsonl"
+
+    with pytest.raises(RecordingLoadError, match="could not read"):
+        load_replay_recording(path)
+
+
+def test_reports_recording_read_oserror(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.jsonl"
+
+    def fail_read(_path: Path) -> bytes:
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read)
+
+    with pytest.raises(RecordingLoadError, match="permission denied"):
+        load_replay_recording(path)
+
+
 def test_rejects_empty_jsonl_line(tmp_path: Path) -> None:
     path = tmp_path / "empty-line.jsonl"
     events = _events()
@@ -141,6 +163,103 @@ def test_rejects_unknown_event_field(tmp_path: Path) -> None:
     _write_events(path, events)
 
     with pytest.raises(RecordingLoadError, match="future_field"):
+        load_replay_recording(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("sequence", "0"),
+        ("repetition_index", True),
+        ("quality_gate_pass", "false"),
+        ("acceptance_tests_total", "1"),
+    ],
+)
+def test_rejects_implicitly_coercible_field_types(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    path = tmp_path / "wrong-type.jsonl"
+    events = _events()
+    if field in events[0]:
+        events[0][field] = value
+    else:
+        events[1]["metrics"][field] = value
+    _write_events(path, events)
+
+    with pytest.raises(RecordingLoadError, match=field):
+        load_replay_recording(path)
+
+
+def test_rejects_duplicate_json_key(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate-key.jsonl"
+    events = _events()
+    started_line = json.dumps(events[0]).replace(
+        '"sequence": 0',
+        '"sequence": 0, "sequence": 1',
+        1,
+    )
+    path.write_text(
+        f"{started_line}\n{json.dumps(events[1])}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RecordingLoadError, match=r"duplicate JSON key.*sequence"):
+        load_replay_recording(path)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_rejects_non_finite_json_constants(tmp_path: Path, value: float) -> None:
+    path = tmp_path / "non-finite.jsonl"
+    events = _events()
+    events[1]["metrics"]["usage_metrics"].update(
+        estimated_api_cost=value,
+        source="estimated",
+    )
+    _write_events(path, events)
+
+    with pytest.raises(RecordingLoadError, match="non-finite JSON number"):
+        load_replay_recording(path)
+
+
+def test_rejects_overflowing_finite_number_literal(tmp_path: Path) -> None:
+    path = tmp_path / "overflow.jsonl"
+    events = _events()
+    completed_line = json.dumps(events[1]).replace(
+        '"estimated_api_cost": null',
+        '"estimated_api_cost": 1e400',
+        1,
+    ).replace('"source": null', '"source": "estimated"', 1)
+    path.write_text(
+        f"{json.dumps(events[0])}\n{completed_line}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RecordingLoadError, match="estimated_api_cost"):
+        load_replay_recording(path)
+
+
+def test_rejects_usage_value_without_source(tmp_path: Path) -> None:
+    path = tmp_path / "missing-source.jsonl"
+    events = _events()
+    events[1]["metrics"]["usage_metrics"]["input_tokens"] = 100
+    _write_events(path, events)
+
+    with pytest.raises(RecordingLoadError, match="require source"):
+        load_replay_recording(path)
+
+
+def test_rejects_usage_value_with_not_available_source(tmp_path: Path) -> None:
+    path = tmp_path / "not-available.jsonl"
+    events = _events()
+    events[1]["metrics"]["usage_metrics"].update(
+        input_tokens=100,
+        source="not_available",
+    )
+    _write_events(path, events)
+
+    with pytest.raises(RecordingLoadError, match="not_available"):
         load_replay_recording(path)
 
 
@@ -249,4 +368,3 @@ def test_rejects_timezone_naive_datetime(tmp_path: Path, event_index: int) -> No
 
     with pytest.raises(RecordingLoadError, match="timezone-aware"):
         load_replay_recording(path)
-
