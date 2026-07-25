@@ -4,9 +4,19 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 
 class ContractModel(BaseModel):
@@ -42,13 +52,54 @@ class UsageMetricSource(StrEnum):
     NOT_AVAILABLE = "not_available"
 
 
-class QualityGate(ContractModel):
-    """Commands that a later runner will execute; Phase 0 only validates them."""
+class GateKind(StrEnum):
+    ACCEPTANCE = "acceptance"
+    REGRESSION = "regression"
+    LINT = "lint"
+    TYPECHECK = "typecheck"
 
-    acceptance: list[list[str]] = Field(min_length=1)
-    regression: list[list[str]] = Field(default_factory=list)
-    lint: list[list[str]] = Field(default_factory=list)
-    typecheck: list[list[str]] = Field(default_factory=list)
+
+class CommandStatus(StrEnum):
+    PASSED = "passed"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+    SIGNAL_TERMINATED = "signal_terminated"
+    SPAWN_ERROR = "spawn_error"
+    COLLECTION_ERROR = "collection_error"
+
+
+class TerminationReason(StrEnum):
+    NONE = "none"
+    TIMEOUT = "timeout"
+    RESIDUAL_PROCESS = "residual_process"
+    EMERGENCY_CLEANUP = "emergency_cleanup"
+
+
+class EvidenceOverallStatus(StrEnum):
+    PASSED = "passed"
+    FAILED = "failed"
+    HARNESS_ERROR = "harness_error"
+
+
+class FailureKind(StrEnum):
+    NONE = "none"
+    QUALITY_GATE_FAILURE = "quality_gate_failure"
+    TIMEOUT = "timeout"
+    SIGNAL_TERMINATION = "signal_termination"
+    COMMAND_UNAVAILABLE = "command_unavailable"
+    SPAWN_ERROR = "spawn_error"
+    PROCESS_CLEANUP_ERROR = "process_cleanup_error"
+    EVIDENCE_ERROR = "evidence_error"
+    UNSUPPORTED_PLATFORM = "unsupported_platform"
+
+
+class QualityGate(ContractModel):
+    """The only argv sequences that the local quality-gate runner may execute."""
+
+    acceptance: list[list[StrictStr]] = Field(min_length=1)
+    regression: list[list[StrictStr]] = Field(default_factory=list)
+    lint: list[list[StrictStr]] = Field(default_factory=list)
+    typecheck: list[list[StrictStr]] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def commands_must_have_argv(self) -> QualityGate:
@@ -80,6 +131,36 @@ class LiveSettings(ContractModel):
     require_explicit_confirmation: Literal[True]
 
 
+class RunnerSettings(ContractModel):
+    """Bounded settings for the trusted-fixture Phase 2 local runner."""
+
+    fixture_path: StrictStr = Field(min_length=1)
+    command_timeout_ms: StrictInt = Field(gt=0, le=600_000)
+    termination_grace_ms: StrictInt = Field(gt=0, le=60_000)
+    max_output_bytes: StrictInt = Field(gt=0, le=16 * 1024 * 1024)
+    max_diff_bytes: StrictInt = Field(gt=0, le=64 * 1024 * 1024)
+
+    @field_validator("fixture_path")
+    @classmethod
+    def fixture_path_must_be_bounded_relative_posix_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("fixture_path must not be empty")
+        if "\x00" in value:
+            raise ValueError("fixture_path must not contain NUL")
+        if "\\" in value:
+            raise ValueError("fixture_path must use POSIX separators")
+
+        posix_path = PurePosixPath(value)
+        windows_path = PureWindowsPath(value)
+        if posix_path.is_absolute() or windows_path.is_absolute() or windows_path.drive:
+            raise ValueError("fixture_path must be relative")
+        if value in {".", "./"}:
+            raise ValueError("fixture_path must name a fixture directory")
+        if ".." in posix_path.parts:
+            raise ValueError("fixture_path must not contain parent-directory references")
+        return value
+
+
 class ExperimentSpec(ContractModel):
     """A single-axis experiment definition.
 
@@ -109,6 +190,7 @@ class ExperimentSpec(ContractModel):
 
     replay: ReplaySettings | None = None
     live: LiveSettings | None = None
+    runner: RunnerSettings | None = None
 
     @model_validator(mode="after")
     def enforce_single_axis_and_execution_mode(self) -> ExperimentSpec:
@@ -214,6 +296,298 @@ class RunMetrics(ContractModel):
     def passed_tests_cannot_exceed_total(self) -> RunMetrics:
         if self.acceptance_tests_passed > self.acceptance_tests_total:
             raise ValueError("acceptance_tests_passed must not exceed acceptance_tests_total")
+        return self
+
+
+class TerminationEvidence(ContractModel):
+    reason: TerminationReason
+    sigterm_sent: StrictBool
+    sigkill_sent: StrictBool
+    process_group_cleared: StrictBool
+    error: StrictStr | None = None
+
+    @model_validator(mode="after")
+    def signal_and_cleanup_state_must_be_consistent(self) -> TerminationEvidence:
+        if self.sigkill_sent and not self.sigterm_sent:
+            raise ValueError("sigkill_sent requires sigterm_sent")
+        if self.reason is TerminationReason.NONE:
+            if self.sigterm_sent or self.sigkill_sent:
+                raise ValueError("termination reason none must not contain sent signals")
+            if not self.process_group_cleared:
+                raise ValueError("termination reason none requires a cleared process group")
+        if self.process_group_cleared and self.error is not None:
+            raise ValueError("cleared process group must not contain a cleanup error")
+        if not self.process_group_cleared and self.error is None:
+            raise ValueError("uncleared process group requires a cleanup error")
+        return self
+
+
+class CommandEvidence(ContractModel):
+    gate: GateKind
+    command_index: StrictInt = Field(ge=0)
+    argv: list[StrictStr] = Field(min_length=1)
+    status: CommandStatus
+    return_code: StrictInt | None
+    started_at: datetime
+    completed_at: datetime
+    duration_ms: StrictInt = Field(ge=0)
+    stdout: StrictStr
+    stderr: StrictStr
+    stdout_truncated: StrictBool
+    stderr_truncated: StrictBool
+    stdout_decode_replaced: StrictBool
+    stderr_decode_replaced: StrictBool
+    termination: TerminationEvidence
+    error: StrictStr | None = None
+
+    @field_validator("started_at", "completed_at", mode="before")
+    @classmethod
+    def timestamps_must_use_datetime_or_iso_string(cls, value: object) -> object:
+        if not isinstance(value, (str, datetime)):
+            raise ValueError("command timestamps must be ISO strings or datetime values")
+        return value
+
+    @field_validator("started_at", "completed_at")
+    @classmethod
+    def timestamps_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("command timestamps must be timezone-aware")
+        return value
+
+    @model_validator(mode="after")
+    def status_must_match_return_code(self) -> CommandEvidence:
+        if self.completed_at < self.started_at:
+            raise ValueError("completed_at must not be before started_at")
+        if self.status is CommandStatus.PASSED and self.return_code != 0:
+            raise ValueError("passed command must have return_code 0")
+        if self.status is CommandStatus.FAILED and (
+            self.return_code is None or self.return_code <= 0
+        ):
+            raise ValueError("failed command must have a positive non-zero return_code")
+        if self.status is CommandStatus.SIGNAL_TERMINATED and (
+            self.return_code is None or self.return_code >= 0
+        ):
+            raise ValueError("signal_terminated command must have a negative return_code")
+        if self.status is CommandStatus.SPAWN_ERROR:
+            if self.return_code is not None:
+                raise ValueError("spawn_error command must not have a return_code")
+            if self.error is None:
+                raise ValueError("spawn_error command requires an error reason")
+        if self.status is CommandStatus.COLLECTION_ERROR and self.error is None:
+            raise ValueError("collection_error command requires an error reason")
+        if (
+            self.status not in {CommandStatus.SPAWN_ERROR, CommandStatus.COLLECTION_ERROR}
+            and self.error is not None
+        ):
+            raise ValueError("only spawn_error or collection_error may contain an error")
+        if self.status is CommandStatus.TIMED_OUT:
+            if self.termination.reason is not TerminationReason.TIMEOUT:
+                raise ValueError("timed_out command requires termination reason timeout")
+        elif (
+            self.status is not CommandStatus.COLLECTION_ERROR
+            and self.termination.reason is TerminationReason.TIMEOUT
+        ):
+            raise ValueError("termination reason timeout requires timed_out status")
+        if (
+            self.status in {CommandStatus.PASSED, CommandStatus.FAILED}
+            and self.termination.reason
+            not in {TerminationReason.NONE, TerminationReason.RESIDUAL_PROCESS}
+        ):
+            raise ValueError("normally completed command has an invalid termination reason")
+        if (
+            self.status is CommandStatus.SPAWN_ERROR
+            and self.termination.reason is not TerminationReason.NONE
+        ):
+            raise ValueError("spawn_error command must not contain process termination")
+        return self
+
+
+class DiffEvidence(ContractModel):
+    changed_files: list[StrictStr]
+    binary_files: list[StrictStr]
+    added_lines: StrictInt | None = Field(default=None, ge=0)
+    deleted_lines: StrictInt | None = Field(default=None, ge=0)
+    unified_diff: StrictStr
+    diff_truncated: StrictBool
+    line_counts_complete: StrictBool
+    collection_error: StrictStr | None = None
+
+    @model_validator(mode="after")
+    def complete_line_counts_must_have_values(self) -> DiffEvidence:
+        if self.changed_files != sorted(set(self.changed_files)):
+            raise ValueError("changed_files must be unique and sorted")
+        if self.binary_files != sorted(set(self.binary_files)):
+            raise ValueError("binary_files must be unique and sorted")
+        if not set(self.binary_files).issubset(self.changed_files):
+            raise ValueError("binary_files must be a subset of changed_files")
+        if self.binary_files and self.line_counts_complete:
+            raise ValueError("binary file changes require incomplete line counts")
+        if self.line_counts_complete:
+            if self.added_lines is None or self.deleted_lines is None:
+                raise ValueError("complete line counts require added_lines and deleted_lines")
+            if self.collection_error is not None:
+                raise ValueError("complete diff must not have a collection_error")
+        elif self.added_lines is not None or self.deleted_lines is not None:
+            raise ValueError("incomplete line counts must not contain estimated values")
+        return self
+
+
+class EvidenceArtifact(ContractModel):
+    schema_version: Literal["1.0"]
+    run_id: StrictStr = Field(min_length=1)
+    experiment_id: StrictStr = Field(min_length=1)
+    task_id: StrictStr = Field(min_length=1)
+    overall_status: EvidenceOverallStatus
+    failure_kind: FailureKind
+    started_at: datetime
+    completed_at: datetime
+    spec_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    fixture_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    runner: RunnerSettings
+    commands: list[CommandEvidence]
+    diff: DiffEvidence
+    metrics: RunMetrics | None
+    workspace_removed: StrictBool
+    harness_error: StrictStr | None = None
+
+    @field_validator("started_at", "completed_at", mode="before")
+    @classmethod
+    def artifact_timestamps_must_use_datetime_or_iso_string(
+        cls,
+        value: object,
+    ) -> object:
+        if not isinstance(value, (str, datetime)):
+            raise ValueError("artifact timestamps must be ISO strings or datetime values")
+        return value
+
+    @field_validator("started_at", "completed_at")
+    @classmethod
+    def artifact_timestamps_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("artifact timestamps must be timezone-aware")
+        return value
+
+    @model_validator(mode="after")
+    def status_failure_and_metrics_must_be_consistent(self) -> EvidenceArtifact:
+        if self.completed_at < self.started_at:
+            raise ValueError("completed_at must not be before started_at")
+
+        expected = {
+            EvidenceOverallStatus.PASSED: FailureKind.NONE,
+            EvidenceOverallStatus.FAILED: FailureKind.QUALITY_GATE_FAILURE,
+        }
+        if (
+            self.overall_status in expected
+            and self.failure_kind is not expected[self.overall_status]
+        ):
+            raise ValueError("overall_status and failure_kind are inconsistent")
+        if (
+            self.overall_status is EvidenceOverallStatus.HARNESS_ERROR
+            and self.failure_kind
+            in {FailureKind.NONE, FailureKind.QUALITY_GATE_FAILURE}
+        ):
+            raise ValueError("harness_error requires a Harness failure kind")
+        if self.overall_status is EvidenceOverallStatus.HARNESS_ERROR:
+            if self.harness_error is None:
+                raise ValueError("harness_error status requires a reason")
+        elif self.harness_error is not None:
+            raise ValueError("non-Harness result must not contain harness_error")
+
+        required_command_status = {
+            FailureKind.TIMEOUT: CommandStatus.TIMED_OUT,
+            FailureKind.SIGNAL_TERMINATION: CommandStatus.SIGNAL_TERMINATED,
+            FailureKind.COMMAND_UNAVAILABLE: CommandStatus.SPAWN_ERROR,
+            FailureKind.SPAWN_ERROR: CommandStatus.SPAWN_ERROR,
+        }.get(self.failure_kind)
+        if required_command_status is not None and not any(
+            command.status is required_command_status for command in self.commands
+        ):
+            raise ValueError("failure_kind does not match any command status")
+        if (
+            self.failure_kind is FailureKind.PROCESS_CLEANUP_ERROR
+            and not any(
+                not command.termination.process_group_cleared
+                for command in self.commands
+            )
+        ):
+            raise ValueError("process_cleanup_error requires an uncleared command group")
+        if (
+            self.failure_kind is FailureKind.UNSUPPORTED_PLATFORM
+            and self.commands
+        ):
+            raise ValueError("unsupported_platform Evidence must not contain commands")
+
+        commands_completed_normally = all(
+            command.status in {CommandStatus.PASSED, CommandStatus.FAILED}
+            and command.termination.process_group_cleared
+            for command in self.commands
+        )
+        metrics_permitted = (
+            self.failure_kind in {FailureKind.NONE, FailureKind.QUALITY_GATE_FAILURE}
+            and commands_completed_normally
+            and self.diff.line_counts_complete
+            and self.workspace_removed
+        )
+        if metrics_permitted != (self.metrics is not None):
+            raise ValueError("metrics presence is inconsistent with Evidence completeness")
+        if self.overall_status is not EvidenceOverallStatus.HARNESS_ERROR:
+            if not self.commands:
+                raise ValueError("non-Harness Evidence requires at least one command")
+            if not commands_completed_normally:
+                raise ValueError("non-Harness Evidence requires normally completed commands")
+            if not self.diff.line_counts_complete or not self.workspace_removed:
+                raise ValueError("non-Harness Evidence must be complete and cleaned up")
+            all_commands_passed = all(
+                command.status is CommandStatus.PASSED for command in self.commands
+            )
+            if (
+                self.overall_status is EvidenceOverallStatus.PASSED
+            ) is not all_commands_passed:
+                raise ValueError("overall_status does not match command statuses")
+
+        if self.metrics is not None:
+            acceptance = [
+                command for command in self.commands if command.gate is GateKind.ACCEPTANCE
+            ]
+            regression = [
+                command for command in self.commands if command.gate is GateKind.REGRESSION
+            ]
+            lint = [command for command in self.commands if command.gate is GateKind.LINT]
+            typecheck = [
+                command for command in self.commands if command.gate is GateKind.TYPECHECK
+            ]
+            expected_quality_pass = all(
+                command.status is CommandStatus.PASSED for command in self.commands
+            )
+            expected_counts = (
+                sum(command.status is CommandStatus.PASSED for command in acceptance),
+                len(acceptance),
+                sum(command.status is CommandStatus.FAILED for command in regression),
+                sum(command.status is CommandStatus.FAILED for command in lint),
+                sum(command.status is CommandStatus.FAILED for command in typecheck),
+            )
+            actual_counts = (
+                self.metrics.acceptance_tests_passed,
+                self.metrics.acceptance_tests_total,
+                self.metrics.regression_failures,
+                self.metrics.lint_errors,
+                self.metrics.typecheck_errors,
+            )
+            metrics_are_phase2_consistent = (
+                self.metrics.quality_gate_pass is expected_quality_pass
+                and actual_counts == expected_counts
+                and self.metrics.agent_duration_ms == 0
+                and self.metrics.agent_call_count == 0
+                and self.metrics.retry_count == 0
+                and self.metrics.total_duration_ms
+                == self.metrics.evaluation_duration_ms
+                and self.metrics.changed_files == self.diff.changed_files
+                and self.metrics.added_lines == self.diff.added_lines
+                and self.metrics.deleted_lines == self.diff.deleted_lines
+                and self.metrics.usage_metrics is None
+            )
+            if not metrics_are_phase2_consistent:
+                raise ValueError("RunMetrics do not match command and diff Evidence")
         return self
 
 

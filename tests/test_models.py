@@ -7,7 +7,14 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from agentlab.models import CapabilityReport, ExperimentSpec, RunMetrics, RunResult, UsageMetrics
+from agentlab.models import (
+    CapabilityReport,
+    ExperimentSpec,
+    RunMetrics,
+    RunnerSettings,
+    RunResult,
+    UsageMetrics,
+)
 
 
 def test_valid_experiment_spec_can_be_loaded(
@@ -388,3 +395,80 @@ def test_unavailable_capability_rejects_reported_details(field: str, value: obje
 
     with pytest.raises(ValidationError, match="unavailable command"):
         CapabilityReport.model_validate(data)
+
+
+def test_existing_spec_without_runner_remains_valid(
+    valid_spec_data: Callable[[], dict[str, Any]],
+) -> None:
+    spec = ExperimentSpec.model_validate(valid_spec_data())
+
+    assert spec.runner is None
+
+
+def test_valid_runner_settings_are_loaded(
+    valid_spec_data: Callable[[], dict[str, Any]],
+) -> None:
+    data = valid_spec_data()
+    data["runner"] = {
+        "fixture_path": "fixtures/runner-smoke",
+        "command_timeout_ms": 5000,
+        "termination_grace_ms": 500,
+        "max_output_bytes": 65536,
+        "max_diff_bytes": 262144,
+    }
+
+    spec = ExperimentSpec.model_validate(data)
+
+    assert spec.runner is not None
+    assert spec.runner.fixture_path == "fixtures/runner-smoke"
+
+
+@pytest.mark.parametrize(
+    "fixture_path",
+    ["", " ", "/absolute/fixture", "../fixture", "fixtures/../fixture", r"C:\fixture", "."],
+)
+def test_runner_rejects_unbounded_fixture_paths(fixture_path: str) -> None:
+    with pytest.raises(ValidationError, match="fixture_path"):
+        RunnerSettings(
+            fixture_path=fixture_path,
+            command_timeout_ms=5000,
+            termination_grace_ms=500,
+            max_output_bytes=65536,
+            max_diff_bytes=262144,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("command_timeout_ms", 0),
+        ("command_timeout_ms", 600_001),
+        ("termination_grace_ms", 60_001),
+        ("max_output_bytes", 16 * 1024 * 1024 + 1),
+        ("max_diff_bytes", 64 * 1024 * 1024 + 1),
+        ("command_timeout_ms", "5000"),
+        ("termination_grace_ms", True),
+    ],
+)
+def test_runner_limits_are_strict_and_bounded(field: str, value: object) -> None:
+    data: dict[str, object] = {
+        "fixture_path": "fixtures/runner-smoke",
+        "command_timeout_ms": 5000,
+        "termination_grace_ms": 500,
+        "max_output_bytes": 65536,
+        "max_diff_bytes": 262144,
+    }
+    data[field] = value
+
+    with pytest.raises(ValidationError, match=field):
+        RunnerSettings.model_validate(data)
+
+
+def test_quality_gate_argv_rejects_non_string_argument(
+    valid_spec_data: Callable[[], dict[str, Any]],
+) -> None:
+    data = valid_spec_data()
+    data["quality_gate"]["acceptance"] = [["python3", 1]]
+
+    with pytest.raises(ValidationError, match="quality_gate"):
+        ExperimentSpec.model_validate(data)

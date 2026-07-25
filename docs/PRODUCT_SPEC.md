@@ -23,8 +23,9 @@ AIコーディングエージェントの評価は、課題や品質Gateだけ�
 4. 実験Spec、実行証跡、評価結果を紐付け、意思決定の根拠を再確認する。
 5. 検証済みの知見を標準手順へ反映する。
 
-Phase 1ではSpec検証、ローカルCLI能力確認、および保存済み合成RecordingのReplayだけを
-実行できる。
+Phase 2ではSpec検証、ローカルCLI能力確認、保存済み合成RecordingのReplayに加え、
+信頼済み合成Fixtureの使い捨てコピー上で品質Gateを実行し、Evidenceを保存できる。
+外部AI Providerは実行しない。
 
 ## 機能要件
 
@@ -56,10 +57,34 @@ Phase 1ではSpec検証、ローカルCLI能力確認、および保存済み合
   `--force`時だけreplaceする。SpecとRecordingは常に上書き対象外とする。
 - Replayは外部AI、network、外部CLI、品質Gateコマンドを呼び出さない。
 
+### Phase 2
+
+- ExperimentSpecは任意の`runner`設定を持ち、既存Phase 0・1 Specはrunnerなしで読める。
+- Runner設定は相対Fixture pathと、command timeout、termination grace、stdout/stderr、
+  diffの現実的な正の上限を表現する。
+- `agentlab run-gates`はtask/run/outputと`--confirm-execution`を必須とし、Specに
+  列挙された品質Gate argvだけを実行する。
+- Fixture sourceのroot/配下symlinkと特殊fileを拒否し、sourceではなくsystem temporary
+  directory内のコピーを実行する。
+- local commandは`cwd`をWorkspace、stdinを閉じ、`shell=False`、分離pipe、最小環境で
+  新しいPOSIX session/process groupとして起動する。
+- timeout時はSIGTERM、grace、SIGKILLで停止し、正常終了時もbackground childを回収する。
+- stdout/stderrは別々に上限付きで最後までdrainし、truncationと不正UTF-8変換の有無を
+  個別flagで記録する。
+- 実行前後snapshotから、安定順のchanged file、text行数、上限付きunified diff、
+  binary/non-UTF-8 pathを生成する。
+- version付きEvidenceはcommand status、termination、Spec/Fixture hash、Runner設定、
+  diff、failure kind、任意RunMetricsをstrict JSONとしてatomic保存する。
+- 通常の非0終了とsignal終了、timeout、spawn、output収集、process cleanup、
+  unsupported platform、Evidence errorを区別する。Harness障害または不完全な行数では
+  Metricsを生成しない。
+- `--force`でもSpec、Replay Recording、Fixture sourceとそのsymlink/hard linkを
+  置換できない。
+
 ### 将来要件
 
-- 隔離Runner、品質Gate実行、証跡保存、Live Provider、集計と比較レポートを段階的に
-  追加する。実装順はROADMAPに従う。
+- Live Provider、Live Recording、scheduler、Workflow実験、集計と比較レポートを
+  段階的に追加する。実装順はROADMAPに従う。
 
 ## 非機能要件
 
@@ -71,17 +96,23 @@ Phase 1ではSpec検証、ローカルCLI能力確認、および保存済み合
 - CLI未導入や能力不明を、実験失敗と混同せず明示する。
 - 秘密情報、認証情報、機密プロンプトを成果物に保存しない。
 - 通常CIはネットワークやLive AI Providerに依存しない。
+- Gate実行には明示確認を要求し、親processの環境を無条件に継承しない。
+- Harness障害を品質Gate不合格へ変換しない。
+- Phase 2 RunnerをOS security sandboxやnetwork隔離として扱わない。
 
 ## Non-goals
 
-Phase 1では以下を実装しない。
+Phase 2では以下を実装しない。
 
 - Codex/AntigravityのLive課題実行、OpenAI/Gemini API
-- 品質Gateの実行、Docker、Git worktree
-- Java/Python/React Task Fixture、LLM Judge、コスト計算、比較レポート
+- Prompt生成、Live Recording拡張、Prompt redaction
+- Docker、VM、Git worktree、seccomp、user namespace、firewall
+- filesystemの完全隔離、CPU/memory/process quota、悪意あるcodeの完全な封じ込め
+- Java/Python/Reactの実Task Fixture、LLM Judge、コスト計算、比較レポート
 - GitHub ActionsからのLive実行、独立レビューエージェント
 - 一般的なモデル能力ランキング
-- 複数task、複数treatment、複数反復のscheduler
+- 複数task、複数treatment、複数反復、stop conditionのscheduler
+- Workflow A/B実験、Provider比較、framework固有diagnostic parser
 
 ## 成功条件
 
@@ -92,3 +123,10 @@ Phase 1では以下を実装しない。
 - Provider境界、Record/Replay、任意Usage指標の意思決定がADRに残る。
 - READMEが実装済み範囲と未実装範囲を正確に表す。
 - 合成Recordingから同一内容・同一byte列のRunResultを外部呼出しなしで生成できる。
+- 明示確認後、合成Fixtureの使い捨てコピー上で全Gateを実行し、再読込可能なEvidenceを
+  保存できる。
+- timeout時と正常終了時にprocess groupを回収し、親環境の合成secretを子へ渡さない。
+- Gate不合格ではcommand単位Metricsを生成し、signal終了を含むHarness障害ではMetricsを
+  `null`にする。
+- 実行に用いたSpecモデルとEvidenceのSpec SHA-256を、同じ一回の入力bytesから生成する。
+- Phase 1 Replayのbyte決定性とSpec/Recording入力保護が後退しない。
