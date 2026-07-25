@@ -18,7 +18,7 @@ CLI未導入でもdoctorが成功する。pytest、Ruff、mypyと必須CLIを実
 
 ## Phase 1: Replay Vertical Slice
 
-**Status: Current**
+**Status: Complete**
 
 **目的:** 外部AIを呼ばず、一つの記録を一つのRunResultへ変換する最小縦断経路を作る。
 
@@ -32,15 +32,21 @@ Recording。
 
 ## Phase 2: Safe Runner, Evidence and Quality Gate
 
-**Status: Planned**
+**Status: Current**
 
-**目的:** Fixtureを隔離して実行し、変更と品質Gateの証跡を安全に収集する。
+**目的:** 信頼済みFixtureを使い捨てWorkspaceで実行し、変更と品質Gateの証跡を
+Harness障害と品質不合格を混同せず収集する。
 
-**成果物:** timeout/停止処理を持つRunner、作業領域管理、Gate executor、stdout/stderr・
-diff・終了状態のEvidence、失敗分類。
+**成果物:** 任意のRunner設定を持つ後方互換ExperimentSpec、Fixture検証と使い捨て
+Workspace、POSIX process groupのtimeout/終了時停止、環境allowlist、上限付き
+stdout/stderr、標準library snapshot/diff、version付きEvidence、command単位RunMetrics、
+`agentlab run-gates`、合成Runner smoke Fixture。
 
-**受入条件:** 許可されたargvだけを`shell=True`なしで実行し、timeout後も子processを
-残さない。Gate結果からRunMetricsを再構成でき、通常テストはReplayだけを使う。
+**受入条件:** 明示確認後にSpec記載argvだけを`shell=True`なしで使い捨てコピー上から
+実行し、timeout時と正常終了時の残存子processを回収する。秘密環境を継承せず、出力と
+diffを上限付きEvidenceへatomic保存する。通常の非0終了だけを品質不合格としてMetricsへ
+変換し、timeout、spawn、回収、unsupported platform、Evidence不完全ではMetricsを
+生成しない。Phase 1 Replayのbyte決定性と入力保護を維持する。
 
 ## Phase 3: Codex CLI Provider
 

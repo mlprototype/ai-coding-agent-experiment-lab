@@ -10,7 +10,8 @@
 
 ## Provider and execution safety
 
-- Live Providerを通常テストやCIから呼び出さない。通常テストはReplayを使う。
+- Live Providerを通常テストやCIから呼び出さない。Provider経路の通常テストはReplayを
+  使い、Runner統合テストは短時間の合成local helperだけを使う。
 - Phase 1 Replayから外部AI、network、subprocess、品質Gateコマンドを呼び出さない。
 - 相対的なRecording pathはExperimentSpecファイルの親directoryを基準に解決する。
 - 合成RecordingをProvider性能の実験結果として扱わない。
@@ -21,6 +22,13 @@
 - 外部コマンドは引数配列で起動し、`shell=True`を使用しない。
 - stdoutとstderrを分離し、短いtimeoutと終了コードを扱う。
 - CLI未導入や未確認能力を推測で補完せず、`not_verified`として扱う。
+- Gate実行には`--confirm-execution`による明示確認を要求する。
+- Fixture sourceを直接実行・変更せず、検証済みの使い捨てコピーだけを実行する。
+- timeout時だけでなくcommand終了時もprocess groupの残存子processを回収する。
+- 親processの環境を丸ごと継承せず、秘密情報を子processへ渡さない。
+- stdout、stderr、diffの設定上限を超えてEvidenceへ保持しない。
+- timeout、spawn、process回収、Evidence収集のHarness障害を品質不合格へ変換しない。
+- Phase 2 Safe Runnerをsecurity sandbox、network隔離、完全なfilesystem隔離と表現しない。
 
 ## Data and security
 
@@ -49,6 +57,11 @@ uv run agentlab doctor --json
 uv run agentlab validate experiments/examples/workflow-smoke.yaml
 uv run agentlab replay experiments/examples/workflow-smoke.yaml \
   --output .artifacts/runs/workflow-smoke-run-001.json
+uv run agentlab run-gates experiments/examples/workflow-smoke.yaml \
+  --task-id smoke-task \
+  --run-id phase2-runner-smoke-001 \
+  --output .artifacts/evidence/phase2-runner-smoke-001.json \
+  --confirm-execution
 ```
 
 - 完了時は変更ファイル、実行したテストと結果、未完了事項、環境制約を報告する。

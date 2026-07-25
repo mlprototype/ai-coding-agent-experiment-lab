@@ -1,4 +1,4 @@
-"""Command-line interface for Phase 0 foundation tasks."""
+"""Command-line interface for experiment contracts, Replay, and Phase 2 gates."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ from typing import Annotated
 import typer
 
 from agentlab.capabilities import doctor_report
+from agentlab.gates import RunGatesError, run_gates
+from agentlab.models import EvidenceOverallStatus
 from agentlab.recording import RecordingLoadError
 from agentlab.replay import ReplayError, run_replay
 from agentlab.specs import SpecLoadError, load_experiment_spec
@@ -83,6 +85,74 @@ def replay(
     typer.echo(f"experiment: {result.experiment_id}")
     typer.echo(f"output: {output_path}")
     typer.echo("external AI executed: no (Replay only)")
+
+
+@app.command("run-gates")
+def run_gates_command(
+    spec_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    task_id: Annotated[
+        str,
+        typer.Option("--task-id", help="Task ID from ExperimentSpec.task_ids."),
+    ],
+    run_id: Annotated[
+        str,
+        typer.Option("--run-id", help="Identifier to persist in the Evidence Artifact."),
+    ],
+    output_path: Annotated[
+        Path,
+        typer.Option("--output", help="Required destination for Evidence JSON."),
+    ],
+    confirm_execution: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-execution",
+            help="Explicitly allow the configured local quality-gate subprocesses.",
+        ),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Explicitly replace an existing Evidence file."),
+    ] = False,
+) -> None:
+    """Run only the quality-gate argv listed in a trusted ExperimentSpec."""
+    try:
+        outcome = run_gates(
+            spec_path,
+            task_id=task_id,
+            run_id=run_id,
+            output_path=output_path,
+            confirm_execution=confirm_execution,
+            force=force,
+        )
+    except (SpecLoadError, RunGatesError) as error:
+        typer.echo(f"run-gates failed: {error}", err=True)
+        typer.echo(f"run: {run_id}")
+        typer.echo(f"task: {task_id}")
+        typer.echo(f"output: {output_path}")
+        if isinstance(error, RunGatesError) and error.workspace_removed is not None:
+            removed = "yes" if error.workspace_removed else "no"
+            typer.echo(f"workspace removed: {removed}")
+        else:
+            typer.echo("workspace removed: not_created")
+        typer.echo("external AI executed: no")
+        raise typer.Exit(code=2) from error
+
+    artifact = outcome.artifact
+    typer.echo(f"run: {artifact.run_id}")
+    typer.echo(f"experiment: {artifact.experiment_id}")
+    typer.echo(f"task: {artifact.task_id}")
+    if artifact.overall_status is EvidenceOverallStatus.HARNESS_ERROR:
+        typer.echo(f"Harness failure: {artifact.failure_kind.value}")
+    else:
+        typer.echo(f"quality gates: {artifact.overall_status.value}")
+    typer.echo(f"output: {outcome.output_path}")
+    typer.echo(f"workspace removed: {'yes' if artifact.workspace_removed else 'no'}")
+    typer.echo("external AI executed: no")
+
+    if artifact.overall_status is EvidenceOverallStatus.FAILED:
+        raise typer.Exit(code=1)
+    if artifact.overall_status is EvidenceOverallStatus.HARNESS_ERROR:
+        raise typer.Exit(code=2)
 
 
 if __name__ == "__main__":

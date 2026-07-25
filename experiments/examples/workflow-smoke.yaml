@@ -11,7 +11,7 @@ control: one_shot
 treatments:
   - staged
 fixed_factors:
-  fixture_revision: phase1-placeholder
+  fixture_revision: phase2-runner-smoke
   prompt_template_revision: "1"
 task_ids:
   - smoke-task
@@ -19,13 +19,13 @@ repetitions: 3
 random_seed: 20260725
 quality_gate:
   acceptance:
-    - [pytest, -q]
+    - [python3, -B, check.py, acceptance]
   regression:
-    - [pytest, -q]
+    - [python3, -B, check.py, regression]
   lint:
-    - [ruff, check, .]
+    - [python3, -B, check.py, lint]
   typecheck:
-    - [mypy, src]
+    - [python3, -B, check.py, typecheck]
 stop_conditions:
   max_failures: 3
   max_total_duration_ms: 900000
@@ -34,4 +34,9 @@ execution_mode: replay
 replay:
   recording_path: recordings/workflow-smoke.jsonl
 live: null
-
+runner:
+  fixture_path: fixtures/runner-smoke
+  command_timeout_ms: 5000
+  termination_grace_ms: 500
+  max_output_bytes: 65536
+  max_diff_bytes: 262144
