@@ -8,6 +8,8 @@ from typing import Annotated
 import typer
 
 from agentlab.capabilities import doctor_report
+from agentlab.recording import RecordingLoadError
+from agentlab.replay import ReplayError, run_replay
 from agentlab.specs import SpecLoadError, load_experiment_spec
 
 app = typer.Typer(
@@ -58,6 +60,30 @@ def validate_spec(path: Annotated[Path, typer.Argument(exists=True, dir_okay=Fal
     )
 
 
+@app.command()
+def replay(
+    spec_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    output_path: Annotated[
+        Path,
+        typer.Option("--output", help="Required destination for deterministic RunResult JSON."),
+    ],
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Explicitly replace an existing output file."),
+    ] = False,
+) -> None:
+    """Create one RunResult from one saved recording without external AI."""
+    try:
+        result = run_replay(spec_path, output_path, force=force)
+    except (SpecLoadError, RecordingLoadError, ReplayError) as error:
+        typer.echo(f"replay failed: {error}", err=True)
+        raise typer.Exit(code=1) from error
+
+    typer.echo(f"replayed run: {result.run_id}")
+    typer.echo(f"experiment: {result.experiment_id}")
+    typer.echo(f"output: {output_path}")
+    typer.echo("external AI executed: no (Replay only)")
+
+
 if __name__ == "__main__":
     app()
-

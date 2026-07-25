@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ContractModel(BaseModel):
@@ -194,8 +194,20 @@ class RunResult(ContractModel):
     schema_version: Literal["1.0"]
     run_id: str = Field(min_length=1)
     experiment_id: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
+    workflow: Workflow
+    provider: Provider
+    repetition_index: int = Field(ge=0)
+    execution_mode: ExecutionMode
     recorded_at: datetime
     metrics: RunMetrics
+
+    @field_validator("recorded_at")
+    @classmethod
+    def recorded_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("recorded_at must be timezone-aware")
+        return value
 
 
 class CapabilityReport(ContractModel):

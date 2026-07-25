@@ -11,6 +11,9 @@
 ## Provider and execution safety
 
 - Live Providerを通常テストやCIから呼び出さない。通常テストはReplayを使う。
+- Phase 1 Replayから外部AI、network、subprocess、品質Gateコマンドを呼び出さない。
+- 相対的なRecording pathはExperimentSpecファイルの親directoryを基準に解決する。
+- 合成RecordingをProvider性能の実験結果として扱わない。
 - Live実行を追加する場合は明示的opt-in、Record、redaction、timeout、停止条件を必須に
   する。
 - 外部コマンドは引数配列で起動し、`shell=True`を使用しない。
@@ -42,7 +45,8 @@ uv run mypy src
 ```console
 uv run agentlab doctor --json
 uv run agentlab validate experiments/examples/workflow-smoke.yaml
+uv run agentlab replay experiments/examples/workflow-smoke.yaml \
+  --output .artifacts/runs/workflow-smoke-run-001.json
 ```
 
 - 完了時は変更ファイル、実行したテストと結果、未完了事項、環境制約を報告する。
-

@@ -16,14 +16,18 @@ Antigravity CLI / Replay Provider）は分離します。一度に変える独�
 
 ## 現在の状態
 
-現在は **Phase 0: Foundation and Capability Spike** です。次だけを提供します。
+Phase 0を完了し、現在は **Phase 1: Replay Vertical Slice** です。次を提供します。
 
 - バージョン付きExperimentSpec、RunMetrics、UsageMetrics、CapabilityReport
 - YAML Specの検証
 - Codex CLIとAntigravity CLIの読み取り専用能力確認
 - 実験設計、Provider境界、ロードマップの文書
+- `run_started`と`run_completed`だけを持つ厳密なJSONL Recording契約
+- 1件の保存済みRecordingから1件のRunResultを生成・保存するReplay CLI
 
-Live AI実行、Replay実行、品質Gate実行、Task Fixture、比較レポート生成は未実装です。
+ReplayはRecording内の保存済みMetricsを再構成するだけです。外部AI、ネットワーク、
+Codex/Antigravity CLI、品質Gateコマンドを実行しません。Runner、Gate実行、Evidence、
+Live AI実行、複数runのscheduler、比較レポート生成は未実装です。
 
 ## Quick Start
 
@@ -34,18 +38,25 @@ uv sync --extra dev
 uv run agentlab doctor
 uv run agentlab doctor --json
 uv run agentlab validate experiments/examples/workflow-smoke.yaml
+uv run agentlab replay experiments/examples/workflow-smoke.yaml \
+  --output .artifacts/runs/workflow-smoke-run-001.json
 uv run pytest
 uv run ruff check .
 uv run mypy src
 ```
 
 `doctor` はローカルコマンドの存在、バージョン、helpだけを確認します。ログイン、API呼び
-出し、AIタスク実行はしません。
+出し、AIタスク実行はしません。`replay`も外部処理を実行せず、Specファイルからの相対
+pathでRecordingを読みます。既存Resultを明示的に置換する場合だけ`--force`を指定します。
+
+サンプルRecordingはReplay pipelineを検証するための合成fixtureです。Provider性能の
+実験結果ではありません。形式と検証規則は
+[docs/REPLAY_FORMAT.md](docs/REPLAY_FORMAT.md)を参照してください。
 
 ## ロードマップ
 
-- Phase 0: Foundation and Capability Spike
-- Phase 1: Replay Vertical Slice
+- Phase 0: Foundation and Capability Spike（完了）
+- Phase 1: Replay Vertical Slice（現在）
 - Phase 2: Safe Runner, Evidence and Quality Gate
 - Phase 3: Codex CLI Provider
 - Phase 4: Workflow A/B Experiment
