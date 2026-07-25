@@ -51,7 +51,9 @@ monotonic clock、時刻はtimezone-aware UTCで記録する。
 timeout時はgroupへSIGTERMを送り、`termination_grace_ms`まで待ち、残存時はSIGKILLへ
 escalateする。親processをwaitしてpipeをdrainする。親が正常終了しても同じgroupに
 background childが残ればSIGTERM/SIGKILLで回収する。group消滅またはcollector完了を
-確認できない場合は`process_cleanup_error`であり、成功や品質不合格として扱わない。
+確認できない場合は、それぞれ`process_cleanup_error`または`evidence_error`であり、
+成功や品質不合格として扱わない。command自身がsignalで終了した場合も通常の非0終了
+とは分け、`signal_termination`のHarness障害とする。
 
 process group APIを保証できないplatformではcommand起動前に
 `unsupported_platform`としてfail closedする。
@@ -71,6 +73,8 @@ process group APIを保証できないplatformではcommand起動前に
 stdoutとstderrは別pipeとして最後までnon-blockingでdrainする。それぞれ
 `max_output_bytes`までしか保持せず、超過後もdeadlockを避けるため読み捨てを続ける。
 超過は個別の`*_truncated` flagで示す。不正UTF-8は置換文字へ変換する。
+変換が発生したstreamは`*_decode_replaced=true`として、commandが元から出力した置換文字
+と区別する。
 
 temporary Workspaceは`<WORKSPACE>`、専用HOME/cache/tempはplaceholderへ正規化する。
 一時絶対pathや親環境のsecretをEvidenceへ保存しない。
@@ -83,21 +87,26 @@ Evidence JSONはschema version `1.0`を持ち、未知field、型強制、timezo
 既存fileは既定で置換せず、`--force`時だけreplaceする。
 
 command Evidenceはgate、group内index、argv、status、return code、UTC時刻、duration、
-stdout/stderr、truncation、termination結果を保持する。statusは`passed`、`failed`、
-`timed_out`、`spawn_error`である。
+stdout/stderr、truncation、decode置換、termination結果を保持する。statusは`passed`、
+`failed`、`timed_out`、`signal_terminated`、`spawn_error`、`collection_error`である。
+`collection_error`は起動後のselector、pipe drainなどのEvidence収集障害であり、
+commandを起動できなかった`spawn_error`とは分離する。
 
 Artifactはrun/experiment/task ID、Spec SHA-256、初期Fixture SHA-256、Runner設定、
-command配列、diff、overall status、failure kind、任意RunMetricsを保持する。
+command配列、diff、overall status、failure kind、任意RunMetricsを保持する。Specは
+一度だけbytesとして読み、その同じbytesからYAML parse、model validation、SHA-256を
+行う。
 
 failure kindは次を区別する。
 
 - `none`: 全Gate成功
 - `quality_gate_failure`: 一つ以上のcommandが通常の非0終了
 - `timeout`: command timeout後の停止に成功
+- `signal_termination`: command自身がsignalで異常終了
 - `command_unavailable`: executableが見つからない
 - `spawn_error`: その他のcommand起動失敗
-- `process_cleanup_error`: process groupまたはpipeを回収できない
-- `evidence_error`: snapshot、diff、Workspace cleanupなどのEvidence不完全
+- `process_cleanup_error`: process groupを回収できない
+- `evidence_error`: output収集、snapshot、diff、Workspace cleanupなどのEvidence不完全
 - `unsupported_platform`: 必要なPOSIX保証がない
 
 ## Diff Evidence
@@ -124,15 +133,16 @@ Workspace削除が完全な場合だけRunMetricsを生成する。
 `agent_duration_ms`、`agent_call_count`、`retry_count`は0、evaluationとtotal durationは
 Gate wall-clock時間、UsageMetricsは`null`である。
 
-timeout、spawn、process cleanup、unsupported platform、Evidence/diff不完全ではMetricsを
-`null`にし、品質不合格へ変換しない。
+timeout、signal終了、spawn、output収集、process cleanup、unsupported platform、
+Evidence/diff不完全ではMetricsを`null`にし、品質不合格へ変換しない。
 
 ## Supported operating systems
 
-保証対象は、PythonのPOSIX session、process group、SIGTERM、SIGKILL、non-blocking pipe
-APIを提供するmacOSとLinuxである。local受入試験はmacOSで実施する。WindowsはPhase 2で
-未対応で、command起動前にfail closedする。新しいOSはprocess tree統合testを通すまで
-対応済みと表現しない。
+macOSはprocess treeを含むlocal受入試験の検証対象である。Linux向けのPOSIX session、
+process group、SIGTERM、SIGKILL、non-blocking pipe実装経路は有効だが、Phase 2時点では
+Linux実機またはUbuntu CIで未検証のため「対応設計済み・未検証」とする。Windowsは
+未対応で、command起動前にfail closedする。Linuxを含む新しいOSは同じprocess tree
+統合testを通すまで保証対象と表現しない。
 
 ## Isolation not provided
 

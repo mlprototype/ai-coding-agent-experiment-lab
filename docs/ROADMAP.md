@@ -45,8 +45,8 @@ stdout/stderr、標準library snapshot/diff、version付きEvidence、command単
 **受入条件:** 明示確認後にSpec記載argvだけを`shell=True`なしで使い捨てコピー上から
 実行し、timeout時と正常終了時の残存子processを回収する。秘密環境を継承せず、出力と
 diffを上限付きEvidenceへatomic保存する。通常の非0終了だけを品質不合格としてMetricsへ
-変換し、timeout、spawn、回収、unsupported platform、Evidence不完全ではMetricsを
-生成しない。Phase 1 Replayのbyte決定性と入力保護を維持する。
+変換し、signal終了、timeout、spawn、output収集、回収、unsupported platform、
+Evidence不完全ではMetricsを生成しない。Phase 1 Replayのbyte決定性と入力保護を維持する。
 
 ## Phase 3: Codex CLI Provider
 

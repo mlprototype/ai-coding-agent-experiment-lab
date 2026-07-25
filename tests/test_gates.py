@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import signal
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -202,6 +204,75 @@ def test_timeout_stops_later_gates_and_does_not_generate_metrics(tmp_path: Path)
     assert load_evidence_artifact(output) == artifact
 
 
+def test_signal_termination_stops_later_gates_and_has_null_metrics(
+    tmp_path: Path,
+) -> None:
+    quality_gate = {
+        "acceptance": [
+            [
+                sys.executable,
+                "-c",
+                "import os,signal; os.kill(os.getpid(), signal.SIGTERM)",
+            ]
+        ],
+        "regression": [
+            [sys.executable, "-c", "open('must-not-run','w',encoding='utf-8').write('x')"]
+        ],
+        "lint": [],
+        "typecheck": [],
+    }
+    spec_path, fixture, _recording = _write_case(
+        tmp_path,
+        quality_gate=quality_gate,
+    )
+
+    artifact = _run(spec_path, tmp_path / "signal.json").artifact
+
+    assert artifact.overall_status is EvidenceOverallStatus.HARNESS_ERROR
+    assert artifact.failure_kind is FailureKind.SIGNAL_TERMINATION
+    assert artifact.metrics is None
+    assert len(artifact.commands) == 1
+    assert artifact.commands[0].status is CommandStatus.SIGNAL_TERMINATED
+    assert artifact.commands[0].return_code == -signal.SIGTERM
+    assert not (fixture / "must-not-run").exists()
+
+
+def test_spec_model_and_hash_come_from_the_same_single_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture, _recording = _write_case(tmp_path)
+    spec_a = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
+    spec_a["quality_gate"]["acceptance"] = [
+        [sys.executable, "-c", "print('spec-a')"]
+    ]
+    spec_b = deepcopy(spec_a)
+    spec_b["quality_gate"]["acceptance"] = [
+        [sys.executable, "-c", "print('spec-b')"]
+    ]
+    bytes_a = yaml.safe_dump(spec_a, sort_keys=False).encode()
+    bytes_b = yaml.safe_dump(spec_b, sort_keys=False).encode()
+    spec_path.write_bytes(bytes_a)
+    original_read_bytes = Path.read_bytes
+    spec_read_count = 0
+
+    def replace_after_read(path: Path) -> bytes:
+        nonlocal spec_read_count
+        content = original_read_bytes(path)
+        if path == spec_path:
+            spec_read_count += 1
+            spec_path.write_bytes(bytes_b)
+        return content
+
+    monkeypatch.setattr(Path, "read_bytes", replace_after_read)
+    artifact = _run(spec_path, tmp_path / "single-read.json").artifact
+
+    assert spec_read_count == 1
+    assert artifact.spec_sha256 == hashlib.sha256(bytes_a).hexdigest()
+    assert artifact.commands[0].argv[-1] == "print('spec-a')"
+    assert artifact.commands[0].stdout == "spec-a\n"
+
+
 def test_unavailable_command_is_harness_failure_with_saved_evidence(tmp_path: Path) -> None:
     spec_path, _fixture, _recording = _write_case(
         tmp_path,
@@ -220,6 +291,25 @@ def test_unavailable_command_is_harness_failure_with_saved_evidence(tmp_path: Pa
     assert artifact.overall_status is EvidenceOverallStatus.HARNESS_ERROR
     assert artifact.metrics is None
     assert output.is_file()
+
+
+def test_output_collection_error_is_not_recorded_as_spawn_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture, _recording = _write_case(tmp_path)
+
+    def fail_select(_selector: object, _timeout: float | None = None) -> NoReturn:
+        raise OSError("synthetic selector failure")
+
+    monkeypatch.setattr("agentlab.runner.selectors.DefaultSelector.select", fail_select)
+    artifact = _run(spec_path, tmp_path / "collection-error.json").artifact
+
+    assert artifact.overall_status is EvidenceOverallStatus.HARNESS_ERROR
+    assert artifact.failure_kind is FailureKind.EVIDENCE_ERROR
+    assert artifact.metrics is None
+    assert artifact.commands[0].status is CommandStatus.COLLECTION_ERROR
+    assert artifact.commands[0].status is not CommandStatus.SPAWN_ERROR
 
 
 def test_binary_change_is_evidence_error_without_estimated_metrics(tmp_path: Path) -> None:
@@ -480,6 +570,36 @@ def test_writer_failure_removes_temporary_artifact(
     assert list(output.parent.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    ("operation", "error", "match"),
+    [
+        ("fsync", OSError("synthetic fsync failure"), "could not write Evidence"),
+        ("link", OSError("synthetic link failure"), "could not write Evidence"),
+        ("link", FileExistsError("synthetic concurrent create"), "already exists"),
+    ],
+)
+def test_writer_io_failures_leave_no_partial_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    error: OSError,
+    match: str,
+) -> None:
+    spec_path, _fixture, _recording = _write_case(tmp_path)
+    artifact = _run(spec_path, tmp_path / "initial.json").artifact
+    output = tmp_path / operation / "evidence.json"
+
+    def fail(*_args: object, **_kwargs: object) -> NoReturn:
+        raise error
+
+    monkeypatch.setattr(f"agentlab.gates.os.{operation}", fail)
+    with pytest.raises(RunGatesError, match=match):
+        write_evidence_artifact(artifact, output)
+
+    assert not output.exists()
+    assert list(output.parent.iterdir()) == []
+
+
 def test_evidence_writer_rejects_non_finite_json(
     tmp_path: Path,
 ) -> None:
@@ -561,4 +681,80 @@ def test_evidence_loader_rejects_non_finite_json_number(tmp_path: Path) -> None:
     output.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(EvidenceLoadError, match="non-finite"):
+        load_evidence_artifact(output)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload["commands"][0].update(
+            {"status": "failed", "return_code": 1}
+        ),
+        lambda payload: payload.update(
+            {
+                "overall_status": "failed",
+                "failure_kind": "quality_gate_failure",
+            }
+        ),
+        lambda payload: payload["metrics"].update(
+            {"acceptance_tests_passed": 0}
+        ),
+        lambda payload: payload["metrics"].update(
+            {"quality_gate_pass": False}
+        ),
+        lambda payload: payload["commands"][0]["termination"].update(
+            {"sigterm_sent": False, "sigkill_sent": True}
+        ),
+        lambda payload: payload["commands"][0]["termination"].update(
+            {
+                "process_group_cleared": False,
+                "error": "synthetic uncleared group",
+            }
+        ),
+        lambda payload: payload["commands"][0].update(
+            {
+                "status": "timed_out",
+                "return_code": -signal.SIGTERM,
+            }
+        ),
+        lambda payload: payload["commands"][0].update(
+            {
+                "status": "spawn_error",
+                "return_code": None,
+                "error": None,
+            }
+        ),
+        lambda payload: payload.update(
+            {
+                "overall_status": "harness_error",
+                "failure_kind": "signal_termination",
+                "metrics": None,
+                "harness_error": "synthetic mismatch",
+            }
+        ),
+    ],
+    ids=[
+        "passed-artifact-with-failed-command",
+        "failed-artifact-with-all-passed-commands",
+        "metrics-command-count-mismatch",
+        "metrics-quality-status-mismatch",
+        "sigkill-without-sigterm",
+        "none-reason-with-uncleared-group",
+        "timed-out-without-timeout-reason",
+        "spawn-error-without-reason",
+        "signal-failure-kind-without-signal-command",
+    ],
+)
+def test_evidence_loader_rejects_semantic_contradictions(
+    tmp_path: Path,
+    mutate: Any,
+) -> None:
+    spec_path, _fixture, _recording = _write_case(tmp_path)
+    output = tmp_path / "evidence.json"
+    _run(spec_path, output)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    mutate(payload)
+    output.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(EvidenceLoadError):
         load_evidence_artifact(output)

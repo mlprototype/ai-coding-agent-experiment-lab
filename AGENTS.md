@@ -27,7 +27,8 @@
 - timeout時だけでなくcommand終了時もprocess groupの残存子processを回収する。
 - 親processの環境を丸ごと継承せず、秘密情報を子processへ渡さない。
 - stdout、stderr、diffの設定上限を超えてEvidenceへ保持しない。
-- timeout、spawn、process回収、Evidence収集のHarness障害を品質不合格へ変換しない。
+- signal終了、timeout、spawn、process回収、Evidence収集のHarness障害を品質不合格へ
+  変換しない。
 - Phase 2 Safe Runnerをsecurity sandbox、network隔離、完全なfilesystem隔離と表現しない。
 
 ## Data and security

@@ -69,13 +69,15 @@ Phase 2ではSpec検証、ローカルCLI能力確認、保存済み合成Record
 - local commandは`cwd`をWorkspace、stdinを閉じ、`shell=False`、分離pipe、最小環境で
   新しいPOSIX session/process groupとして起動する。
 - timeout時はSIGTERM、grace、SIGKILLで停止し、正常終了時もbackground childを回収する。
-- stdout/stderrは別々に上限付きで最後までdrainし、truncationと不正UTF-8変換を記録する。
+- stdout/stderrは別々に上限付きで最後までdrainし、truncationと不正UTF-8変換の有無を
+  個別flagで記録する。
 - 実行前後snapshotから、安定順のchanged file、text行数、上限付きunified diff、
   binary/non-UTF-8 pathを生成する。
 - version付きEvidenceはcommand status、termination、Spec/Fixture hash、Runner設定、
   diff、failure kind、任意RunMetricsをstrict JSONとしてatomic保存する。
-- 通常の非0終了とtimeout、spawn、process cleanup、unsupported platform、Evidence
-  errorを区別する。Harness障害または不完全な行数ではMetricsを生成しない。
+- 通常の非0終了とsignal終了、timeout、spawn、output収集、process cleanup、
+  unsupported platform、Evidence errorを区別する。Harness障害または不完全な行数では
+  Metricsを生成しない。
 - `--force`でもSpec、Replay Recording、Fixture sourceとそのsymlink/hard linkを
   置換できない。
 
@@ -124,5 +126,7 @@ Phase 2では以下を実装しない。
 - 明示確認後、合成Fixtureの使い捨てコピー上で全Gateを実行し、再読込可能なEvidenceを
   保存できる。
 - timeout時と正常終了時にprocess groupを回収し、親環境の合成secretを子へ渡さない。
-- Gate不合格ではcommand単位Metricsを生成し、Harness障害ではMetricsを`null`にする。
+- Gate不合格ではcommand単位Metricsを生成し、signal終了を含むHarness障害ではMetricsを
+  `null`にする。
+- 実行に用いたSpecモデルとEvidenceのSpec SHA-256を、同じ一回の入力bytesから生成する。
 - Phase 1 Replayのbyte決定性とSpec/Recording入力保護が後退しない。

@@ -7,8 +7,8 @@
 
 品質GateをFixture source上で直接実行すると、評価対象を変更し、再現性を失う。shell
 commandや親環境の無条件継承は、Spec外の処理、対話待ち、secret漏えいを招く。さらに、
-通常の非0終了とtimeout、spawn、process回収、diff収集の失敗を同じ「Gate失敗」にすると、
-ProviderやWorkflowの品質をHarness障害として誤評価する。
+通常の非0終了とsignal終了、timeout、spawn、output/process回収、diff収集の失敗を
+同じ「Gate失敗」にすると、ProviderやWorkflowの品質をHarness障害として誤評価する。
 
 Phase 2はOS security sandboxを導入しないため、実行境界と保証できない隔離も明示する
 必要がある。
@@ -28,8 +28,8 @@ diffは別々の設定上限で収集する。
 
 Provider/Workflow結果であるRunMetricsと、Harnessが観測したEvidenceを分離する。
 commandが通常終了し、process回収、diff行数、Workspace cleanupが完全な場合だけMetricsを
-生成する。timeout、spawn、回収、unsupported platform、Evidence不完全はfailure kindを
-持つHarness障害としてMetricsを`null`にする。
+生成する。signal終了、timeout、spawn、output収集、回収、unsupported platform、
+Evidence不完全はfailure kindを持つHarness障害としてMetricsを`null`にする。
 
 ## Consequences
 

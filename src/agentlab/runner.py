@@ -60,8 +60,12 @@ class _BoundedBytes:
         if len(chunk) > remaining:
             self.truncated = True
 
-    def decode(self) -> str:
-        return bytes(self._content).decode("utf-8", errors="replace")
+    def decode(self) -> tuple[str, bool]:
+        content = bytes(self._content)
+        try:
+            return content.decode("utf-8"), False
+        except UnicodeDecodeError:
+            return content.decode("utf-8", errors="replace"), True
 
 
 class _PipeDrainer:
@@ -195,19 +199,21 @@ def _render_collected_text(
     workspace: Path,
     environment_root: Path,
     temporary_root: Path,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, bool]:
+    decoded, decode_replaced = collector.decode()
     normalized = _normalize_text(
-        collector.decode(),
+        decoded,
         workspace=workspace,
         environment_root=environment_root,
         temporary_root=temporary_root,
     )
     encoded = normalized.encode()
     if len(encoded) <= max_output_bytes:
-        return normalized, collector.truncated
+        return normalized, collector.truncated, decode_replaced
     return (
         encoded[:max_output_bytes].decode("utf-8", errors="ignore"),
         True,
+        decode_replaced,
     )
 
 
@@ -364,10 +370,19 @@ def _merge_termination_error(
     combined = error if termination.error is None else f"{termination.error}; {error}"
     return termination.model_copy(
         update={
+            "reason": (
+                TerminationReason.EMERGENCY_CLEANUP
+                if termination.reason is TerminationReason.NONE
+                else termination.reason
+            ),
             "process_group_cleared": False,
             "error": combined,
         }
     )
+
+
+def _append_collection_error(existing: str | None, detail: str) -> str:
+    return detail if existing is None else f"{existing}; {detail}"
 
 
 class LocalCommandRunner:
@@ -425,6 +440,8 @@ class LocalCommandRunner:
                     stderr="",
                     stdout_truncated=False,
                     stderr_truncated=False,
+                    stdout_decode_replaced=False,
+                    stderr_decode_replaced=False,
                     termination=_termination_without_signal(),
                     error=spawn_error_message,
                 ),
@@ -506,12 +523,12 @@ class LocalCommandRunner:
             while drainer.has_open_streams and time.monotonic() < output_deadline:
                 drainer.drain(0.05)
             if drainer.has_open_streams:
-                termination = _merge_termination_error(
-                    termination,
+                internal_error = _append_collection_error(
+                    internal_error,
                     "output pipes remained open after process cleanup",
                 )
             if drainer.error is not None:
-                internal_error = drainer.error
+                internal_error = _append_collection_error(internal_error, drainer.error)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             internal_error = f"runner collection failed: {type(error).__name__}"
             termination = _terminate_process_group(
@@ -531,8 +548,8 @@ class LocalCommandRunner:
         completed_at = datetime.now(UTC)
         harness_failure: FailureKind | None
         if internal_error is not None:
-            status = CommandStatus.SPAWN_ERROR
-            evidence_return_code = None
+            status = CommandStatus.COLLECTION_ERROR
+            evidence_return_code = return_code
             harness_failure = FailureKind.EVIDENCE_ERROR
         elif timed_out:
             status = CommandStatus.TIMED_OUT
@@ -542,12 +559,16 @@ class LocalCommandRunner:
                 if termination.process_group_cleared
                 else FailureKind.PROCESS_CLEANUP_ERROR
             )
-        else:
-            status = (
-                CommandStatus.PASSED
-                if return_code == 0
-                else CommandStatus.FAILED
+        elif return_code is not None and return_code < 0:
+            status = CommandStatus.SIGNAL_TERMINATED
+            evidence_return_code = return_code
+            harness_failure = (
+                FailureKind.SIGNAL_TERMINATION
+                if termination.process_group_cleared
+                else FailureKind.PROCESS_CLEANUP_ERROR
             )
+        else:
+            status = CommandStatus.PASSED if return_code == 0 else CommandStatus.FAILED
             evidence_return_code = return_code
             harness_failure = (
                 None
@@ -555,14 +576,14 @@ class LocalCommandRunner:
                 else FailureKind.PROCESS_CLEANUP_ERROR
             )
 
-        stdout, stdout_truncated = _render_collected_text(
+        stdout, stdout_truncated, stdout_decode_replaced = _render_collected_text(
             stdout_collector,
             max_output_bytes=self._settings.max_output_bytes,
             workspace=workspace,
             environment_root=environment_root,
             temporary_root=temporary_root,
         )
-        stderr, stderr_truncated = _render_collected_text(
+        stderr, stderr_truncated, stderr_decode_replaced = _render_collected_text(
             stderr_collector,
             max_output_bytes=self._settings.max_output_bytes,
             workspace=workspace,
@@ -593,6 +614,8 @@ class LocalCommandRunner:
                 stderr=stderr,
                 stdout_truncated=stdout_truncated,
                 stderr_truncated=stderr_truncated,
+                stdout_decode_replaced=stdout_decode_replaced,
+                stderr_decode_replaced=stderr_decode_replaced,
                 termination=termination,
                 error=safe_error,
             ),

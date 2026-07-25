@@ -63,7 +63,9 @@ class CommandStatus(StrEnum):
     PASSED = "passed"
     FAILED = "failed"
     TIMED_OUT = "timed_out"
+    SIGNAL_TERMINATED = "signal_terminated"
     SPAWN_ERROR = "spawn_error"
+    COLLECTION_ERROR = "collection_error"
 
 
 class TerminationReason(StrEnum):
@@ -83,6 +85,7 @@ class FailureKind(StrEnum):
     NONE = "none"
     QUALITY_GATE_FAILURE = "quality_gate_failure"
     TIMEOUT = "timeout"
+    SIGNAL_TERMINATION = "signal_termination"
     COMMAND_UNAVAILABLE = "command_unavailable"
     SPAWN_ERROR = "spawn_error"
     PROCESS_CLEANUP_ERROR = "process_cleanup_error"
@@ -303,6 +306,21 @@ class TerminationEvidence(ContractModel):
     process_group_cleared: StrictBool
     error: StrictStr | None = None
 
+    @model_validator(mode="after")
+    def signal_and_cleanup_state_must_be_consistent(self) -> TerminationEvidence:
+        if self.sigkill_sent and not self.sigterm_sent:
+            raise ValueError("sigkill_sent requires sigterm_sent")
+        if self.reason is TerminationReason.NONE:
+            if self.sigterm_sent or self.sigkill_sent:
+                raise ValueError("termination reason none must not contain sent signals")
+            if not self.process_group_cleared:
+                raise ValueError("termination reason none requires a cleared process group")
+        if self.process_group_cleared and self.error is not None:
+            raise ValueError("cleared process group must not contain a cleanup error")
+        if not self.process_group_cleared and self.error is None:
+            raise ValueError("uncleared process group requires a cleanup error")
+        return self
+
 
 class CommandEvidence(ContractModel):
     gate: GateKind
@@ -317,6 +335,8 @@ class CommandEvidence(ContractModel):
     stderr: StrictStr
     stdout_truncated: StrictBool
     stderr_truncated: StrictBool
+    stdout_decode_replaced: StrictBool
+    stderr_decode_replaced: StrictBool
     termination: TerminationEvidence
     error: StrictStr | None = None
 
@@ -341,11 +361,44 @@ class CommandEvidence(ContractModel):
         if self.status is CommandStatus.PASSED and self.return_code != 0:
             raise ValueError("passed command must have return_code 0")
         if self.status is CommandStatus.FAILED and (
-            self.return_code is None or self.return_code == 0
+            self.return_code is None or self.return_code <= 0
         ):
-            raise ValueError("failed command must have a non-zero return_code")
-        if self.status is CommandStatus.SPAWN_ERROR and self.return_code is not None:
-            raise ValueError("spawn_error command must not have a return_code")
+            raise ValueError("failed command must have a positive non-zero return_code")
+        if self.status is CommandStatus.SIGNAL_TERMINATED and (
+            self.return_code is None or self.return_code >= 0
+        ):
+            raise ValueError("signal_terminated command must have a negative return_code")
+        if self.status is CommandStatus.SPAWN_ERROR:
+            if self.return_code is not None:
+                raise ValueError("spawn_error command must not have a return_code")
+            if self.error is None:
+                raise ValueError("spawn_error command requires an error reason")
+        if self.status is CommandStatus.COLLECTION_ERROR and self.error is None:
+            raise ValueError("collection_error command requires an error reason")
+        if (
+            self.status not in {CommandStatus.SPAWN_ERROR, CommandStatus.COLLECTION_ERROR}
+            and self.error is not None
+        ):
+            raise ValueError("only spawn_error or collection_error may contain an error")
+        if self.status is CommandStatus.TIMED_OUT:
+            if self.termination.reason is not TerminationReason.TIMEOUT:
+                raise ValueError("timed_out command requires termination reason timeout")
+        elif (
+            self.status is not CommandStatus.COLLECTION_ERROR
+            and self.termination.reason is TerminationReason.TIMEOUT
+        ):
+            raise ValueError("termination reason timeout requires timed_out status")
+        if (
+            self.status in {CommandStatus.PASSED, CommandStatus.FAILED}
+            and self.termination.reason
+            not in {TerminationReason.NONE, TerminationReason.RESIDUAL_PROCESS}
+        ):
+            raise ValueError("normally completed command has an invalid termination reason")
+        if (
+            self.status is CommandStatus.SPAWN_ERROR
+            and self.termination.reason is not TerminationReason.NONE
+        ):
+            raise ValueError("spawn_error command must not contain process termination")
         return self
 
 
@@ -439,6 +492,30 @@ class EvidenceArtifact(ContractModel):
                 raise ValueError("harness_error status requires a reason")
         elif self.harness_error is not None:
             raise ValueError("non-Harness result must not contain harness_error")
+
+        required_command_status = {
+            FailureKind.TIMEOUT: CommandStatus.TIMED_OUT,
+            FailureKind.SIGNAL_TERMINATION: CommandStatus.SIGNAL_TERMINATED,
+            FailureKind.COMMAND_UNAVAILABLE: CommandStatus.SPAWN_ERROR,
+            FailureKind.SPAWN_ERROR: CommandStatus.SPAWN_ERROR,
+        }.get(self.failure_kind)
+        if required_command_status is not None and not any(
+            command.status is required_command_status for command in self.commands
+        ):
+            raise ValueError("failure_kind does not match any command status")
+        if (
+            self.failure_kind is FailureKind.PROCESS_CLEANUP_ERROR
+            and not any(
+                not command.termination.process_group_cleared
+                for command in self.commands
+            )
+        ):
+            raise ValueError("process_cleanup_error requires an uncleared command group")
+        if (
+            self.failure_kind is FailureKind.UNSUPPORTED_PLATFORM
+            and self.commands
+        ):
+            raise ValueError("unsupported_platform Evidence must not contain commands")
 
         commands_completed_normally = all(
             command.status in {CommandStatus.PASSED, CommandStatus.FAILED}

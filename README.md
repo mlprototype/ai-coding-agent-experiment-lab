@@ -66,8 +66,8 @@ ExperimentSpecの`runner`にある相対`fixture_path`をSpecの親directoryか�
 直接実行せずsystem temporary directory内の使い捨てコピーでGateを実行します。Evidence
 はstdout、stderr、終了状態、termination結果、diffを保存します。全commandが通常終了し、
 diffの行数が完全で、Workspaceを削除できた場合だけRunMetricsを生成します。通常の非0
-終了は品質不合格ですが、timeout、起動失敗、回収失敗、Evidence不完全はHarness障害で
-あり、Metricsは`null`です。
+終了は品質不合格ですが、signal終了、timeout、起動失敗、output収集失敗、回収失敗、
+Evidence不完全はHarness障害であり、Metricsは`null`です。
 
 サンプルRecordingはReplay pipelineを検証するための合成fixtureです。Provider性能の
 実験結果ではありません。形式と検証規則は
@@ -82,6 +82,8 @@ Phase 2 RunnerはOS security sandboxではありません。process group、環�
 network遮断、CPU/memory quota、悪意あるprocessの完全な封じ込めは保証しません。
 信頼済みのSpec、Fixture、commandだけに使用してください。詳細は
 [docs/SAFE_RUNNER.md](docs/SAFE_RUNNER.md)を参照してください。
+macOSはlocal process-tree testで検証済みです。Linux実装経路は有効ですが、同等の実機
+またはCI検証が完了するまでは「対応設計済み・未検証」です。
 
 ## ロードマップ
 

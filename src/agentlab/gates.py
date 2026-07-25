@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import tempfile
@@ -32,7 +31,7 @@ from agentlab.runner import (
     UnsupportedRunnerPlatformError,
     ensure_runner_platform_supported,
 )
-from agentlab.specs import load_experiment_spec
+from agentlab.specs import load_experiment_spec_document
 from agentlab.workspace import (
     DirectorySnapshot,
     SnapshotError,
@@ -169,15 +168,6 @@ def write_evidence_artifact(
         if temporary_path is not None:
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
-
-
-def _spec_sha256(spec_path: Path) -> str:
-    try:
-        return hashlib.sha256(spec_path.read_bytes()).hexdigest()
-    except OSError as error:
-        raise RunGatesError(
-            f"could not hash ExperimentSpec: {type(error).__name__}"
-        ) from error
 
 
 def _append_harness_detail(existing: str | None, detail: str) -> str:
@@ -405,7 +395,8 @@ def run_gates(
     if not run_id:
         raise RunGatesError("run_id must not be empty")
 
-    spec = load_experiment_spec(spec_path)
+    loaded_spec = load_experiment_spec_document(spec_path)
+    spec = loaded_spec.spec
     if spec.runner is None:
         raise RunGatesError("ExperimentSpec.runner is required for run-gates")
     if task_id not in spec.task_ids:
@@ -438,7 +429,7 @@ def run_gates(
     try:
         artifact = _execute_in_workspace(
             spec=spec,
-            spec_hash=_spec_sha256(spec_path),
+            spec_hash=loaded_spec.sha256,
             source=source,
             source_snapshot=source_snapshot,
             run_id=run_id,

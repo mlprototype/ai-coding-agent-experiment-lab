@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 
@@ -163,6 +164,48 @@ def test_invalid_utf8_output_uses_replacement_character(tmp_path: Path) -> None:
 
     assert result.evidence.status is CommandStatus.PASSED
     assert result.evidence.stdout == "bad:�\n"
+    assert result.evidence.stdout_decode_replaced is True
+    assert result.evidence.stderr_decode_replaced is False
+
+
+def test_literal_replacement_character_is_not_reported_as_decode_repair(
+    tmp_path: Path,
+) -> None:
+    result = _run(tmp_path, [sys.executable, "-c", "print('�')"])
+
+    assert result.evidence.stdout == "�\n"
+    assert result.evidence.stdout_decode_replaced is False
+
+
+def test_signal_termination_is_not_a_quality_gate_failure(tmp_path: Path) -> None:
+    result = _run(
+        tmp_path,
+        [
+            sys.executable,
+            "-c",
+            "import os,signal; os.kill(os.getpid(), signal.SIGTERM)",
+        ],
+    )
+
+    assert result.evidence.status is CommandStatus.SIGNAL_TERMINATED
+    assert result.evidence.return_code == -signal.SIGTERM
+    assert result.harness_failure is FailureKind.SIGNAL_TERMINATION
+
+
+def test_output_selector_failure_is_collection_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_select(_selector: object, _timeout: float | None = None) -> NoReturn:
+        raise OSError("synthetic selector failure")
+
+    monkeypatch.setattr("agentlab.runner.selectors.DefaultSelector.select", fail_select)
+    result = _run(tmp_path, [sys.executable, "-c", "print('started')"])
+
+    assert result.evidence.status is CommandStatus.COLLECTION_ERROR
+    assert result.evidence.status is not CommandStatus.SPAWN_ERROR
+    assert "output selector failed: OSError" in (result.evidence.error or "")
+    assert result.harness_failure is FailureKind.EVIDENCE_ERROR
 
 
 def test_large_stdout_and_stderr_are_drained_and_truncated(tmp_path: Path) -> None:
