@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import signal
 import sys
 from copy import deepcopy
@@ -549,6 +550,57 @@ def test_diff_collection_error_has_null_metrics_and_no_workspace_leak(
     assert artifact.diff.line_counts_complete is False
     assert artifact.metrics is None
     assert artifact.workspace_removed is True
+
+
+def test_read_only_gate_output_is_made_writable_for_cleanup_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = (
+        "import os,pathlib;"
+        "directory=pathlib.Path('read-only-output');"
+        "directory.mkdir();"
+        "(directory/'artifact.txt').write_text('generated\\n',encoding='utf-8');"
+        "os.chmod(directory,0o500)"
+    )
+    spec_path, fixture, _recording = _write_case(
+        tmp_path,
+        quality_gate={
+            "acceptance": [[sys.executable, "-c", script]],
+            "regression": [],
+            "lint": [],
+            "typecheck": [],
+        },
+    )
+    original_rmtree = shutil.rmtree
+    cleanup_attempts: list[Path] = []
+
+    def fail_first_cleanup(path: str | os.PathLike[str]) -> None:
+        temporary_root = Path(path)
+        cleanup_attempts.append(temporary_root)
+        if len(cleanup_attempts) == 1:
+            read_only_directory = temporary_root / "workspace" / "read-only-output"
+            assert read_only_directory.is_dir()
+            assert read_only_directory.stat().st_mode & 0o200 == 0
+            raise PermissionError("synthetic read-only cleanup failure")
+        read_only_directory = temporary_root / "workspace" / "read-only-output"
+        assert read_only_directory.stat().st_mode & 0o200 != 0
+        original_rmtree(path)
+
+    monkeypatch.setattr("agentlab.workspace.shutil.rmtree", fail_first_cleanup)
+    output = tmp_path / "read-only-cleanup.json"
+
+    artifact = _run(spec_path, output).artifact
+
+    assert len(cleanup_attempts) == 2
+    assert cleanup_attempts[0] == cleanup_attempts[1]
+    assert not cleanup_attempts[0].exists()
+    assert artifact.overall_status is EvidenceOverallStatus.PASSED
+    assert artifact.workspace_removed is True
+    assert artifact.metrics is not None
+    assert artifact.diff.changed_files == ["read-only-output/artifact.txt"]
+    assert output.is_file()
+    assert not (fixture / "read-only-output").exists()
 
 
 def test_writer_failure_removes_temporary_artifact(
