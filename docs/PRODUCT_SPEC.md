@@ -32,12 +32,15 @@ Phase 0ではSpec検証とローカルCLI能力確認だけを実行できる。
 - ExperimentSpecはスキーマ版、仮説、比較軸、固定条件、反復、乱数seed、品質Gate、
   停止条件、明示的な実行モードを表現する。
 - 一つのSpecでWorkflowとProviderを同時に変更できない。
-- Replay/Liveの設定は実行モードと一致し、Liveは暗黙の既定値にならない。
+- Replay/Liveの設定は実行モードと一致し、Liveは
+  `require_explicit_confirmation: true`の明示入力を必須とする。
 - RunMetricsは品質、時間、呼出回数、変更量を表現する。
 - UsageMetricsは欠損可能で、欠損しても結果を保存できる。
 - `agentlab validate` はYAMLを検証し、失敗理由と非0終了コードを返す。
 - `agentlab doctor` はCodex/Antigravity CLIを読み取り専用で調査し、人間向けまたは
   JSONでCapabilityReportを返す。
+- commandが利用不可の場合、CapabilityReportは実行path、version、supported能力を
+  報告済みとして扱わない。
 
 ### 将来要件
 
@@ -73,4 +76,3 @@ Phase 0では以下を実装しない。
 - Capability Matrixは実測事実と`not_verified`を分離する。
 - Provider境界、Record/Replay、任意Usage指標の意思決定がADRに残る。
 - READMEが実装済み範囲と未実装範囲を正確に表す。
-

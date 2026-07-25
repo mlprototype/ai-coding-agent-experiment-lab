@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
-from agentlab.models import ExperimentSpec, RunMetrics, UsageMetrics
+from agentlab.models import CapabilityReport, ExperimentSpec, RunMetrics, UsageMetrics
 
 
 def test_valid_experiment_spec_can_be_loaded(
@@ -43,6 +44,89 @@ def test_rejects_multiple_comparison_axes(
 ) -> None:
     data = valid_spec_data()
     data["comparison_axis"] = comparison_axis
+
+    with pytest.raises(ValidationError):
+        ExperimentSpec.model_validate(data)
+
+
+def test_rejects_duplicate_treatments(
+    valid_spec_data: Callable[[], dict[str, Any]],
+) -> None:
+    data = valid_spec_data()
+    data["treatments"] = ["staged", "staged"]
+
+    with pytest.raises(ValidationError, match="treatments must be unique"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_rejects_control_in_treatments(
+    valid_spec_data: Callable[[], dict[str, Any]],
+) -> None:
+    data = valid_spec_data()
+    data["treatments"] = ["one_shot"]
+
+    with pytest.raises(ValidationError, match="control must not also appear"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_rejects_workflow_that_does_not_equal_workflow_control(
+    valid_spec_data: Callable[[], dict[str, Any]],
+) -> None:
+    data = valid_spec_data()
+    data["workflow"] = "staged"
+
+    with pytest.raises(ValidationError, match="workflow must equal control"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_rejects_provider_that_does_not_equal_provider_control(
+    valid_spec_data: Callable[[], dict[str, Any]],
+) -> None:
+    data = valid_spec_data()
+    data.update(
+        comparison_axis="provider",
+        provider="antigravity",
+        control="codex",
+        treatments=["replay"],
+    )
+
+    with pytest.raises(ValidationError, match="provider must equal control"):
+        ExperimentSpec.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("control", "codex"), ("treatments", ["codex"])],
+)
+def test_rejects_provider_values_on_workflow_axis(
+    valid_spec_data: Callable[[], dict[str, Any]],
+    field: str,
+    value: object,
+) -> None:
+    data = valid_spec_data()
+    data[field] = value
+
+    with pytest.raises(ValidationError):
+        ExperimentSpec.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("control", "one_shot"), ("treatments", ["staged"])],
+)
+def test_rejects_workflow_values_on_provider_axis(
+    valid_spec_data: Callable[[], dict[str, Any]],
+    field: str,
+    value: object,
+) -> None:
+    data = valid_spec_data()
+    data.update(
+        comparison_axis="provider",
+        provider="codex",
+        control="codex",
+        treatments=["antigravity"],
+    )
+    data[field] = value
 
     with pytest.raises(ValidationError):
         ExperimentSpec.model_validate(data)
@@ -106,13 +190,49 @@ def test_live_mode_requires_matching_explicit_settings(
         provider="codex",
         execution_mode="live",
         replay=None,
-        live={"record_to": "recordings/live.jsonl"},
+        live={
+            "record_to": "recordings/live.jsonl",
+            "require_explicit_confirmation": True,
+        },
     )
 
     spec = ExperimentSpec.model_validate(data)
 
     assert spec.live is not None
     assert spec.live.require_explicit_confirmation is True
+
+
+def test_live_mode_rejects_omitted_explicit_confirmation(
+    valid_spec_data: Callable[[], dict[str, Any]],
+) -> None:
+    data = valid_spec_data()
+    data.update(
+        provider="codex",
+        execution_mode="live",
+        replay=None,
+        live={"record_to": "recordings/live.jsonl"},
+    )
+
+    with pytest.raises(ValidationError, match="require_explicit_confirmation"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_live_mode_rejects_false_explicit_confirmation(
+    valid_spec_data: Callable[[], dict[str, Any]],
+) -> None:
+    data = valid_spec_data()
+    data.update(
+        provider="codex",
+        execution_mode="live",
+        replay=None,
+        live={
+            "record_to": "recordings/live.jsonl",
+            "require_explicit_confirmation": False,
+        },
+    )
+
+    with pytest.raises(ValidationError, match="require_explicit_confirmation"):
+        ExperimentSpec.model_validate(data)
 
 
 def test_live_mode_rejects_missing_live_settings(
@@ -125,6 +245,46 @@ def test_live_mode_rejects_missing_live_settings(
         ExperimentSpec.model_validate(data)
 
 
+def test_replay_mode_rejects_missing_replay_settings(
+    valid_spec_data: Callable[[], dict[str, Any]],
+) -> None:
+    data = valid_spec_data()
+    data["replay"] = None
+
+    with pytest.raises(ValidationError, match="replay settings are required"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_replay_mode_rejects_live_settings(
+    valid_spec_data: Callable[[], dict[str, Any]],
+) -> None:
+    data = valid_spec_data()
+    data["live"] = {
+        "record_to": "recordings/live.jsonl",
+        "require_explicit_confirmation": True,
+    }
+
+    with pytest.raises(ValidationError, match="live settings must be absent"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_live_mode_rejects_replay_settings(
+    valid_spec_data: Callable[[], dict[str, Any]],
+) -> None:
+    data = valid_spec_data()
+    data.update(
+        provider="codex",
+        execution_mode="live",
+        live={
+            "record_to": "recordings/live.jsonl",
+            "require_explicit_confirmation": True,
+        },
+    )
+
+    with pytest.raises(ValidationError, match="replay settings must be absent"):
+        ExperimentSpec.model_validate(data)
+
+
 def test_rejects_attempt_to_redefine_other_axis_as_fixed_factor(
     valid_spec_data: Callable[[], dict[str, Any]],
 ) -> None:
@@ -133,3 +293,31 @@ def test_rejects_attempt_to_redefine_other_axis_as_fixed_factor(
 
     with pytest.raises(ValidationError):
         ExperimentSpec.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("executable_path", "/fake/agy"),
+        ("cli_version", "agy 1.0"),
+        ("non_interactive_supported", True),
+        ("structured_output_supported", True),
+        ("usage_metrics_supported", True),
+    ],
+)
+def test_unavailable_capability_rejects_reported_details(field: str, value: object) -> None:
+    data: dict[str, object] = {
+        "provider": "antigravity",
+        "command_available": False,
+        "executable_path": None,
+        "cli_version": None,
+        "non_interactive_supported": False,
+        "structured_output_supported": False,
+        "usage_metrics_supported": False,
+        "checked_at": datetime.now(UTC),
+        "notes": [],
+    }
+    data[field] = value
+
+    with pytest.raises(ValidationError, match="unavailable command"):
+        CapabilityReport.model_validate(data)

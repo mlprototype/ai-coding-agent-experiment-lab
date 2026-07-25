@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 from typer.testing import CliRunner
 
@@ -33,3 +34,17 @@ def test_validate_rejects_invalid_spec_with_nonzero_exit(tmp_path: Path) -> None
     assert result.exit_code != 0
     assert "invalid ExperimentSpec" in result.stderr
     assert "repetitions" in result.stderr
+
+
+def test_doctor_human_output_is_readable_when_commands_are_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("agentlab.capabilities.shutil.which", lambda _command: None)
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "codex: not_available" in result.stdout
+    assert "antigravity: not_available" in result.stdout
+    assert "version: not_verified" in result.stdout
+    assert "note:" in result.stdout

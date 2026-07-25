@@ -12,9 +12,11 @@ Live Agent実行は非決定的で、外部サービス、認証、quota、費�
 
 ## Decision
 
-将来のLive実行は明示的opt-inとし、許可された入力、正規化event、終了状態、能力・版、
-必要なEvidenceを必ずRecordする。Record前に秘密情報、認証情報、完全な機密Promptを
-除去する。記録できないLive実行は有効な実験runとして扱わない。
+将来のLive実行は明示的opt-inとし、Specに
+`require_explicit_confirmation: true`が明記されていることを要求する。許可された入力、
+正規化event、終了状態、能力・版、必要なEvidenceを必ずRecordする。Record前に秘密情報、
+認証情報、完全な機密Promptを除去する。記録できないLive実行は有効な実験runとして
+扱わない。
 
 通常のローカルテストとCIはReplay Providerだけを使い、外部AIを呼ばない。Live smoke
 testが必要になった場合は、通常CIと分離された手動承認workflow、費用上限、秘密管理、
@@ -26,4 +28,3 @@ testが必要になった場合は、通常CIと分離された手動承認workf
 - Provider障害やquotaが通常CIを不安定にしない。
 - Recording schema、redaction、retention、互換性管理が必要になる。
 - Replayは過去の挙動を再現するもので、現在のProvider品質を保証しない。
-

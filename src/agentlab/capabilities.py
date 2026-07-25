@@ -18,11 +18,24 @@ class ProbeDefinition:
     command: str
     version_args: tuple[str, ...]
     help_args: tuple[str, ...]
+    non_interactive_markers: tuple[str, ...]
 
 
 PROBES = (
-    ProbeDefinition(Provider.CODEX, "codex", ("--version",), ("exec", "--help")),
-    ProbeDefinition(Provider.ANTIGRAVITY, "agy", ("--version",), ("--help",)),
+    ProbeDefinition(
+        Provider.CODEX,
+        "codex",
+        ("--version",),
+        ("exec", "--help"),
+        ("run codex non-interactively",),
+    ),
+    ProbeDefinition(
+        Provider.ANTIGRAVITY,
+        "agy",
+        ("--version",),
+        ("--help",),
+        ("non-interactive", "--prompt", "headless"),
+    ),
 )
 
 
@@ -93,12 +106,9 @@ def probe_capability(definition: ProbeDefinition) -> CapabilityReport:
     except (OSError, subprocess.SubprocessError) as error:
         notes.append(f"help probe failed: {type(error).__name__}")
 
-    if definition.provider is Provider.CODEX:
-        non_interactive = help_succeeded
-    else:
-        non_interactive = help_succeeded and any(
-            marker in help_text for marker in ("non-interactive", "--prompt", "headless")
-        )
+    non_interactive = help_succeeded and any(
+        marker in help_text for marker in definition.non_interactive_markers
+    )
 
     structured_output = help_succeeded and any(
         marker in help_text for marker in ("--json", "json output", "output-format")
@@ -123,4 +133,3 @@ def probe_capability(definition: ProbeDefinition) -> CapabilityReport:
 
 def doctor_report() -> DoctorReport:
     return DoctorReport(capabilities=[probe_capability(probe) for probe in PROBES])
-

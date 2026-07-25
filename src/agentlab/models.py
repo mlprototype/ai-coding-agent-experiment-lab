@@ -77,7 +77,7 @@ class LiveSettings(ContractModel):
     """Contract only; Phase 0 has no live executor."""
 
     record_to: str = Field(min_length=1)
-    require_explicit_confirmation: Literal[True] = True
+    require_explicit_confirmation: Literal[True]
 
 
 class ExperimentSpec(ContractModel):
@@ -210,9 +210,19 @@ class CapabilityReport(ContractModel):
     notes: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def unavailable_command_has_no_executable(self) -> CapabilityReport:
-        if not self.command_available and self.executable_path is not None:
-            raise ValueError("an unavailable command cannot have an executable_path")
+    def unavailable_command_has_no_reported_capabilities(self) -> CapabilityReport:
+        has_unavailable_details = (
+            self.executable_path is not None
+            or self.cli_version is not None
+            or self.non_interactive_supported
+            or self.structured_output_supported
+            or self.usage_metrics_supported
+        )
+        if not self.command_available and has_unavailable_details:
+            raise ValueError(
+                "an unavailable command cannot report an executable, version, "
+                "or supported capabilities"
+            )
         return self
 
 
