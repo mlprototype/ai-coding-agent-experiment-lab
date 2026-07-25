@@ -1,0 +1,37 @@
+schema_version: "1.0"
+experiment_id: workflow-smoke
+title: Workflow comparison contract smoke test
+research_question: Does a staged workflow improve quality-gate outcomes over one-shot execution?
+hypothesis: The staged workflow will pass the same quality gate more consistently.
+comparison_axis: workflow
+
+workflow: one_shot
+provider: replay
+control: one_shot
+treatments:
+  - staged
+fixed_factors:
+  fixture_revision: phase1-placeholder
+  prompt_template_revision: "1"
+task_ids:
+  - smoke-task
+repetitions: 3
+random_seed: 20260725
+quality_gate:
+  acceptance:
+    - [pytest, -q]
+  regression:
+    - [pytest, -q]
+  lint:
+    - [ruff, check, .]
+  typecheck:
+    - [mypy, src]
+stop_conditions:
+  max_failures: 3
+  max_total_duration_ms: 900000
+  fail_fast: false
+execution_mode: replay
+replay:
+  recording_path: recordings/workflow-smoke.jsonl
+live: null
+
