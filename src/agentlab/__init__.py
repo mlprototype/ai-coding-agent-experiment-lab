@@ -6,12 +6,20 @@ from agentlab.models import (
     DiffEvidence,
     EvidenceArtifact,
     ExperimentSpec,
+    LiveRunArtifact,
     RunMetrics,
     RunnerSettings,
     RunResult,
     UsageMetrics,
 )
-from agentlab.recording import ReplayRecording, RunCompletedEvent, RunStartedEvent
+from agentlab.recording import (
+    LiveRunCompletedEvent,
+    LiveRunFailedEvent,
+    LiveRunStartedEvent,
+    ReplayRecording,
+    RunCompletedEvent,
+    RunStartedEvent,
+)
 
 __all__ = [
     "CapabilityReport",
@@ -19,6 +27,10 @@ __all__ = [
     "DiffEvidence",
     "EvidenceArtifact",
     "ExperimentSpec",
+    "LiveRunArtifact",
+    "LiveRunCompletedEvent",
+    "LiveRunFailedEvent",
+    "LiveRunStartedEvent",
     "ReplayRecording",
     "RunCompletedEvent",
     "RunMetrics",

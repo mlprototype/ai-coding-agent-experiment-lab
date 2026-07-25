@@ -1,0 +1,140 @@
+# Codex CLI Provider
+
+## Scope
+
+Phase 3は、1 task・1 Codex Provider・1 repetition・`one_shot`を人間が手動実行する最小
+vertical sliceである。scheduler、staged Workflow、比較実験、自動retryはPhase 4以降で
+あり、実装していない。通常テストはfake Codexだけを使い、manual Live smokeは未実施。
+
+## Read-only preflight
+
+`live-codex`は確認flag、Spec/Prompt/Fixture/output検証後、`codex`のPATH存在、
+`codex --version`、`codex exec --help`だけを短いtimeout、分離stdout/stderr、
+`shell=False`で確認する。AI Prompt、Login、auth file読取り、network refreshは行わない。
+
+helpには`--json`、`--ephemeral`、`--sandbox`、`--ask-for-approval`、
+`--skip-git-repo-check`、`--ignore-user-config`、`--ignore-rules`、`--strict-config`、
+`--model`、`--config`がすべて必要である。不足時は互換性を推測せずfail closedする。
+永続化するpreflight metadataはCLI version、確認時刻、flag名だけで、実行pathは保存しない。
+
+## Fixed invocation and Prompt
+
+構築するargvの意味は次で固定し、CLIから追加flagを受け付けない。
+
+```text
+codex exec
+  --json
+  --ephemeral
+  --sandbox workspace-write
+  --ask-for-approval never
+  --skip-git-repo-check
+  --ignore-user-config
+  --ignore-rules
+  --strict-config
+  --model <Spec model>
+  --config model_reasoning_effort="<Spec effort>"
+  --config sandbox_workspace_write.network_access=false
+  --config web_search="disabled"
+  -
+```
+
+最後の`-`によりPromptをstdinから渡す。Prompt本文はargv、process list、Recording、
+Evidenceへ入れない。Prompt pathはSpec基準の相対pathで、symlink、通常file以外、不正
+UTF-8、NUL、空白のみ、上限超過を拒否する。SHA-256、byte数、redacted=trueだけを保存する。
+
+`--skip-git-repo-check`は検証済みFixtureの使い捨てコピーだけに使用する。一般repositoryを
+対象にするCLI機能ではない。danger-full-access、full-auto、yolo、resumeは使わない。
+
+## Sandbox, network, and authentication
+
+Codexが生成するcommandはworkspace-write sandbox、approval neverで動く。workspace-write
+network accessをfalse、web searchをdisabledにする。Codex自身のmodel API通信は必要で、
+Phase 3はfirewall、VM、containerによる完全なnetwork遮断を保証しない。
+
+認証は既存CLIのChatGPT-managed authだけを対象にする。`OPENAI_API_KEY`、
+`CODEX_API_KEY`、親の任意secretを継承しない。auth fileをcopy、read、parseせず、
+既存`CODEX_HOME` pathだけをCodex processへ渡し、その値も保存しない。品質Gateは別の
+Phase 2 allowlist環境と専用の一時HOME/TMP/cacheで起動するため、Provider側の一時環境や
+`CODEX_HOME`を受け取らない。
+
+## Incremental JSONL parser
+
+stdoutはraw全体を保持せずchunkごとに処理する。各行でstrict UTF-8、非空、JSON object、
+duplicate key、非有限数、string `type`、1行/全体byte上限を確認する。
+
+成功lifecycleは`thread.started`、`turn.started`、exactly one `turn.completed`の順である。
+`turn.failed`とterminal `error`はProvider失敗にする。item payloadは保存せずitem type件数
+だけを数え、認識していないitem type文字列は本文を保持せず`unknown`へ集約する。
+未知eventはraw payloadを破棄してunknown件数へ加算し、core lifecycleが正しければ
+許容する。
+
+`turn.completed.usage`に存在する非負integerのinput/cached input/output/reasoning output
+Tokenだけを`provider_reported`として写す。Usage欠損は0にせず`not_available`とする。
+cost、quota、価格計算は行わない。
+
+## Persisted and excluded fields
+
+CodexExecutionEvidenceにはrequested model/reasoning、sandbox/approval/network条件、
+CLI version、時刻/duration、status/exit、event/unknown/item件数、Usage、stdout/stderr
+byte数と上限状態、process termination、safe failure kindを保存する。
+
+Prompt本文、agent最終回答、reasoning、command本文/output、file content、raw JSONL、
+raw stderr、thread/session ID、executable path、HOME/CODEX_HOME、認証情報は保存しない。
+Live Artifactのdiffは品質評価に必要なWorkspace変更Evidenceであり、Codex event payload
+とは別契約である。
+
+## Process and Workspace lifecycle
+
+ProviderもPhase 2と同じPOSIX新規session/process group、monotonic timeout、SIGTERM、
+grace、SIGKILL、正常終了後のbackground child回収を使う。stdin/stdout/stderrを
+non-blockingで回収し、大量出力時もraw streamをmemoryへ蓄積しない。
+
+Provider成功時だけ同じWorkspaceでPhase 2 Gateをgroup順に実行する。Provider失敗時は
+Gateを実行しない。最終diff後は成否に関係なくtemporary rootを削除し、Fixture/Prompt
+入力へaliasする出力がないことを保存直前に再確認する。Promptは最初に一度だけ読んだ
+同じbytesからSHA-256を計算してstdinへ渡す。
+
+## Failure taxonomy and Metrics
+
+Provider: `provider_turn_failed`、`provider_cli_nonzero`、`provider_timeout`、
+`provider_unavailable`、`provider_spawn_error`、`provider_input_error`、
+`provider_protocol_error`、`provider_output_limit`。
+
+品質: `quality_gate_failure`。Harness: `process_cleanup_error`、
+`gate_harness_error`、`evidence_error`、`unsupported_platform`。
+
+Provider成功、全Gate通常完了、完全なtext diff、Workspace cleanupが揃う場合だけMetricsを
+生成する。Gate不合格でもMetricsを生成する。agent durationはCodex wall clock、evaluation
+はGate wall clock、totalは合計、agent call=1、retry=0、UsageはCodex terminal event由来。
+
+## Recording 1.1 and Replay
+
+Live Recordingは`run_started`と`run_completed`または`run_failed`の2行だけである。
+strict UTF-8 JSONL、key sort、finite number、末尾newline、atomic公開を使う。成功時は
+MetricsとCodex summary、失敗時はfailure kindとCodex summaryだけを保存する。
+
+EvidenceはRecording bytesのSHA-256を一方向参照する。成功Recording 1.1は外部CLI、
+subprocess、network、GateなしでReplay Resultへ変換できる。失敗RecordingはMetricsが
+ない理由を示して拒否する。Recording 1.0とPhase 1 Result bytesは変更しない。
+
+## 保証できないこととPhase 4境界
+
+workspace-writeとprocess groupはOS security boundaryではない。filesystem readの完全隔離、
+firewall、CPU/memory/process quota、悪意あるprocessの完全な封じ込めは保証しない。
+Codex model API、認証状態、model availability、quota、vendor eventの将来互換もmanual
+smoke前には保証できない。ProviderがPrompt本文をWorkspace変更へ意図的に複製した場合、
+その変更は品質Evidenceのdiff契約に現れうるため、PromptとFixtureは非機密または別途
+レビュー済みでなければならない。
+
+Phase 3は一つの`one_shot` taskを手動実行するだけである。複数task/条件/反復scheduler、
+`staged` Workflow、A/B比較、集計はPhase 4であり、Phase 3 Providerへ先行実装しない。
+
+## Manual smoke
+
+実装、Prompt非保存、JSONL parser、環境分離、process tree、Recording/Replayをレビューし、
+CLI helpが必須flagをすべて持ち、ChatGPT-managed auth、model/quota、送信対象を確認した後、
+READMEの`live-codex ... --confirm-live-codex`を1回だけ手動実行する。
+
+現在確認した`codex-cli 0.146.0-alpha.3.1`は`exec --help`に
+`--ask-for-approval`を表示しないため、preflightはfail closedする。manual Live smokeは
+未実施である。

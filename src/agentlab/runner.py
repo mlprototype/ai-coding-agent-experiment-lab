@@ -385,6 +385,38 @@ def _append_collection_error(existing: str | None, detail: str) -> str:
     return detail if existing is None else f"{existing}; {detail}"
 
 
+def process_group_exists(process_group_id: int) -> tuple[bool, str | None]:
+    """Expose the Phase 2 process-group inspection contract to Provider runners."""
+    return _group_exists(process_group_id)
+
+
+def terminate_process_group(
+    process: subprocess.Popen[bytes],
+    *,
+    reason: TerminationReason,
+    grace_seconds: float,
+    drain: Callable[[float], None],
+) -> TerminationEvidence:
+    """Use the same bounded SIGTERM/SIGKILL policy for Gate and Provider processes."""
+    return _terminate_process_group(
+        process,
+        reason=reason,
+        grace_seconds=grace_seconds,
+        drain=drain,
+    )
+
+
+def termination_without_signal() -> TerminationEvidence:
+    return _termination_without_signal()
+
+
+def merge_termination_error(
+    termination: TerminationEvidence,
+    error: str,
+) -> TerminationEvidence:
+    return _merge_termination_error(termination, error)
+
+
 class LocalCommandRunner:
     """Execute one already-validated argv in a disposable workspace."""
 

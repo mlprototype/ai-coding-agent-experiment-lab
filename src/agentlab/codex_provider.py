@@ -1,0 +1,980 @@
+"""Redacted Codex CLI preflight, JSONL parsing, and bounded process execution."""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import selectors
+import shutil
+import subprocess
+import time
+from collections.abc import Mapping
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import IO, Any, NoReturn, cast
+
+from agentlab.models import (
+    CODEX_REQUIRED_EXEC_FLAGS,
+    CodexExecutionEvidence,
+    LiveFailureKind,
+    LiveSettings,
+    Provider,
+    ProviderExecutionStatus,
+    ReasoningEffort,
+    RunnerSettings,
+    TerminationEvidence,
+    TerminationReason,
+    UsageMetrics,
+    UsageMetricSource,
+)
+from agentlab.runner import (
+    UnsupportedRunnerPlatformError,
+    ensure_runner_platform_supported,
+    merge_termination_error,
+    process_group_exists,
+    terminate_process_group,
+    termination_without_signal,
+)
+
+PREFLIGHT_TIMEOUT_SECONDS = 5.0
+_READ_CHUNK_BYTES = 64 * 1024
+_POLL_INTERVAL_SECONDS = 0.01
+_PROVIDER_ENV_ALLOWLIST = (
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "SYSTEMROOT",
+    "COMSPEC",
+    "PATHEXT",
+)
+REQUIRED_CODEX_EXEC_FLAGS = CODEX_REQUIRED_EXEC_FLAGS
+_SAFE_ITEM_TYPES = frozenset(
+    {
+        "agent_message",
+        "command",
+        "command_execution",
+        "error",
+        "file",
+        "file_change",
+        "mcp_tool_call",
+        "message",
+        "reasoning",
+        "todo_list",
+        "web_search",
+    }
+)
+
+
+class CodexPreflightError(ValueError):
+    """A read-only compatibility check failed before a Live process could start."""
+
+    def __init__(
+        self,
+        failure_kind: LiveFailureKind,
+        message: str,
+        *,
+        checked_at: datetime,
+        cli_version: str | None = None,
+        verified_flags: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.failure_kind = failure_kind
+        self.checked_at = checked_at
+        self.cli_version = cli_version
+        self.verified_flags = verified_flags
+
+
+class CodexProtocolError(ValueError):
+    """A bounded JSONL stream did not satisfy the minimal lifecycle contract."""
+
+    def __init__(self, failure_kind: LiveFailureKind, message: str) -> None:
+        super().__init__(message)
+        self.failure_kind = failure_kind
+
+
+@dataclass(frozen=True)
+class CodexPreflight:
+    executable: str
+    cli_version: str
+    checked_at: datetime
+    verified_flags: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CodexParseSummary:
+    event_count: int
+    unknown_event_count: int
+    item_type_counts: dict[str, int]
+    usage_metrics: UsageMetrics
+    turn_failed: bool
+
+
+@dataclass(frozen=True)
+class CodexRunResult:
+    evidence: CodexExecutionEvidence
+
+
+class _DuplicateKeyError(ValueError):
+    pass
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateKeyError(key)
+        result[key] = value
+    return result
+
+
+def _reject_non_finite(value: str) -> NoReturn:
+    raise ValueError(f"non-finite JSON number {value}")
+
+
+def _parse_finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number {value}")
+    return parsed
+
+
+def _not_available_usage() -> UsageMetrics:
+    return UsageMetrics(source=UsageMetricSource.NOT_AVAILABLE)
+
+
+class CodexJsonlParser:
+    """Incrementally normalize only safe counts and Usage from vendor JSONL."""
+
+    def __init__(self, *, max_line_bytes: int, max_total_bytes: int) -> None:
+        self._max_line_bytes = max_line_bytes
+        self._max_total_bytes = max_total_bytes
+        self._buffer = bytearray()
+        self.total_bytes = 0
+        self.event_count = 0
+        self.unknown_event_count = 0
+        self.item_type_counts: dict[str, int] = {}
+        self.usage_metrics = _not_available_usage()
+        self._thread_started = False
+        self._turn_started = False
+        self._terminal_seen = False
+        self._turn_failed = False
+
+    def feed(self, chunk: bytes) -> None:
+        self.total_bytes += len(chunk)
+        if self.total_bytes > self._max_total_bytes:
+            raise CodexProtocolError(
+                LiveFailureKind.PROVIDER_OUTPUT_LIMIT,
+                "Codex JSONL exceeded the configured total byte limit",
+            )
+
+        remaining = chunk
+        while remaining:
+            newline_index = remaining.find(b"\n")
+            if newline_index < 0:
+                self._append_line_bytes(remaining)
+                break
+            self._append_line_bytes(remaining[:newline_index])
+            self._consume_line(bytes(self._buffer))
+            self._buffer.clear()
+            remaining = remaining[newline_index + 1 :]
+
+    def finish(self) -> CodexParseSummary:
+        if self._buffer:
+            self._consume_line(bytes(self._buffer))
+            self._buffer.clear()
+        if not self._terminal_seen:
+            raise CodexProtocolError(
+                LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+                "Codex JSONL did not contain a terminal event",
+            )
+        if not self._turn_failed and not (
+            self._thread_started and self._turn_started
+        ):
+            raise CodexProtocolError(
+                LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+                "Codex success lifecycle is incomplete",
+            )
+        return self.summary()
+
+    def summary(self) -> CodexParseSummary:
+        return CodexParseSummary(
+            event_count=self.event_count,
+            unknown_event_count=self.unknown_event_count,
+            item_type_counts=dict(sorted(self.item_type_counts.items())),
+            usage_metrics=self.usage_metrics,
+            turn_failed=self._turn_failed,
+        )
+
+    def _append_line_bytes(self, value: bytes) -> None:
+        if len(self._buffer) + len(value) > self._max_line_bytes:
+            raise CodexProtocolError(
+                LiveFailureKind.PROVIDER_OUTPUT_LIMIT,
+                "Codex JSONL line exceeded the configured byte limit",
+            )
+        self._buffer.extend(value)
+
+    def _consume_line(self, encoded_line: bytes) -> None:
+        if not encoded_line:
+            raise CodexProtocolError(
+                LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+                "Codex JSONL contains an empty line",
+            )
+        try:
+            line = encoded_line.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise CodexProtocolError(
+                LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+                "Codex JSONL contains invalid UTF-8",
+            ) from error
+        if not line.strip():
+            raise CodexProtocolError(
+                LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+                "Codex JSONL contains an empty line",
+            )
+        try:
+            raw = json.loads(
+                line,
+                object_pairs_hook=_unique_json_object,
+                parse_constant=_reject_non_finite,
+                parse_float=_parse_finite_float,
+            )
+        except _DuplicateKeyError as error:
+            raise CodexProtocolError(
+                LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+                f"Codex JSONL contains duplicate key {error}",
+            ) from error
+        except (json.JSONDecodeError, ValueError) as error:
+            raise CodexProtocolError(
+                LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+                f"Codex JSONL is invalid: {type(error).__name__}",
+            ) from error
+        if not isinstance(raw, dict):
+            raise CodexProtocolError(
+                LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+                "Codex JSONL event must be an object",
+            )
+        event_type = raw.get("type")
+        if not isinstance(event_type, str):
+            raise CodexProtocolError(
+                LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+                "Codex JSONL event type must be a string",
+            )
+        if self._terminal_seen:
+            raise CodexProtocolError(
+                LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+                "Codex JSONL contains an event after its terminal event",
+            )
+
+        self.event_count += 1
+        if event_type == "thread.started":
+            if self._thread_started or self._turn_started:
+                self._invalid_order("thread.started")
+            self._thread_started = True
+        elif event_type == "turn.started":
+            if not self._thread_started or self._turn_started:
+                self._invalid_order("turn.started")
+            self._turn_started = True
+        elif event_type == "turn.completed":
+            if not self._thread_started or not self._turn_started:
+                self._invalid_order("turn.completed")
+            self._terminal_seen = True
+            self.usage_metrics = self._parse_usage(raw.get("usage"))
+        elif event_type == "turn.failed":
+            if not self._thread_started or not self._turn_started:
+                self._invalid_order("turn.failed")
+            self._terminal_seen = True
+            self._turn_failed = True
+        elif event_type == "error":
+            self._terminal_seen = True
+            self._turn_failed = True
+        elif event_type in {"item.started", "item.updated", "item.completed"}:
+            if not self._thread_started or not self._turn_started:
+                self._invalid_order(event_type)
+            item = raw.get("item")
+            item_type = item.get("type") if isinstance(item, dict) else None
+            safe_item_type = (
+                item_type
+                if isinstance(item_type, str) and item_type in _SAFE_ITEM_TYPES
+                else "unknown"
+            )
+            self.item_type_counts[safe_item_type] = (
+                self.item_type_counts.get(safe_item_type, 0) + 1
+            )
+        else:
+            self.unknown_event_count += 1
+
+    def _invalid_order(self, event_type: str) -> NoReturn:
+        raise CodexProtocolError(
+            LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+            f"Codex JSONL lifecycle order is invalid at {event_type}",
+        )
+
+    def _parse_usage(self, value: object) -> UsageMetrics:
+        if value is None:
+            return _not_available_usage()
+        if not isinstance(value, dict):
+            raise CodexProtocolError(
+                LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+                "turn.completed usage must be an object",
+            )
+        names = (
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        )
+        parsed: dict[str, int] = {}
+        for name in names:
+            if name not in value:
+                continue
+            raw_value = value[name]
+            if isinstance(raw_value, bool) or not isinstance(raw_value, int) or raw_value < 0:
+                raise CodexProtocolError(
+                    LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+                    f"turn.completed usage.{name} must be a non-negative integer",
+                )
+            parsed[name] = raw_value
+        if not parsed:
+            return _not_available_usage()
+        return UsageMetrics(
+            **parsed,
+            source=UsageMetricSource.PROVIDER_REPORTED,
+        )
+
+
+def _probe_environment(parent_environment: Mapping[str, str]) -> dict[str, str]:
+    return {
+        name: parent_environment[name]
+        for name in _PROVIDER_ENV_ALLOWLIST
+        if name in parent_environment
+    }
+
+
+def _run_preflight_command(
+    executable: str,
+    args: list[str],
+    *,
+    environment: Mapping[str, str],
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [executable, *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        stdin=subprocess.DEVNULL,
+        shell=False,
+        timeout=PREFLIGHT_TIMEOUT_SECONDS,
+        env=dict(environment),
+    )
+
+
+def _first_nonempty_line(result: subprocess.CompletedProcess[str]) -> str | None:
+    for output in (result.stdout, result.stderr):
+        for line in output.splitlines():
+            if line.strip():
+                return line.strip()
+    return None
+
+
+def preflight_codex(
+    *,
+    parent_environment: Mapping[str, str] | None = None,
+) -> CodexPreflight:
+    """Run only version/help commands and fail closed on an incompatible CLI."""
+    checked_at = datetime.now(UTC)
+    parent = os.environ if parent_environment is None else parent_environment
+    executable = shutil.which("codex", path=parent.get("PATH"))
+    if executable is None:
+        raise CodexPreflightError(
+            LiveFailureKind.PROVIDER_UNAVAILABLE,
+            "codex was not found on PATH",
+            checked_at=checked_at,
+        )
+    environment = _probe_environment(parent)
+    try:
+        version_result = _run_preflight_command(
+            executable,
+            ["--version"],
+            environment=environment,
+        )
+    except (OSError, UnicodeError, subprocess.SubprocessError) as error:
+        raise CodexPreflightError(
+            LiveFailureKind.PROVIDER_UNAVAILABLE,
+            f"codex version preflight failed: {type(error).__name__}",
+            checked_at=checked_at,
+        ) from error
+    version = _first_nonempty_line(version_result)
+    if (
+        version_result.returncode != 0
+        or version is None
+        or len(version.encode("utf-8")) > 256
+    ):
+        raise CodexPreflightError(
+            LiveFailureKind.PROVIDER_UNAVAILABLE,
+            "codex --version did not succeed",
+            checked_at=checked_at,
+        )
+
+    try:
+        help_result = _run_preflight_command(
+            executable,
+            ["exec", "--help"],
+            environment=environment,
+        )
+    except (OSError, UnicodeError, subprocess.SubprocessError) as error:
+        raise CodexPreflightError(
+            LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+            f"codex exec help preflight failed: {type(error).__name__}",
+            checked_at=checked_at,
+            cli_version=version,
+        ) from error
+    if help_result.returncode != 0:
+        raise CodexPreflightError(
+            LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+            "codex exec --help did not succeed",
+            checked_at=checked_at,
+            cli_version=version,
+        )
+    help_text = f"{help_result.stdout}\n{help_result.stderr}"
+    verified_flags = tuple(
+        sorted(
+            flag
+            for flag in REQUIRED_CODEX_EXEC_FLAGS
+            if re.search(
+                rf"(?<![\w-]){re.escape(flag)}(?![\w-])",
+                help_text,
+            )
+        )
+    )
+    missing_flags = sorted(set(REQUIRED_CODEX_EXEC_FLAGS) - set(verified_flags))
+    if missing_flags:
+        raise CodexPreflightError(
+            LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+            f"codex exec help is missing required flags: {', '.join(missing_flags)}",
+            checked_at=checked_at,
+            cli_version=version,
+            verified_flags=verified_flags,
+        )
+    return CodexPreflight(
+        executable=executable,
+        cli_version=version,
+        checked_at=checked_at,
+        verified_flags=verified_flags,
+    )
+
+
+def build_codex_argv(
+    preflight: CodexPreflight,
+    *,
+    model: str,
+    reasoning_effort: ReasoningEffort,
+) -> list[str]:
+    """Construct the fixed safe invocation; Prompt content is deliberately absent."""
+    return [
+        preflight.executable,
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "never",
+        "--skip-git-repo-check",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--strict-config",
+        "--model",
+        model,
+        "--config",
+        f'model_reasoning_effort="{reasoning_effort.value}"',
+        "--config",
+        "sandbox_workspace_write.network_access=false",
+        "--config",
+        'web_search="disabled"',
+        "-",
+    ]
+
+
+def build_codex_environment(
+    environment_root: Path,
+    *,
+    parent_environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Pass only basic locale/PATH plus the existing managed-auth CODEX_HOME path."""
+    parent = os.environ if parent_environment is None else parent_environment
+    environment = _probe_environment(parent)
+    environment.update(
+        {
+            "HOME": str(environment_root / "home"),
+            "TMPDIR": str(environment_root / "tmp"),
+            "XDG_CACHE_HOME": str(environment_root / "cache"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+    codex_home = parent.get("CODEX_HOME")
+    if not codex_home and parent.get("HOME"):
+        codex_home = str(Path(parent["HOME"]) / ".codex")
+    if codex_home:
+        environment["CODEX_HOME"] = codex_home
+    return environment
+
+
+def _preflight_failure_evidence(
+    error: CodexPreflightError,
+    *,
+    live: LiveSettings,
+) -> CodexExecutionEvidence:
+    assert live.model is not None
+    assert live.reasoning_effort is not None
+    now = datetime.now(UTC)
+    return CodexExecutionEvidence(
+        schema_version="1.0",
+        provider=Provider.CODEX,
+        cli_version=error.cli_version,
+        preflight_checked_at=error.checked_at,
+        verified_flags=sorted(error.verified_flags),
+        requested_model=live.model,
+        requested_reasoning_effort=live.reasoning_effort,
+        sandbox_mode="workspace-write",
+        approval_policy="never",
+        web_search_disabled=True,
+        command_network_disabled=True,
+        raw_stream_persisted=False,
+        status=ProviderExecutionStatus.FAILED,
+        failure_kind=error.failure_kind,
+        exit_code=None,
+        started_at=now,
+        completed_at=now,
+        duration_ms=0,
+        event_count=0,
+        unknown_event_count=0,
+        item_type_counts={},
+        usage_metrics=_not_available_usage(),
+        stdout_bytes=0,
+        stderr_bytes=0,
+        stdout_limit_exceeded=False,
+        stderr_truncated=False,
+        termination=termination_without_signal(),
+    )
+
+
+def preflight_failure_evidence(
+    error: CodexPreflightError,
+    *,
+    live: LiveSettings,
+) -> CodexExecutionEvidence:
+    return _preflight_failure_evidence(error, live=live)
+
+
+class CodexProcessRunner:
+    """Run one preflighted Codex process without retaining raw stdout or stderr."""
+
+    def __init__(self, *, live: LiveSettings, runner: RunnerSettings) -> None:
+        self._live = live
+        self._runner = runner
+
+    def run(
+        self,
+        *,
+        preflight: CodexPreflight,
+        prompt: bytes,
+        workspace: Path,
+        environment_root: Path,
+        parent_environment: Mapping[str, str] | None = None,
+    ) -> CodexRunResult:
+        live = self._live
+        assert live.model is not None
+        assert live.reasoning_effort is not None
+        assert live.provider_timeout_ms is not None
+        assert live.max_event_line_bytes is not None
+        assert live.max_provider_output_bytes is not None
+        max_provider_output_bytes = live.max_provider_output_bytes
+        ensure_runner_platform_supported()
+        started_at = datetime.now(UTC)
+        started_monotonic = time.monotonic()
+        parser = CodexJsonlParser(
+            max_line_bytes=live.max_event_line_bytes,
+            max_total_bytes=live.max_provider_output_bytes,
+        )
+        argv = build_codex_argv(
+            preflight,
+            model=live.model,
+            reasoning_effort=live.reasoning_effort,
+        )
+        environment = build_codex_environment(
+            environment_root,
+            parent_environment=parent_environment,
+        )
+        try:
+            process = subprocess.Popen(
+                argv,
+                cwd=workspace,
+                env=environment,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                start_new_session=True,
+            )
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            failure = (
+                LiveFailureKind.PROVIDER_UNAVAILABLE
+                if isinstance(error, FileNotFoundError)
+                else LiveFailureKind.PROVIDER_SPAWN_ERROR
+            )
+            return CodexRunResult(
+                evidence=self._build_evidence(
+                    preflight=preflight,
+                    started_at=started_at,
+                    started_monotonic=started_monotonic,
+                    status=ProviderExecutionStatus.FAILED,
+                    failure_kind=failure,
+                    exit_code=None,
+                    parser=parser,
+                    stderr_bytes=0,
+                    stderr_truncated=False,
+                    termination=termination_without_signal(),
+                )
+            )
+
+        assert process.stdin is not None
+        assert process.stdout is not None
+        assert process.stderr is not None
+        streams: dict[str, IO[bytes]] = {
+            "stdin": process.stdin,
+            "stdout": process.stdout,
+            "stderr": process.stderr,
+        }
+        selector = selectors.DefaultSelector()
+        try:
+            for name, stream in streams.items():
+                os.set_blocking(stream.fileno(), False)
+                event = selectors.EVENT_WRITE if name == "stdin" else selectors.EVENT_READ
+                selector.register(stream, event, name)
+        except (OSError, ValueError) as error:
+            termination = terminate_process_group(
+                process,
+                reason=TerminationReason.EMERGENCY_CLEANUP,
+                grace_seconds=self._runner.termination_grace_ms / 1000,
+                drain=lambda _timeout: None,
+            )
+            for stream in streams.values():
+                with suppress(OSError):
+                    stream.close()
+            selector.close()
+            failure = (
+                LiveFailureKind.EVIDENCE_ERROR
+                if termination.process_group_cleared
+                else LiveFailureKind.PROCESS_CLEANUP_ERROR
+            )
+            del error
+            return CodexRunResult(
+                evidence=self._build_evidence(
+                    preflight=preflight,
+                    started_at=started_at,
+                    started_monotonic=started_monotonic,
+                    status=ProviderExecutionStatus.FAILED,
+                    failure_kind=failure,
+                    exit_code=process.poll(),
+                    parser=parser,
+                    stderr_bytes=0,
+                    stderr_truncated=False,
+                    termination=termination,
+                )
+            )
+
+        prompt_offset = 0
+        stderr_bytes = 0
+        stderr_truncated = False
+        failure_kind: LiveFailureKind | None = None
+        timed_out = False
+        termination = termination_without_signal()
+        return_code: int | None = None
+        protocol_error: CodexProtocolError | None = None
+
+        def close_stream(name: str) -> None:
+            stream = streams[name]
+            with suppress(KeyError, ValueError):
+                selector.unregister(stream)
+            with suppress(OSError):
+                stream.close()
+
+        def drain_once(timeout: float) -> None:
+            nonlocal prompt_offset, stderr_bytes, stderr_truncated
+            nonlocal failure_kind, protocol_error
+            if not selector.get_map():
+                return
+            try:
+                ready = selector.select(max(timeout, 0.0))
+            except OSError:
+                if failure_kind is None:
+                    failure_kind = LiveFailureKind.EVIDENCE_ERROR
+                return
+            for key, _events in ready:
+                name = cast(str, key.data)
+                stream = cast(IO[bytes], key.fileobj)
+                if name == "stdin":
+                    try:
+                        written = os.write(stream.fileno(), prompt[prompt_offset:])
+                    except BlockingIOError:
+                        continue
+                    except (BrokenPipeError, OSError):
+                        failure_kind = LiveFailureKind.PROVIDER_INPUT_ERROR
+                        close_stream("stdin")
+                        continue
+                    prompt_offset += written
+                    if prompt_offset == len(prompt):
+                        close_stream("stdin")
+                    continue
+
+                try:
+                    chunk = os.read(stream.fileno(), _READ_CHUNK_BYTES)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    if failure_kind is None:
+                        failure_kind = LiveFailureKind.EVIDENCE_ERROR
+                    close_stream(name)
+                    continue
+                if not chunk:
+                    close_stream(name)
+                    continue
+                if name == "stdout":
+                    try:
+                        parser.feed(chunk)
+                    except CodexProtocolError as error:
+                        protocol_error = error
+                        failure_kind = error.failure_kind
+                else:
+                    stderr_bytes += len(chunk)
+                    if stderr_bytes > max_provider_output_bytes:
+                        stderr_truncated = True
+
+        try:
+            deadline = started_monotonic + live.provider_timeout_ms / 1000
+            while True:
+                drain_once(0.05)
+                return_code = process.poll()
+                if failure_kind is not None:
+                    termination = terminate_process_group(
+                        process,
+                        reason=TerminationReason.EMERGENCY_CLEANUP,
+                        grace_seconds=self._runner.termination_grace_ms / 1000,
+                        drain=drain_once,
+                    )
+                    return_code = process.poll()
+                    break
+                if return_code is not None:
+                    exists, inspection_error = process_group_exists(process.pid)
+                    if inspection_error is not None:
+                        termination = TerminationEvidence(
+                            reason=TerminationReason.RESIDUAL_PROCESS,
+                            sigterm_sent=False,
+                            sigkill_sent=False,
+                            process_group_cleared=False,
+                            error=inspection_error,
+                        )
+                    elif exists:
+                        termination = terminate_process_group(
+                            process,
+                            reason=TerminationReason.RESIDUAL_PROCESS,
+                            grace_seconds=self._runner.termination_grace_ms / 1000,
+                            drain=drain_once,
+                        )
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    termination = terminate_process_group(
+                        process,
+                        reason=TerminationReason.TIMEOUT,
+                        grace_seconds=self._runner.termination_grace_ms / 1000,
+                        drain=drain_once,
+                    )
+                    return_code = process.poll()
+                    break
+
+            if process.poll() is None:
+                process.kill()
+                try:
+                    process.wait(timeout=max(self._runner.termination_grace_ms / 1000, 0.5))
+                except subprocess.TimeoutExpired:
+                    termination = merge_termination_error(
+                        termination,
+                        "Provider parent remained after direct kill",
+                    )
+                else:
+                    termination = merge_termination_error(
+                        termination,
+                        "Provider parent escaped its process group",
+                    )
+                return_code = process.poll()
+
+            output_deadline = time.monotonic() + max(
+                self._runner.termination_grace_ms / 1000,
+                0.5,
+            )
+            while (
+                any(name in {"stdout", "stderr"} for name in self._registered_names(selector))
+                and time.monotonic() < output_deadline
+            ):
+                drain_once(0.05)
+            if any(
+                name in {"stdout", "stderr"} for name in self._registered_names(selector)
+            ) and failure_kind is None:
+                failure_kind = LiveFailureKind.EVIDENCE_ERROR
+        finally:
+            for name in tuple(streams):
+                close_stream(name)
+            selector.close()
+
+        summary = parser.summary()
+        if protocol_error is None:
+            try:
+                summary = parser.finish()
+            except CodexProtocolError as error:
+                protocol_error = error
+
+        if not termination.process_group_cleared:
+            final_failure = LiveFailureKind.PROCESS_CLEANUP_ERROR
+        elif timed_out:
+            final_failure = LiveFailureKind.PROVIDER_TIMEOUT
+        elif failure_kind is not None:
+            final_failure = failure_kind
+        elif summary.turn_failed:
+            final_failure = LiveFailureKind.PROVIDER_TURN_FAILED
+        elif return_code != 0:
+            final_failure = LiveFailureKind.PROVIDER_CLI_NONZERO
+        elif protocol_error is not None:
+            final_failure = protocol_error.failure_kind
+        elif prompt_offset != len(prompt):
+            final_failure = LiveFailureKind.PROVIDER_INPUT_ERROR
+        else:
+            final_failure = LiveFailureKind.NONE
+        status = (
+            ProviderExecutionStatus.SUCCEEDED
+            if final_failure is LiveFailureKind.NONE
+            else ProviderExecutionStatus.FAILED
+        )
+        return CodexRunResult(
+            evidence=self._build_evidence(
+                preflight=preflight,
+                started_at=started_at,
+                started_monotonic=started_monotonic,
+                status=status,
+                failure_kind=final_failure,
+                exit_code=return_code,
+                parser=parser,
+                stderr_bytes=stderr_bytes,
+                stderr_truncated=stderr_truncated,
+                stdout_limit_exceeded=(
+                    failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
+                    or (
+                        protocol_error is not None
+                        and protocol_error.failure_kind
+                        is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
+                    )
+                ),
+                termination=termination,
+                summary=summary,
+            )
+        )
+
+    @staticmethod
+    def _registered_names(selector: selectors.BaseSelector) -> set[str]:
+        return {cast(str, key.data) for key in selector.get_map().values()}
+
+    def _build_evidence(
+        self,
+        *,
+        preflight: CodexPreflight,
+        started_at: datetime,
+        started_monotonic: float,
+        status: ProviderExecutionStatus,
+        failure_kind: LiveFailureKind,
+        exit_code: int | None,
+        parser: CodexJsonlParser,
+        stderr_bytes: int,
+        stderr_truncated: bool,
+        termination: TerminationEvidence,
+        stdout_limit_exceeded: bool = False,
+        summary: CodexParseSummary | None = None,
+    ) -> CodexExecutionEvidence:
+        assert self._live.model is not None
+        assert self._live.reasoning_effort is not None
+        parsed = parser.summary() if summary is None else summary
+        return CodexExecutionEvidence(
+            schema_version="1.0",
+            provider=Provider.CODEX,
+            cli_version=preflight.cli_version,
+            preflight_checked_at=preflight.checked_at,
+            verified_flags=sorted(preflight.verified_flags),
+            requested_model=self._live.model,
+            requested_reasoning_effort=self._live.reasoning_effort,
+            sandbox_mode="workspace-write",
+            approval_policy="never",
+            web_search_disabled=True,
+            command_network_disabled=True,
+            raw_stream_persisted=False,
+            status=status,
+            failure_kind=failure_kind,
+            exit_code=exit_code,
+            started_at=started_at,
+            completed_at=datetime.now(UTC),
+            duration_ms=max(0, int((time.monotonic() - started_monotonic) * 1000)),
+            event_count=parsed.event_count,
+            unknown_event_count=parsed.unknown_event_count,
+            item_type_counts=parsed.item_type_counts,
+            usage_metrics=parsed.usage_metrics,
+            stdout_bytes=parser.total_bytes,
+            stderr_bytes=stderr_bytes,
+            stdout_limit_exceeded=stdout_limit_exceeded,
+            stderr_truncated=stderr_truncated,
+            termination=termination,
+        )
+
+
+def unsupported_platform_evidence(
+    error: UnsupportedRunnerPlatformError,
+    *,
+    preflight: CodexPreflight,
+    live: LiveSettings,
+) -> CodexExecutionEvidence:
+    del error
+    assert live.model is not None
+    assert live.reasoning_effort is not None
+    now = datetime.now(UTC)
+    return CodexExecutionEvidence(
+        schema_version="1.0",
+        provider=Provider.CODEX,
+        cli_version=preflight.cli_version,
+        preflight_checked_at=preflight.checked_at,
+        verified_flags=sorted(preflight.verified_flags),
+        requested_model=live.model,
+        requested_reasoning_effort=live.reasoning_effort,
+        sandbox_mode="workspace-write",
+        approval_policy="never",
+        web_search_disabled=True,
+        command_network_disabled=True,
+        raw_stream_persisted=False,
+        status=ProviderExecutionStatus.FAILED,
+        failure_kind=LiveFailureKind.UNSUPPORTED_PLATFORM,
+        exit_code=None,
+        started_at=now,
+        completed_at=now,
+        duration_ms=0,
+        event_count=0,
+        unknown_event_count=0,
+        item_type_counts={},
+        usage_metrics=_not_available_usage(),
+        stdout_bytes=0,
+        stderr_bytes=0,
+        stdout_limit_exceeded=False,
+        stderr_truncated=False,
+        termination=termination_without_signal(),
+    )

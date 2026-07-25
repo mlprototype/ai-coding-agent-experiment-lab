@@ -1,8 +1,8 @@
 # CLI Capability Matrix
 
-確認日時: 2026-07-25（Asia/Tokyo）
+最終read-only再確認: 2026-07-26（Asia/Tokyo）
 
-この文書はPhase 0時点のローカル環境で、指定された読み取り専用コマンドだけを実行した
+この文書はPhase 3実装時のローカル環境で、指定された読み取り専用コマンドだけを実行した
 結果である。利用できないCLIの能力は推測しない。CLIや環境の更新後は
 `agentlab doctor --json`と元コマンドで再確認する。
 
@@ -13,6 +13,7 @@
 | 指定help | `codex exec --help` 成功 | `not_verified` |
 | Non-interactive | verified: helpに「Run Codex non-interactively」 | `not_verified` |
 | Structured output | verified: `--json`でJSONL event出力 | `not_verified` |
+| Phase 3必須flag | `--ask-for-approval`だけ未検出、Live preflightはfail closed | `not_verified` |
 | Usage metrics | `not_verified`（指定helpに明示なし） | `not_verified` |
 | Live課題実行 | 未実施 | 未実施 |
 
@@ -24,6 +25,10 @@
 - `codex --version`は終了コード0で上記versionを返した。
 - `codex exec --help`は終了コード0で、非対話実行、`--json`によるJSONL event出力、
   `--output-schema`を表示した。
+- Phase 3で必要な`--ephemeral`、`--sandbox`、`--skip-git-repo-check`、
+  `--ignore-user-config`、`--ignore-rules`、`--strict-config`、`--model`、`--config`を
+  helpで確認した。`--ask-for-approval`はこのversionの`exec --help`に存在しなかった。
+  このため現在の実CLIに対するPhase 3 preflightはAI送信前に拒否する。
 - 起動時にPATH aliasを作成できない旨のwarningがstderrへ出たが、version/help確認は
   成功した。
 
@@ -36,7 +41,6 @@
 
 - どちらのProviderについても認証、Login状態、API接続、Live AI実行、実際のevent
   schema、Token/コスト取得、quota情報、終了/timeout時の挙動は確認していない。
-- Codexの`--json`が示す構造化eventを本プロジェクトの契約へ変換できるかはPhase 3で
-  検証する。
+- Codex JSONL parserと変換はfake CLIでoffline検証済みだが、実CLI eventとのLive統合は
+  manual smoke未実施のため未確認である。
 - Antigravityの非対話実行、構造化出力、Usage指標を含む全能力は`not_verified`である。
-

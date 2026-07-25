@@ -32,7 +32,7 @@ Recording。
 
 ## Phase 2: Safe Runner, Evidence and Quality Gate
 
-**Status: Current**
+**Status: Complete**
 
 **目的:** 信頼済みFixtureを使い捨てWorkspaceで実行し、変更と品質Gateの証跡を
 Harness障害と品質不合格を混同せず収集する。
@@ -50,15 +50,19 @@ Evidence不完全ではMetricsを生成しない。Phase 1 Replayのbyte決定�
 
 ## Phase 3: Codex CLI Provider
 
-**Status: Planned**
+**Status: Current**
 
 **目的:** Codex CLIを共通Provider境界へ接続し、安全なLive Recordを実現する。
 
-**成果物:** Codex adapter、能力/版のpreflight、Prompt入力、構造化event変換、
-redaction付きrecording、明示的Live opt-in。
+**成果物:** Codex adapter、能力/版のread-only preflight、stdin Prompt、incremental
+JSONL parser、Provider process tree停止、正規化Codex Evidence、redaction済みRecording
+1.1、Live Evidence、成功RecordingのReplay、明示的Live opt-in、fake CLI offline test。
 
 **受入条件:** 手動の隔離環境で一つのfixtureを実行・Recordでき、その記録をReplayして
 同じ正規化eventを得る。認証情報や機密Promptを成果物へ保存しない。通常CIは呼ばない。
+実装とoffline受入は完了している。実Codexによるmanual Live smokeは未実施であり、diff、
+redaction、認証環境分離、process tree、Recording/Replayをレビューした後の残受入条件
+とする。
 
 ## Phase 4: Workflow A/B Experiment
 

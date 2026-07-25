@@ -16,8 +16,8 @@ Antigravity CLI / Replay Provider）は分離します。一度に変える独�
 
 ## 現在の状態
 
-Phase 0とPhase 1を完了し、現在は
-**Phase 2: Safe Runner, Evidence and Quality Gate** です。次を提供します。
+Phase 0〜2を完了し、現在は
+**Phase 3: Codex CLI Provider** です。次を提供します。
 
 - バージョン付きExperimentSpec、RunMetrics、UsageMetrics、CapabilityReport
 - YAML Specの検証
@@ -29,11 +29,15 @@ Phase 0とPhase 1を完了し、現在は
 - timeout、process group停止、残存子process回収、環境変数allowlist
 - 上限付きstdout/stderr、実行前後diff、終了状態を持つversion付きEvidence
 - 通常のGate不合格とHarness障害を分ける`agentlab run-gates`
+- read-only Codex CLI preflightと、明示確認が必要な`agentlab live-codex`
+- stdin Prompt、上限付きincremental JSONL parser、redaction済みCodex Evidence
+- 2イベントのLive Recording 1.1と、その成功記録のoffline Replay
+- Provider成功後に同じ使い捨てWorkspaceで品質Gateを実行する最小vertical slice
 
 Replayは引き続きRecording内の保存済みMetricsだけを再構成し、外部処理を呼びません。
-Phase 2にはCodex/Antigravity、外部AI、APIを起動するProvider経路を実装しておらず、
-同梱Runner smokeもlocalかつnetwork不要です。Live AI、scheduler、Workflow A/B、
-Provider比較、比較レポートは未実装です。
+通常テストは短時間のfake Codex executableだけを使い、実Codex、外部AI、network、
+quotaを呼びません。Phase 3のmanual Live smokeは未実行です。scheduler、staged
+Workflow、Workflow A/B、Antigravity、Provider比較、比較レポートは未実装です。
 
 ## Quick Start
 
@@ -44,6 +48,7 @@ uv sync --extra dev
 uv run agentlab doctor
 uv run agentlab doctor --json
 uv run agentlab validate experiments/examples/workflow-smoke.yaml
+uv run agentlab validate experiments/examples/codex-live-smoke.yaml
 uv run agentlab replay experiments/examples/workflow-smoke.yaml \
   --output .artifacts/runs/workflow-smoke-run-001.json
 uv run agentlab run-gates experiments/examples/workflow-smoke.yaml \
@@ -55,6 +60,34 @@ uv run pytest
 uv run ruff check .
 uv run mypy src
 ```
+
+実Codexを使うmanual smokeは、実装とdiffのレビュー後に人間が外部送信とquota消費を
+承認した場合だけ、次を1回実行します。
+
+```console
+uv run agentlab live-codex experiments/examples/codex-live-smoke.yaml \
+  --task-id codex-live-smoke \
+  --repetition-index 0 \
+  --run-id codex-live-smoke-001 \
+  --output .artifacts/evidence/codex-live-smoke-001.json \
+  --confirm-live-codex
+```
+
+現在確認済みの`codex-cli 0.146.0-alpha.3.1`は`exec --help`に
+`--ask-for-approval`を表示しないため、上記実行はpreflightでfail closedします。
+互換CLIで必須flagを再確認するまでmanual smokeは実行しません。
+
+`--confirm-live-codex`なしではversion/help preflightを含むsubprocessを起動しません。
+確認付き実行はCodex model APIへのPrompt送信とquota消費を伴います。Promptはargvへ
+含めずstdinから渡し、Prompt本文、raw Codex JSONL、raw stderr、agent message、
+reasoning、command output、thread/session IDをRecordingやEvidenceへ保存しません。
+PromptはSHA-256とbyte数だけを保存します。
+
+Phase 3の認証対象は既存Codex CLIのChatGPT-managed authenticationだけです。
+`OPENAI_API_KEY`と`CODEX_API_KEY`はProvider processへ継承せず、API key方式は未対応です。
+Codex自身のmodel API通信は必要ですが、model-generated commandのnetwork accessと
+web searchを無効化します。OS-levelの完全なnetwork遮断ではありません。詳細は
+[docs/CODEX_PROVIDER.md](docs/CODEX_PROVIDER.md)を参照してください。
 
 `doctor` はローカルコマンドの存在、バージョン、helpだけを確認します。ログイン、API呼び
 出し、AIタスク実行はしません。`replay`も外部処理を実行せず、Specファイルからの相対
@@ -89,8 +122,8 @@ macOSはlocal process-tree testで検証済みです。Linux実装経路は有�
 
 - Phase 0: Foundation and Capability Spike（完了）
 - Phase 1: Replay Vertical Slice（完了）
-- Phase 2: Safe Runner, Evidence and Quality Gate（現在）
-- Phase 3: Codex CLI Provider
+- Phase 2: Safe Runner, Evidence and Quality Gate（完了）
+- Phase 3: Codex CLI Provider（現在、manual Live smoke未実施）
 - Phase 4: Workflow A/B Experiment
 - Phase 5: Antigravity CLI Provider
 - Phase 6: Multi-language Fixtures and Public Report

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import re
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Literal
@@ -25,6 +26,20 @@ class ContractModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+CODEX_REQUIRED_EXEC_FLAGS = (
+    "--ask-for-approval",
+    "--config",
+    "--ephemeral",
+    "--ignore-rules",
+    "--ignore-user-config",
+    "--json",
+    "--model",
+    "--sandbox",
+    "--skip-git-repo-check",
+    "--strict-config",
+)
+
+
 class ComparisonAxis(StrEnum):
     WORKFLOW = "workflow"
     PROVIDER = "provider"
@@ -44,6 +59,13 @@ class Provider(StrEnum):
 class ExecutionMode(StrEnum):
     REPLAY = "replay"
     LIVE = "live"
+
+
+class ReasoningEffort(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
 
 
 class UsageMetricSource(StrEnum):
@@ -93,6 +115,35 @@ class FailureKind(StrEnum):
     UNSUPPORTED_PLATFORM = "unsupported_platform"
 
 
+class ProviderExecutionStatus(StrEnum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class LiveOverallStatus(StrEnum):
+    PASSED = "passed"
+    FAILED = "failed"
+    PROVIDER_ERROR = "provider_error"
+    HARNESS_ERROR = "harness_error"
+
+
+class LiveFailureKind(StrEnum):
+    NONE = "none"
+    PROVIDER_TURN_FAILED = "provider_turn_failed"
+    PROVIDER_CLI_NONZERO = "provider_cli_nonzero"
+    PROVIDER_TIMEOUT = "provider_timeout"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    PROVIDER_SPAWN_ERROR = "provider_spawn_error"
+    PROVIDER_INPUT_ERROR = "provider_input_error"
+    PROVIDER_PROTOCOL_ERROR = "provider_protocol_error"
+    PROVIDER_OUTPUT_LIMIT = "provider_output_limit"
+    PROCESS_CLEANUP_ERROR = "process_cleanup_error"
+    QUALITY_GATE_FAILURE = "quality_gate_failure"
+    GATE_HARNESS_ERROR = "gate_harness_error"
+    EVIDENCE_ERROR = "evidence_error"
+    UNSUPPORTED_PLATFORM = "unsupported_platform"
+
+
 class QualityGate(ContractModel):
     """The only argv sequences that the local quality-gate runner may execute."""
 
@@ -125,10 +176,92 @@ class ReplaySettings(ContractModel):
 
 
 class LiveSettings(ContractModel):
-    """Contract only; Phase 0 has no live executor."""
+    """Backward-compatible Live contract; Phase 3 fields opt into Codex execution."""
 
     record_to: str = Field(min_length=1)
-    require_explicit_confirmation: Literal[True]
+    prompt_path: StrictStr | None = Field(default=None, min_length=1)
+    model: StrictStr | None = Field(default=None, min_length=1, max_length=128)
+    reasoning_effort: ReasoningEffort | None = None
+    provider_timeout_ms: StrictInt | None = Field(
+        default=None,
+        gt=0,
+        le=1_800_000,
+    )
+    max_prompt_bytes: StrictInt | None = Field(
+        default=None,
+        gt=0,
+        le=1024 * 1024,
+    )
+    max_event_line_bytes: StrictInt | None = Field(
+        default=None,
+        gt=0,
+        le=4 * 1024 * 1024,
+    )
+    max_provider_output_bytes: StrictInt | None = Field(
+        default=None,
+        gt=0,
+        le=64 * 1024 * 1024,
+    )
+    require_explicit_confirmation: StrictBool
+
+    @field_validator("model")
+    @classmethod
+    def model_must_be_an_explicit_condition(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.strip() or value != value.strip() or "\x00" in value:
+            raise ValueError("live.model must be a non-empty explicit model identifier")
+        mutable_aliases = {"latest", "default", "auto"}
+        normalized_parts = set(re.split(r"[-_/.]", value.casefold()))
+        if mutable_aliases.intersection(normalized_parts):
+            raise ValueError("live.model must not use a mutable alias")
+        return value
+
+    @model_validator(mode="after")
+    def phase3_fields_are_all_present_or_all_absent(self) -> LiveSettings:
+        if not self.require_explicit_confirmation:
+            raise ValueError("live.require_explicit_confirmation must be true")
+        phase3_values = (
+            self.prompt_path,
+            self.model,
+            self.reasoning_effort,
+            self.provider_timeout_ms,
+            self.max_prompt_bytes,
+            self.max_event_line_bytes,
+            self.max_provider_output_bytes,
+        )
+        if any(value is not None for value in phase3_values) and not all(
+            value is not None for value in phase3_values
+        ):
+            raise ValueError("Phase 3 live settings must be configured as a complete set")
+        if (
+            self.max_event_line_bytes is not None
+            and self.max_provider_output_bytes is not None
+            and self.max_event_line_bytes > self.max_provider_output_bytes
+        ):
+            raise ValueError(
+                "live.max_event_line_bytes must not exceed max_provider_output_bytes"
+            )
+        if self.prompt_path is not None:
+            _validate_relative_posix_file_path(self.prompt_path, "live.prompt_path")
+            _validate_relative_posix_file_path(self.record_to, "live.record_to")
+        return self
+
+
+def _validate_relative_posix_file_path(value: str, field_name: str) -> str:
+    if not value.strip():
+        raise ValueError(f"{field_name} must not be empty")
+    if "\x00" in value:
+        raise ValueError(f"{field_name} must not contain NUL")
+    if "\\" in value:
+        raise ValueError(f"{field_name} must use POSIX separators")
+    posix_path = PurePosixPath(value)
+    windows_path = PureWindowsPath(value)
+    if posix_path.is_absolute() or windows_path.is_absolute() or windows_path.drive:
+        raise ValueError(f"{field_name} must be relative")
+    if value in {".", "./"} or ".." in posix_path.parts:
+        raise ValueError(f"{field_name} must name a file below the Spec directory")
+    return value
 
 
 class RunnerSettings(ContractModel):
@@ -588,6 +721,362 @@ class EvidenceArtifact(ContractModel):
             )
             if not metrics_are_phase2_consistent:
                 raise ValueError("RunMetrics do not match command and diff Evidence")
+        return self
+
+
+class CodexExecutionEvidence(ContractModel):
+    """Redacted summary of one Codex CLI process; raw events are never persisted."""
+
+    schema_version: Literal["1.0"]
+    provider: Literal[Provider.CODEX]
+    cli_version: StrictStr | None
+    preflight_checked_at: datetime
+    verified_flags: list[StrictStr]
+    requested_model: StrictStr
+    requested_reasoning_effort: ReasoningEffort
+    sandbox_mode: Literal["workspace-write"]
+    approval_policy: Literal["never"]
+    web_search_disabled: StrictBool
+    command_network_disabled: StrictBool
+    raw_stream_persisted: StrictBool
+    status: ProviderExecutionStatus
+    failure_kind: LiveFailureKind
+    exit_code: StrictInt | None
+    started_at: datetime
+    completed_at: datetime
+    duration_ms: StrictInt = Field(ge=0)
+    event_count: StrictInt = Field(ge=0)
+    unknown_event_count: StrictInt = Field(ge=0)
+    item_type_counts: dict[StrictStr, StrictInt]
+    usage_metrics: UsageMetrics
+    stdout_bytes: StrictInt = Field(ge=0)
+    stderr_bytes: StrictInt = Field(ge=0)
+    stdout_limit_exceeded: StrictBool
+    stderr_truncated: StrictBool
+    termination: TerminationEvidence
+
+    @field_validator("preflight_checked_at", "started_at", "completed_at", mode="before")
+    @classmethod
+    def codex_timestamps_must_use_datetime_or_iso_string(
+        cls,
+        value: object,
+    ) -> object:
+        if not isinstance(value, (str, datetime)):
+            raise ValueError("Codex timestamps must be ISO strings or datetime values")
+        return value
+
+    @field_validator("preflight_checked_at", "started_at", "completed_at")
+    @classmethod
+    def codex_timestamps_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if (
+            value.tzinfo is None
+            or value.utcoffset() is None
+            or value.utcoffset() != timedelta(0)
+        ):
+            raise ValueError("Codex timestamps must be timezone-aware UTC")
+        return value
+
+    @model_validator(mode="after")
+    def codex_summary_must_be_semantically_consistent(self) -> CodexExecutionEvidence:
+        if (
+            not self.web_search_disabled
+            or not self.command_network_disabled
+            or self.raw_stream_persisted
+        ):
+            raise ValueError("Codex safety and redaction flags must use their required values")
+        if self.preflight_checked_at > self.started_at:
+            raise ValueError("Codex preflight must not occur after process start")
+        if self.completed_at < self.started_at:
+            raise ValueError("Codex completed_at must not precede started_at")
+        if self.unknown_event_count > self.event_count:
+            raise ValueError("unknown_event_count must not exceed event_count")
+        if sum(self.item_type_counts.values()) > self.event_count:
+            raise ValueError("item event counts must not exceed event_count")
+        if self.verified_flags != sorted(set(self.verified_flags)):
+            raise ValueError("verified_flags must be unique and sorted")
+        if any(
+            not item_type or count < 0
+            for item_type, count in self.item_type_counts.items()
+        ):
+            raise ValueError(
+                "item_type_counts must contain non-empty types and non-negative counts"
+            )
+        if self.usage_metrics.source not in {
+            UsageMetricSource.PROVIDER_REPORTED,
+            UsageMetricSource.NOT_AVAILABLE,
+        }:
+            raise ValueError("Codex Usage source must be provider_reported or not_available")
+        if (
+            self.usage_metrics.estimated_api_cost is not None
+            or self.usage_metrics.quota_consumption is not None
+        ):
+            raise ValueError("Codex Evidence must not contain estimated cost or quota values")
+        token_values = (
+            self.usage_metrics.input_tokens,
+            self.usage_metrics.cached_input_tokens,
+            self.usage_metrics.output_tokens,
+            self.usage_metrics.reasoning_output_tokens,
+        )
+        if (
+            self.usage_metrics.source is UsageMetricSource.PROVIDER_REPORTED
+            and all(value is None for value in token_values)
+        ):
+            raise ValueError("provider_reported Codex Usage requires at least one token value")
+
+        allowed_failure_kinds = {
+            LiveFailureKind.PROVIDER_TURN_FAILED,
+            LiveFailureKind.PROVIDER_CLI_NONZERO,
+            LiveFailureKind.PROVIDER_TIMEOUT,
+            LiveFailureKind.PROVIDER_UNAVAILABLE,
+            LiveFailureKind.PROVIDER_SPAWN_ERROR,
+            LiveFailureKind.PROVIDER_INPUT_ERROR,
+            LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+            LiveFailureKind.PROVIDER_OUTPUT_LIMIT,
+            LiveFailureKind.PROCESS_CLEANUP_ERROR,
+            LiveFailureKind.EVIDENCE_ERROR,
+            LiveFailureKind.UNSUPPORTED_PLATFORM,
+        }
+        if self.status is ProviderExecutionStatus.SUCCEEDED:
+            if self.failure_kind is not LiveFailureKind.NONE or self.exit_code != 0:
+                raise ValueError("successful Codex Evidence requires failure_kind none and exit 0")
+            if self.event_count < 3:
+                raise ValueError("successful Codex Evidence requires the core lifecycle events")
+            if not set(CODEX_REQUIRED_EXEC_FLAGS).issubset(self.verified_flags):
+                raise ValueError("successful Codex Evidence requires all preflight flags")
+            if not self.termination.process_group_cleared:
+                raise ValueError("successful Codex Evidence requires process cleanup")
+            if self.stdout_limit_exceeded:
+                raise ValueError("successful Codex Evidence cannot exceed stdout limit")
+        elif self.failure_kind is LiveFailureKind.NONE:
+            raise ValueError("failed Codex Evidence requires a failure kind")
+        elif self.failure_kind not in allowed_failure_kinds:
+            raise ValueError("Codex Evidence contains a non-Provider failure kind")
+        if (
+            self.failure_kind
+            in {
+                LiveFailureKind.PROVIDER_UNAVAILABLE,
+                LiveFailureKind.PROVIDER_SPAWN_ERROR,
+                LiveFailureKind.UNSUPPORTED_PLATFORM,
+            }
+            and self.exit_code is not None
+        ):
+            raise ValueError("pre-spawn Provider failures must not have an exit code")
+        if (
+            self.failure_kind is LiveFailureKind.PROVIDER_TIMEOUT
+            and self.termination.reason is not TerminationReason.TIMEOUT
+        ):
+            raise ValueError("provider_timeout requires timeout termination Evidence")
+        if (
+            self.failure_kind is LiveFailureKind.PROVIDER_CLI_NONZERO
+            and (self.exit_code is None or self.exit_code == 0)
+        ):
+            raise ValueError("provider_cli_nonzero requires a non-zero exit code")
+        if (
+            self.failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
+            and not self.stdout_limit_exceeded
+        ):
+            raise ValueError("provider_output_limit requires stdout_limit_exceeded")
+        if (
+            self.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+            and self.termination.process_group_cleared
+        ):
+            raise ValueError("process_cleanup_error requires an uncleared process group")
+        return self
+
+
+class LiveRunArtifact(ContractModel):
+    """Versioned Phase 3 Evidence with a one-way hash reference to its Recording."""
+
+    schema_version: Literal["1.0"]
+    run_id: StrictStr = Field(min_length=1)
+    experiment_id: StrictStr = Field(min_length=1)
+    task_id: StrictStr = Field(min_length=1)
+    repetition_index: StrictInt = Field(ge=0)
+    workflow: Literal[Workflow.ONE_SHOT]
+    provider: Literal[Provider.CODEX]
+    execution_mode: Literal[ExecutionMode.LIVE]
+    overall_status: LiveOverallStatus
+    failure_kind: LiveFailureKind
+    started_at: datetime
+    completed_at: datetime
+    spec_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    fixture_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    prompt_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    prompt_bytes: StrictInt = Field(gt=0)
+    prompt_redacted: StrictBool
+    runner: RunnerSettings
+    codex: CodexExecutionEvidence
+    gate_commands: list[CommandEvidence]
+    diff: DiffEvidence
+    metrics: RunMetrics | None
+    workspace_removed: StrictBool
+    recording_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    raw_provider_output_persisted: StrictBool
+
+    @field_validator("started_at", "completed_at", mode="before")
+    @classmethod
+    def live_timestamps_must_use_datetime_or_iso_string(
+        cls,
+        value: object,
+    ) -> object:
+        if not isinstance(value, (str, datetime)):
+            raise ValueError("Live timestamps must be ISO strings or datetime values")
+        return value
+
+    @field_validator("started_at", "completed_at")
+    @classmethod
+    def live_timestamps_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if (
+            value.tzinfo is None
+            or value.utcoffset() is None
+            or value.utcoffset() != timedelta(0)
+        ):
+            raise ValueError("Live timestamps must be timezone-aware UTC")
+        return value
+
+    @model_validator(mode="after")
+    def live_status_metrics_and_evidence_must_match(self) -> LiveRunArtifact:
+        if not self.prompt_redacted or self.raw_provider_output_persisted:
+            raise ValueError("Live Prompt/provider redaction flags must use required values")
+        if self.completed_at < self.started_at:
+            raise ValueError("Live completed_at must not precede started_at")
+        expected_failure = {
+            LiveOverallStatus.PASSED: LiveFailureKind.NONE,
+            LiveOverallStatus.FAILED: LiveFailureKind.QUALITY_GATE_FAILURE,
+        }
+        if (
+            self.overall_status in expected_failure
+            and self.failure_kind is not expected_failure[self.overall_status]
+        ):
+            raise ValueError("Live overall_status and failure_kind are inconsistent")
+        provider_failure_kinds = {
+            LiveFailureKind.PROVIDER_TURN_FAILED,
+            LiveFailureKind.PROVIDER_CLI_NONZERO,
+            LiveFailureKind.PROVIDER_TIMEOUT,
+            LiveFailureKind.PROVIDER_UNAVAILABLE,
+            LiveFailureKind.PROVIDER_SPAWN_ERROR,
+            LiveFailureKind.PROVIDER_INPUT_ERROR,
+            LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+            LiveFailureKind.PROVIDER_OUTPUT_LIMIT,
+        }
+        if (
+            self.overall_status is LiveOverallStatus.PROVIDER_ERROR
+        ) is not (self.failure_kind in provider_failure_kinds):
+            raise ValueError("provider_error status must match a Provider failure kind")
+        harness_failure_kinds = {
+            LiveFailureKind.PROCESS_CLEANUP_ERROR,
+            LiveFailureKind.GATE_HARNESS_ERROR,
+            LiveFailureKind.EVIDENCE_ERROR,
+            LiveFailureKind.UNSUPPORTED_PLATFORM,
+        }
+        if (
+            self.overall_status is LiveOverallStatus.HARNESS_ERROR
+        ) is not (self.failure_kind in harness_failure_kinds):
+            raise ValueError("harness_error status must match a Harness failure kind")
+        if self.overall_status is LiveOverallStatus.PROVIDER_ERROR:
+            if self.codex.failure_kind is not self.failure_kind:
+                raise ValueError("Artifact and Codex Provider failure kinds must match")
+            if self.gate_commands:
+                raise ValueError("quality Gates must not run after a Provider failure")
+        if (
+            self.overall_status in {LiveOverallStatus.PASSED, LiveOverallStatus.FAILED}
+            and self.codex.status is not ProviderExecutionStatus.SUCCEEDED
+        ):
+            raise ValueError("quality result requires successful Codex execution")
+        if (
+            self.codex.status is ProviderExecutionStatus.FAILED
+            and self.gate_commands
+        ):
+            raise ValueError("quality Gates must not run after failed Codex execution")
+        if self.failure_kind in {
+            LiveFailureKind.PROCESS_CLEANUP_ERROR,
+            LiveFailureKind.UNSUPPORTED_PLATFORM,
+        } and (
+            self.codex.status is not ProviderExecutionStatus.FAILED
+            or self.codex.failure_kind is not self.failure_kind
+        ):
+            raise ValueError("Provider Harness failure must match Codex Evidence")
+        if self.failure_kind is LiveFailureKind.GATE_HARNESS_ERROR:
+            abnormal_gate = any(
+                command.status
+                not in {CommandStatus.PASSED, CommandStatus.FAILED}
+                or not command.termination.process_group_cleared
+                for command in self.gate_commands
+            )
+            if (
+                self.codex.status is not ProviderExecutionStatus.SUCCEEDED
+                or not self.gate_commands
+                or not abnormal_gate
+            ):
+                raise ValueError(
+                    "gate_harness_error requires successful Codex and an abnormal Gate"
+                )
+
+        commands_completed_normally = bool(self.gate_commands) and all(
+            command.status in {CommandStatus.PASSED, CommandStatus.FAILED}
+            and command.termination.process_group_cleared
+            for command in self.gate_commands
+        )
+        metrics_permitted = (
+            self.codex.status is ProviderExecutionStatus.SUCCEEDED
+            and commands_completed_normally
+            and self.failure_kind
+            in {LiveFailureKind.NONE, LiveFailureKind.QUALITY_GATE_FAILURE}
+            and self.diff.line_counts_complete
+            and self.workspace_removed
+        )
+        if metrics_permitted != (self.metrics is not None):
+            raise ValueError("Live metrics presence is inconsistent with Evidence completeness")
+        if self.metrics is not None:
+            acceptance = [
+                command
+                for command in self.gate_commands
+                if command.gate is GateKind.ACCEPTANCE
+            ]
+            regression = [
+                command
+                for command in self.gate_commands
+                if command.gate is GateKind.REGRESSION
+            ]
+            lint = [
+                command for command in self.gate_commands if command.gate is GateKind.LINT
+            ]
+            typecheck = [
+                command
+                for command in self.gate_commands
+                if command.gate is GateKind.TYPECHECK
+            ]
+            expected_quality_pass = all(
+                command.status is CommandStatus.PASSED for command in self.gate_commands
+            )
+            expected_counts = (
+                sum(command.status is CommandStatus.PASSED for command in acceptance),
+                len(acceptance),
+                sum(command.status is CommandStatus.FAILED for command in regression),
+                sum(command.status is CommandStatus.FAILED for command in lint),
+                sum(command.status is CommandStatus.FAILED for command in typecheck),
+            )
+            actual_counts = (
+                self.metrics.acceptance_tests_passed,
+                self.metrics.acceptance_tests_total,
+                self.metrics.regression_failures,
+                self.metrics.lint_errors,
+                self.metrics.typecheck_errors,
+            )
+            if (
+                self.metrics.quality_gate_pass is not expected_quality_pass
+                or actual_counts != expected_counts
+                or self.metrics.agent_duration_ms != self.codex.duration_ms
+                or self.metrics.total_duration_ms
+                != self.metrics.agent_duration_ms + self.metrics.evaluation_duration_ms
+                or self.metrics.agent_call_count != 1
+                or self.metrics.retry_count != 0
+                or self.metrics.changed_files != self.diff.changed_files
+                or self.metrics.added_lines != self.diff.added_lines
+                or self.metrics.deleted_lines != self.diff.deleted_lines
+                or self.metrics.usage_metrics != self.codex.usage_metrics
+            ):
+                raise ValueError("Phase 3 RunMetrics do not match Live Evidence")
         return self
 
 

@@ -23,9 +23,10 @@ AIコーディングエージェントの評価は、課題や品質Gateだけ�
 4. 実験Spec、実行証跡、評価結果を紐付け、意思決定の根拠を再確認する。
 5. 検証済みの知見を標準手順へ反映する。
 
-Phase 2ではSpec検証、ローカルCLI能力確認、保存済み合成RecordingのReplayに加え、
+Phase 3ではSpec検証、ローカルCLI能力確認、保存済みRecordingのReplayに加え、
 信頼済み合成Fixtureの使い捨てコピー上で品質Gateを実行し、Evidenceを保存できる。
-外部AI Providerは実行しない。
+明示確認された単一のone-shot Codex CLI実行だけを同じWorkspaceのGateへ接続できる。
+通常テストとCIはfake CLIだけを使い、外部AI Providerを実行しない。
 
 ## 機能要件
 
@@ -81,10 +82,35 @@ Phase 2ではSpec検証、ローカルCLI能力確認、保存済み合成Record
 - `--force`でもSpec、Replay Recording、Fixture sourceとそのsymlink/hard linkを
   置換できない。
 
+### Phase 3
+
+- 既存LiveSettingsを後方互換に保ち、Prompt/model/reasoning、Provider timeout、
+  Prompt/event/output上限をstrictなPhase 3設定として追加する。
+- `agentlab live-codex`はlive/codex/one_shot、Runner、task、repetition、完全なLive設定、
+  `--confirm-live-codex`を必須とする。
+- 確認flagなしではread-only preflightを含むsubprocessを起動しない。
+- preflightはPATH、`--version`、`exec --help`、必要flagだけを確認し、Login、auth file
+  読取り、AI呼出しを行わない。flag不足は推測せずfail closedする。
+- PromptはSpec基準の通常UTF-8 fileから上限付きで一度読み、stdinだけで渡す。本文を
+  argv、Recording、Evidenceへ保存せず、SHA-256、byte数、redacted flagだけを保存する。
+- Codex processはworkspace-write、approval never、ephemeral、JSONL、user config/rules
+  無視、strict configで起動し、web searchとmodel-generated command networkを無効にする。
+- ChatGPT-managed CLI authだけを対象とし、API key、auth file copy/parseを実装しない。
+  CodexとGateの環境を分離し、Gateへ`CODEX_HOME`を渡さない。
+- JSONLはincrementalにUTF-8、JSON object、duplicate key、有限数、line/total上限、
+  lifecycleを検証する。raw payloadを保存せずevent/item件数とProvider報告Usageだけを
+  正規化する。
+- Provider成功時だけ同じ使い捨てWorkspaceでPhase 2 Gateを実行する。Provider失敗、
+  Gate通常不合格、Harness障害を別taxonomyで保存する。
+- Recording 1.1はredaction済み`run_started`と`run_completed`または`run_failed`の2件
+  だけを保存する。成功Recordingは外部呼出しなしでReplayでき、失敗RecordingはMetrics
+  欠損理由付きで拒否する。
+- Live EvidenceはRecording SHA-256を一方向参照し、raw Prompt/JSONL/stderrを保存しない。
+
 ### 将来要件
 
-- Live Provider、Live Recording、scheduler、Workflow実験、集計と比較レポートを
-  段階的に追加する。実装順はROADMAPに従う。
+- Antigravity Provider、scheduler、Workflow実験、集計と比較レポートを段階的に追加する。
+  実装順はROADMAPに従う。
 
 ## 非機能要件
 
@@ -96,16 +122,18 @@ Phase 2ではSpec検証、ローカルCLI能力確認、保存済み合成Record
 - CLI未導入や能力不明を、実験失敗と混同せず明示する。
 - 秘密情報、認証情報、機密プロンプトを成果物に保存しない。
 - 通常CIはネットワークやLive AI Providerに依存しない。
+- Live Codexは外部送信とquota消費を表示し、人間の明示確認を必須とする。
 - Gate実行には明示確認を要求し、親processの環境を無条件に継承しない。
 - Harness障害を品質Gate不合格へ変換しない。
 - Phase 2 RunnerをOS security sandboxやnetwork隔離として扱わない。
 
 ## Non-goals
 
-Phase 2では以下を実装しない。
+Phase 3では以下を実装しない。
 
-- Codex/AntigravityのLive課題実行、OpenAI/Gemini API
-- Prompt生成、Live Recording拡張、Prompt redaction
+- AntigravityのLive課題実行、OpenAI/Gemini API直接呼出し、API key認証
+- Prompt本文、raw JSONL、reasoning、agent message、command outputの保存
+- session resume、任意Codex追加flag、実行中の自動retry
 - Docker、VM、Git worktree、seccomp、user namespace、firewall
 - filesystemの完全隔離、CPU/memory/process quota、悪意あるcodeの完全な封じ込め
 - Java/Python/Reactの実Task Fixture、LLM Judge、コスト計算、比較レポート
@@ -113,6 +141,7 @@ Phase 2では以下を実装しない。
 - 一般的なモデル能力ランキング
 - 複数task、複数treatment、複数反復、stop conditionのscheduler
 - Workflow A/B実験、Provider比較、framework固有diagnostic parser
+- 実Codexの通常テスト/CI実行、外部networkの完全遮断
 
 ## 成功条件
 
@@ -130,3 +159,7 @@ Phase 2では以下を実装しない。
   `null`にする。
 - 実行に用いたSpecモデルとEvidenceのSpec SHA-256を、同じ一回の入力bytesから生成する。
 - Phase 1 Replayのbyte決定性とSpec/Recording入力保護が後退しない。
+- redaction済みLive Recording 1.1を再読込し、成功記録をoffline Replayできる。
+- Prompt、raw JSONL、stderr、thread/session ID、認証情報がArtifactに存在しない。
+- Provider失敗時はGateを実行せず、Provider/Gate/Harness failureを区別する。
+- manual Live smokeは実装レビュー後の明示承認まで未実行とする。

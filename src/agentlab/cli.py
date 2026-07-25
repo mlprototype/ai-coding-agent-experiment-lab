@@ -9,7 +9,8 @@ import typer
 
 from agentlab.capabilities import doctor_report
 from agentlab.gates import RunGatesError, run_gates
-from agentlab.models import EvidenceOverallStatus
+from agentlab.live import LiveCodexError, run_live_codex
+from agentlab.models import EvidenceOverallStatus, LiveOverallStatus
 from agentlab.recording import RecordingLoadError
 from agentlab.replay import ReplayError, run_replay
 from agentlab.specs import SpecLoadError, load_experiment_spec
@@ -152,6 +153,91 @@ def run_gates_command(
     if artifact.overall_status is EvidenceOverallStatus.FAILED:
         raise typer.Exit(code=1)
     if artifact.overall_status is EvidenceOverallStatus.HARNESS_ERROR:
+        raise typer.Exit(code=2)
+
+
+@app.command("live-codex")
+def live_codex_command(
+    spec_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    task_id: Annotated[
+        str,
+        typer.Option("--task-id", help="Task ID from ExperimentSpec.task_ids."),
+    ],
+    repetition_index: Annotated[
+        int,
+        typer.Option("--repetition-index", help="Zero-based repetition index."),
+    ],
+    run_id: Annotated[
+        str,
+        typer.Option("--run-id", help="Identifier for Recording and Evidence."),
+    ],
+    output_path: Annotated[
+        Path,
+        typer.Option("--output", help="Required destination for redacted Live Evidence."),
+    ],
+    confirm_live_codex: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-live-codex",
+            help="Explicitly allow external AI data transmission and quota consumption.",
+        ),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Explicitly replace existing Recording and Evidence outputs.",
+        ),
+    ] = False,
+) -> None:
+    """Run one manually confirmed Codex CLI vertical slice."""
+    if confirm_live_codex:
+        typer.echo(
+            "WARNING: external AI execution, data transmission, and quota consumption "
+            "will occur."
+        )
+    try:
+        outcome = run_live_codex(
+            spec_path,
+            task_id=task_id,
+            repetition_index=repetition_index,
+            run_id=run_id,
+            output_path=output_path,
+            confirm_live_codex=confirm_live_codex,
+            force=force,
+        )
+    except (SpecLoadError, LiveCodexError) as error:
+        typer.echo(f"live-codex failed: {error}", err=True)
+        typer.echo(f"run: {run_id}")
+        typer.echo(f"task: {task_id}")
+        typer.echo(f"evidence output: {output_path}")
+        if isinstance(error, LiveCodexError) and error.workspace_removed is not None:
+            typer.echo(
+                f"workspace removed: {'yes' if error.workspace_removed else 'no'}"
+            )
+        else:
+            typer.echo("workspace removed: not_created")
+        typer.echo("raw Prompt persisted: no")
+        typer.echo("raw Codex JSONL persisted: no")
+        raise typer.Exit(code=2) from error
+
+    artifact = outcome.artifact
+    typer.echo(f"run: {artifact.run_id}")
+    typer.echo(f"experiment: {artifact.experiment_id}")
+    typer.echo(f"task: {artifact.task_id}")
+    typer.echo(f"status: {artifact.overall_status.value}")
+    typer.echo(f"failure kind: {artifact.failure_kind.value}")
+    typer.echo(f"recording output: {outcome.recording_path}")
+    typer.echo(f"evidence output: {outcome.output_path}")
+    typer.echo(f"workspace removed: {'yes' if artifact.workspace_removed else 'no'}")
+    typer.echo("raw Prompt persisted: no")
+    typer.echo("raw Codex JSONL persisted: no")
+    if artifact.overall_status is LiveOverallStatus.FAILED:
+        raise typer.Exit(code=1)
+    if artifact.overall_status in {
+        LiveOverallStatus.PROVIDER_ERROR,
+        LiveOverallStatus.HARNESS_ERROR,
+    }:
         raise typer.Exit(code=2)
 
 
