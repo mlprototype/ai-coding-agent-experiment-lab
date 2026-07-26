@@ -916,9 +916,9 @@ class CodexExecutionEvidence(ContractModel):
                 raise ValueError(
                     "explicit-never Codex profile requires an allowlisted CLI version"
                 )
-            if not set(CODEX_REQUIRED_EXEC_FLAGS).issubset(self.verified_flags):
+            if self.verified_flags != sorted(CODEX_REQUIRED_EXEC_FLAGS):
                 raise ValueError(
-                    "selected Codex profile requires all preflight flags"
+                    "selected Codex profile requires exactly its preflight flags"
                 )
             if self.execution_stage is CodexExecutionStage.PREFLIGHT_NOT_COMPLETED:
                 raise ValueError(
@@ -1047,8 +1047,6 @@ class CodexExecutionEvidence(ContractModel):
                 )
             if not self.process_started:
                 raise ValueError("successful Codex Evidence requires a started process")
-            if not set(CODEX_REQUIRED_EXEC_FLAGS).issubset(self.verified_flags):
-                raise ValueError("successful Codex Evidence requires all preflight flags")
             if not self.termination.process_group_cleared:
                 raise ValueError("successful Codex Evidence requires process cleanup")
             if self.stdout_limit_exceeded:
@@ -1207,8 +1205,24 @@ class LiveRunArtifact(ContractModel):
         ):
             raise ValueError("quality Gates must not run after failed Codex execution")
         if (
+            self.codex.execution_stage
+            is CodexExecutionStage.PREFLIGHT_NOT_COMPLETED
+            and self.workspace_lifecycle is not WorkspaceLifecycle.NOT_CREATED
+        ):
+            raise ValueError(
+                "preflight_not_completed requires a not_created Workspace"
+            )
+        if (
+            self.codex.execution_stage
+            is CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+            and self.workspace_lifecycle is WorkspaceLifecycle.NOT_CREATED
+        ):
+            raise ValueError(
+                "provider_invocation_attempted requires a created Workspace"
+            )
+        if (
             self.workspace_lifecycle is WorkspaceLifecycle.NOT_CREATED
-            and (self.codex.process_started or self.gate_commands)
+            and self.gate_commands
         ):
             raise ValueError(
                 "not_created Workspace cannot contain Provider or Gate execution"

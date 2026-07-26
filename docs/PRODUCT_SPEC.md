@@ -91,7 +91,8 @@ Phase 3ではSpec検証、ローカルCLI能力確認、保存済みRecordingの
 - 確認flagなしではread-only preflightを含むsubprocessを起動しない。
 - preflightはPATH、`--version`、`exec --help`、必要flagだけを固定出力上限、timeout、
   新規process groupで確認し、Login、auth file読取り、AI呼出しを行わない。flag不足、
-  UTF-8不正、timeout、残存processはfail closedする。
+  UTF-8不正、timeout、残存process、preflight一時directory削除失敗はfail closedし、
+  cleanup失敗はProvider能力ではなくHarness障害として扱う。
 - PromptはSpec基準の通常UTF-8 fileから上限付きで一度読み、stdinだけで渡す。本文を
   argv、Recording、Evidenceへ保存せず、SHA-256、byte数、redacted flagだけを保存する。
 - Codex processはworkspace-write、明示configによるapproval never、ephemeral、JSONL、
@@ -107,6 +108,8 @@ Phase 3ではSpec検証、ローカルCLI能力確認、保存済みRecordingの
 - Provider成功時だけ同じ使い捨てWorkspaceでPhase 2 Gateを実行する。Provider失敗、
   signal終了、Gate通常不合格、Harness障害を別taxonomyで保存する。Workspace状態は
   `not_created`、`removed`、`cleanup_failed`で区別する。
+- Provider process生成後のselector、pipe、収集処理の未知例外でもprocess groupを回収し、
+  Evidence収集失敗またはprocess cleanup失敗として扱う。
 - Recording 1.1はredaction済み`run_started`と`run_completed`または`run_failed`の2件
   だけを保存する。terminal eventにはGate件数、evaluation duration、diff、Workspace
   lifecycleのredaction済みsummaryを含め、成功時はMetricsと照合する。成功Recordingは

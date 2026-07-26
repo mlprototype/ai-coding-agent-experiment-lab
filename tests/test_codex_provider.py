@@ -8,6 +8,7 @@ from typing import NoReturn
 
 import pytest
 
+import agentlab.codex_provider as codex_provider_module
 from agentlab.codex_provider import (
     REQUIRED_CODEX_EXEC_FLAGS,
     CodexJsonlParser,
@@ -134,6 +135,29 @@ def test_preflight_rejects_missing_command(tmp_path: Path) -> None:
         preflight_codex(parent_environment={"PATH": str(tmp_path)})
 
     assert error.value.failure_kind is LiveFailureKind.PROVIDER_UNAVAILABLE
+
+
+def test_preflight_cleanup_failure_is_a_harness_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment, _inspection = _fake_codex(tmp_path)
+    remove_temporary_root = codex_provider_module.remove_temporary_root
+
+    def report_cleanup_failure(path: Path) -> tuple[bool, str]:
+        cleanup_succeeded, _cleanup_error = remove_temporary_root(path)
+        assert cleanup_succeeded
+        return False, "synthetic preflight cleanup failure"
+
+    monkeypatch.setattr(
+        "agentlab.codex_provider.remove_temporary_root",
+        report_cleanup_failure,
+    )
+
+    with pytest.raises(CodexPreflightError) as error:
+        preflight_codex(parent_environment=environment)
+
+    assert error.value.failure_kind is LiveFailureKind.EVIDENCE_ERROR
 
 
 def test_preflight_rejects_unallowlisted_version_before_help(tmp_path: Path) -> None:
@@ -771,6 +795,182 @@ def test_process_runner_cleans_up_when_pipe_setup_fails(
     assert result.evidence.status is ProviderExecutionStatus.FAILED
     assert result.evidence.failure_kind is LiveFailureKind.EVIDENCE_ERROR
     assert result.evidence.termination.process_group_cleared is True
+
+
+def test_process_runner_cleans_up_when_selector_creation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment, _inspection = _fake_codex(
+        tmp_path,
+        live_code="signal.pause()",
+    )
+    preflight = preflight_codex(parent_environment=environment)
+    workspace, environment_root = _workspace(tmp_path)
+    spawned_pids: list[int] = []
+    popen = codex_provider_module.subprocess.Popen
+
+    def track_spawn(*args: object, **kwargs: object):
+        process = popen(*args, **kwargs)
+        spawned_pids.append(process.pid)
+        return process
+
+    def fail_selector_creation() -> NoReturn:
+        raise OSError("synthetic selector creation failure")
+
+    monkeypatch.setattr(
+        "agentlab.codex_provider.subprocess.Popen",
+        track_spawn,
+    )
+    monkeypatch.setattr(
+        "agentlab.codex_provider.selectors.DefaultSelector",
+        fail_selector_creation,
+    )
+
+    result = CodexProcessRunner(
+        live=_live_settings(),
+        runner=_runner_settings(),
+    ).run(
+        preflight=preflight,
+        prompt=b"safe prompt",
+        workspace=workspace,
+        environment_root=environment_root,
+        parent_environment=environment,
+    )
+
+    assert len(spawned_pids) == 1
+    assert result.evidence.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+    assert result.evidence.process_started is True
+    assert (
+        result.evidence.execution_stage
+        is CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+    )
+    assert result.evidence.approval_policy == "never"
+    assert result.evidence.approval_basis == "explicit_config_never"
+    assert result.evidence.termination.process_group_cleared is True
+    with pytest.raises(ProcessLookupError):
+        os.kill(spawned_pids[0], 0)
+
+
+def test_process_runner_classifies_emergency_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment, _inspection = _fake_codex(
+        tmp_path,
+        live_code="signal.pause()",
+    )
+    preflight = preflight_codex(parent_environment=environment)
+    workspace, environment_root = _workspace(tmp_path)
+    terminate_process_group = codex_provider_module.terminate_process_group
+
+    def fail_selector_creation() -> NoReturn:
+        raise OSError("synthetic selector creation failure")
+
+    def report_cleanup_failure(*args: object, **kwargs: object):
+        termination = terminate_process_group(*args, **kwargs)
+        assert termination.process_group_cleared
+        return termination.model_copy(
+            update={
+                "process_group_cleared": False,
+                "error": "synthetic cleanup reporting failure",
+            }
+        )
+
+    monkeypatch.setattr(
+        "agentlab.codex_provider.selectors.DefaultSelector",
+        fail_selector_creation,
+    )
+    monkeypatch.setattr(
+        "agentlab.codex_provider.terminate_process_group",
+        report_cleanup_failure,
+    )
+
+    result = CodexProcessRunner(
+        live=_live_settings(),
+        runner=_runner_settings(),
+    ).run(
+        preflight=preflight,
+        prompt=b"safe prompt",
+        workspace=workspace,
+        environment_root=environment_root,
+        parent_environment=environment,
+    )
+
+    assert result.evidence.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+    assert result.evidence.process_started is True
+    assert result.evidence.termination.process_group_cleared is False
+
+
+def test_process_runner_cleans_up_on_unexpected_collection_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment, _inspection = _fake_codex(
+        tmp_path,
+        live_code="signal.pause()",
+    )
+    preflight = preflight_codex(parent_environment=environment)
+    workspace, environment_root = _workspace(tmp_path)
+    spawned_pids: list[int] = []
+    popen = codex_provider_module.subprocess.Popen
+    selector_factory = codex_provider_module.selectors.DefaultSelector
+
+    def track_spawn(*args: object, **kwargs: object):
+        process = popen(*args, **kwargs)
+        spawned_pids.append(process.pid)
+        return process
+
+    class UnexpectedCollectionSelector:
+        def __init__(self) -> None:
+            self._selector = selector_factory()
+
+        def register(self, *args: object, **kwargs: object):
+            return self._selector.register(*args, **kwargs)
+
+        def unregister(self, *args: object, **kwargs: object):
+            return self._selector.unregister(*args, **kwargs)
+
+        def get_map(self):
+            return self._selector.get_map()
+
+        def select(self, _timeout: float):
+            raise RuntimeError("synthetic unexpected collection failure")
+
+        def close(self) -> None:
+            self._selector.close()
+
+    monkeypatch.setattr(
+        "agentlab.codex_provider.subprocess.Popen",
+        track_spawn,
+    )
+    monkeypatch.setattr(
+        "agentlab.codex_provider.selectors.DefaultSelector",
+        UnexpectedCollectionSelector,
+    )
+
+    result = CodexProcessRunner(
+        live=_live_settings(),
+        runner=_runner_settings(),
+    ).run(
+        preflight=preflight,
+        prompt=b"safe prompt",
+        workspace=workspace,
+        environment_root=environment_root,
+        parent_environment=environment,
+    )
+
+    assert len(spawned_pids) == 1
+    assert result.evidence.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+    assert result.evidence.process_started is True
+    assert (
+        result.evidence.execution_stage
+        is CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+    )
+    assert result.evidence.approval_policy == "never"
+    assert result.evidence.termination.process_group_cleared is True
+    with pytest.raises(ProcessLookupError):
+        os.kill(spawned_pids[0], 0)
 
 
 def test_process_runner_escalates_to_sigkill(tmp_path: Path) -> None:

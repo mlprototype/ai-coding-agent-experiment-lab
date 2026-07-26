@@ -30,6 +30,8 @@ Metricsを生成できるためcompletedである。loaderはこのsummaryとMet
 `run_failed`はfailure kind、redaction済みCodexExecutionEvidence、同じ評価summaryを保持し、
 `metrics_included=false`とする。Provider失敗、timeout、protocol/output上限、
 process/Gate Harness、diff/cleanup不完全を品質結果へ変換しない。
+loaderは`preflight_not_completed`と`workspace_lifecycle=not_created`、
+`provider_invocation_attempted`と作成済みWorkspaceの対応も検証する。
 
 1.1の開始、Provider、終了時刻はtimezone-aware UTCとし、開始条件のmodel、
 reasoning effort、CLI versionはterminal Codex Evidenceと一致しなければならない。

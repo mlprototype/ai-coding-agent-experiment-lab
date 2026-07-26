@@ -1260,9 +1260,17 @@ def test_live_artifact_rejects_profile_with_unallowlisted_cli_version(
         LiveRunArtifact.model_validate(payload)
 
 
-def test_live_artifact_rejects_selected_profile_without_required_flags(
+@pytest.mark.parametrize(
+    "verified_flags",
+    [
+        [],
+        [*sorted(REQUIRED_CODEX_EXEC_FLAGS), "--synthetic-extra-flag"],
+    ],
+)
+def test_live_artifact_rejects_selected_profile_without_exact_flags(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    verified_flags: list[str],
 ) -> None:
     spec_path, _fixture, _prompt, output = _write_case(tmp_path)
     environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
@@ -1272,9 +1280,9 @@ def test_live_artifact_rejects_selected_profile_without_required_flags(
 
     monkeypatch.setattr("agentlab.live.prepare_disposable_workspace", fail_prepare)
     payload = _run(spec_path, output, environment).artifact.model_dump(mode="json")
-    payload["codex"]["verified_flags"] = []
+    payload["codex"]["verified_flags"] = verified_flags
 
-    with pytest.raises(ValidationError, match="all preflight flags"):
+    with pytest.raises(ValidationError, match="exactly its preflight flags"):
         LiveRunArtifact.model_validate(payload)
 
 
@@ -1304,5 +1312,79 @@ def test_live_artifact_rejects_impossible_workspace_lifecycle(tmp_path: Path) ->
     payload["workspace_lifecycle"] = "not_created"
     payload["metrics"] = None
 
-    with pytest.raises(ValidationError, match="not_created"):
+    with pytest.raises(ValidationError, match="requires a created Workspace"):
         LiveRunArtifact.model_validate(payload)
+
+
+def test_artifact_and_recording_reject_invocation_without_created_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+
+    def fail_prepare(*_args: object, **_kwargs: object) -> NoReturn:
+        raise WorkspaceError("synthetic preparation failure")
+
+    monkeypatch.setattr("agentlab.live.prepare_disposable_workspace", fail_prepare)
+    outcome = _run(spec_path, output, environment)
+    artifact_payload = outcome.artifact.model_dump(mode="json")
+    artifact_payload["overall_status"] = "provider_error"
+    artifact_payload["failure_kind"] = "provider_spawn_error"
+    artifact_payload["codex"]["execution_stage"] = "provider_invocation_attempted"
+    artifact_payload["codex"]["approval_policy"] = "never"
+    artifact_payload["codex"]["approval_basis"] = "explicit_config_never"
+    artifact_payload["codex"]["failure_kind"] = "provider_spawn_error"
+
+    with pytest.raises(ValidationError, match="requires a created Workspace"):
+        LiveRunArtifact.model_validate(artifact_payload)
+
+    events = [
+        json.loads(line)
+        for line in outcome.recording_path.read_text(encoding="utf-8").splitlines()
+    ]
+    terminal = events[1]
+    terminal["failure_kind"] = "provider_spawn_error"
+    terminal["codex"]["execution_stage"] = "provider_invocation_attempted"
+    terminal["codex"]["approval_policy"] = "never"
+    terminal["codex"]["approval_basis"] = "explicit_config_never"
+    terminal["codex"]["failure_kind"] = "provider_spawn_error"
+    outcome.recording_path.write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RecordingLoadError, match="requires a created Workspace"):
+        load_replay_recording(outcome.recording_path)
+
+
+def test_artifact_and_recording_reject_removed_workspace_before_preflight(
+    tmp_path: Path,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    codex_home = tmp_path / "managed-auth"
+    codex_home.mkdir()
+    environment = {
+        "PATH": str(tmp_path / "empty-path"),
+        "HOME": str(tmp_path / "home"),
+        "CODEX_HOME": str(codex_home),
+    }
+    outcome = _run(spec_path, output, environment)
+    artifact_payload = outcome.artifact.model_dump(mode="json")
+    artifact_payload["workspace_lifecycle"] = "removed"
+
+    with pytest.raises(ValidationError, match="requires a not_created Workspace"):
+        LiveRunArtifact.model_validate(artifact_payload)
+
+    events = [
+        json.loads(line)
+        for line in outcome.recording_path.read_text(encoding="utf-8").splitlines()
+    ]
+    events[1]["evaluation"]["workspace_lifecycle"] = "removed"
+    outcome.recording_path.write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RecordingLoadError, match="requires a not_created Workspace"):
+        load_replay_recording(outcome.recording_path)

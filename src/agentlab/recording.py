@@ -20,6 +20,7 @@ from pydantic import (
 
 from agentlab.models import (
     CodexExecutionEvidence,
+    CodexExecutionStage,
     ContractModel,
     ExecutionMode,
     LiveEvaluationSummary,
@@ -228,6 +229,24 @@ class LiveRunFailedEvent(ContractModel):
     def failure_must_match_codex_summary(self) -> LiveRunFailedEvent:
         if self.metrics_included:
             raise ValueError("run_failed must not include Metrics")
+        if (
+            self.codex.execution_stage
+            is CodexExecutionStage.PREFLIGHT_NOT_COMPLETED
+            and self.evaluation.workspace_lifecycle
+            is not WorkspaceLifecycle.NOT_CREATED
+        ):
+            raise ValueError(
+                "preflight_not_completed requires a not_created Workspace"
+            )
+        if (
+            self.codex.execution_stage
+            is CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+            and self.evaluation.workspace_lifecycle
+            is WorkspaceLifecycle.NOT_CREATED
+        ):
+            raise ValueError(
+                "provider_invocation_attempted requires a created Workspace"
+            )
         provider_failures = {
             LiveFailureKind.PROVIDER_TURN_FAILED,
             LiveFailureKind.PROVIDER_CLI_NONZERO,

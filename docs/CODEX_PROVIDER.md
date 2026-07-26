@@ -12,6 +12,7 @@ vertical sliceである。scheduler、staged Workflow、比較実験、自動ret
 `codex --version`、`codex exec --help`だけを固定上限、短いtimeout、分離stdout/stderr、
 strict UTF-8、`shell=False`で確認する。各probeも新規POSIX session/process groupで
 起動し、timeout、正常終了後の残存子process、SIGTERM無視時のSIGKILLをboundedに扱う。
+一時directoryのcleanup失敗はProvider能力エラーへ変換せず`evidence_error`とする。
 AI Prompt、Login、auth file読取り、network refreshは行わない。
 
 helpには`--json`、`--ephemeral`、`--sandbox`、
@@ -25,8 +26,8 @@ model呼出し前にfail closedする。
 `--ignore-user-config`だけを根拠にしない。profileはCLIに存在しない
 `--ask-for-approval`を要求せず、`--config approval_policy="never"`を明示する。
 永続化するpreflight metadataはprofile、CLI version、確認時刻、flag名、明示approval
-設定の根拠で、実行pathは保存しない。選択済みprofileはstatusにかかわらず必須flagを
-すべて要求する。preflight未完了時はprofileを`not_selected`、execution stageを
+設定の根拠で、実行pathは保存しない。選択済みprofileはstatusにかかわらず必須flag集合との
+完全一致を要求する。preflight未完了時はprofileを`not_selected`、execution stageを
 `preflight_not_completed`、approval policy/basisをnullにする。preflight完了後、
 Provider起動試行前の失敗ではallowlist済みversion、profile、flagを保持し、stageを
 `preflight_completed`、approval policy/basisをnullにする。argvを使った起動を試みた
@@ -109,7 +110,9 @@ Live Artifactのdiffは品質評価に必要なWorkspace変更Evidenceであり�
 
 ProviderもPhase 2と同じPOSIX新規session/process group、monotonic timeout、SIGTERM、
 grace、SIGKILL、正常終了後のbackground child回収を使う。stdin/stdout/stderrを
-non-blockingで回収し、大量出力時もraw streamをmemoryへ蓄積しない。
+non-blockingで回収し、大量出力時もraw streamをmemoryへ蓄積しない。Popen成功後は
+selector生成、pipe設定、収集loopの未知例外も緊急cleanup境界で処理し、group回収成功を
+`evidence_error`、回収失敗を`process_cleanup_error`として保存する。
 
 Provider成功時だけ同じWorkspaceでPhase 2 Gateをgroup順に実行する。Provider失敗時は
 Gateを実行しない。最終diff後は成否に関係なくtemporary rootを削除し、Fixture/Prompt
@@ -142,6 +145,8 @@ terminal eventはCodex summaryに加え、Gate種別ごとのcommand/pass/fail�
 通常完了flag、evaluation duration、changed files/line counts/diff completeness、
 Workspace lifecycleを保存する。`run_completed`ではこのsummaryとMetricsを照合し、
 acceptance Gateが1件以上あることを要求して、矛盾をloaderで拒否する。
+`preflight_not_completed`は`not_created`だけ、
+`provider_invocation_attempted`は作成済みWorkspaceだけを許容する。
 
 EvidenceはRecording bytesのSHA-256を一方向参照する。成功Recording 1.1は外部CLI、
 subprocess、network、GateなしでReplay Resultへ変換できる。失敗RecordingはMetricsが

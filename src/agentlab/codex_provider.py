@@ -444,7 +444,7 @@ def _run_preflight_command(
     finally:
         cleanup_succeeded, cleanup_error = remove_temporary_root(temporary_root)
         if not cleanup_succeeded:
-            raise subprocess.SubprocessError(
+            raise _PreflightHarnessError(
                 cleanup_error or "preflight temporary cleanup failed"
             )
 
@@ -813,21 +813,57 @@ class CodexProcessRunner:
                 )
             )
 
-        assert process.stdin is not None
-        assert process.stdout is not None
-        assert process.stderr is not None
-        streams: dict[str, IO[bytes]] = {
-            "stdin": process.stdin,
-            "stdout": process.stdout,
-            "stderr": process.stderr,
-        }
-        selector = selectors.DefaultSelector()
+        streams: dict[str, IO[bytes]] = {}
+        try:
+            if (
+                process.stdin is None
+                or process.stdout is None
+                or process.stderr is None
+            ):
+                raise RuntimeError("Provider pipes were not created")
+            streams = {
+                "stdin": process.stdin,
+                "stdout": process.stdout,
+                "stderr": process.stderr,
+            }
+            selector = selectors.DefaultSelector()
+        except Exception:
+            termination = terminate_process_group(
+                process,
+                reason=TerminationReason.EMERGENCY_CLEANUP,
+                grace_seconds=self._runner.termination_grace_ms / 1000,
+                drain=lambda _timeout: None,
+            )
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    with suppress(OSError):
+                        stream.close()
+            failure = (
+                LiveFailureKind.EVIDENCE_ERROR
+                if termination.process_group_cleared
+                else LiveFailureKind.PROCESS_CLEANUP_ERROR
+            )
+            return CodexRunResult(
+                evidence=self._build_evidence(
+                    preflight=preflight,
+                    started_at=started_at,
+                    started_monotonic=started_monotonic,
+                    status=ProviderExecutionStatus.FAILED,
+                    failure_kind=failure,
+                    exit_code=process.poll(),
+                    parser=parser,
+                    stderr_bytes=0,
+                    stderr_truncated=False,
+                    termination=termination,
+                )
+            )
+
         try:
             for name, stream in streams.items():
                 os.set_blocking(stream.fileno(), False)
                 event = selectors.EVENT_WRITE if name == "stdin" else selectors.EVENT_READ
                 selector.register(stream, event, name)
-        except (OSError, ValueError) as error:
+        except Exception:
             termination = terminate_process_group(
                 process,
                 reason=TerminationReason.EMERGENCY_CLEANUP,
@@ -837,13 +873,13 @@ class CodexProcessRunner:
             for stream in streams.values():
                 with suppress(OSError):
                     stream.close()
-            selector.close()
+            with suppress(Exception):
+                selector.close()
             failure = (
                 LiveFailureKind.EVIDENCE_ERROR
                 if termination.process_group_cleared
                 else LiveFailureKind.PROCESS_CLEANUP_ERROR
             )
-            del error
             return CodexRunResult(
                 evidence=self._build_evidence(
                     preflight=preflight,
@@ -869,11 +905,20 @@ class CodexProcessRunner:
         protocol_error: CodexProtocolError | None = None
 
         def close_stream(name: str) -> None:
+            nonlocal failure_kind
             stream = streams[name]
-            with suppress(KeyError, ValueError):
+            try:
                 selector.unregister(stream)
-            with suppress(OSError):
+            except (KeyError, ValueError):
+                pass
+            except Exception:
+                if failure_kind is None:
+                    failure_kind = LiveFailureKind.EVIDENCE_ERROR
+            try:
                 stream.close()
+            except Exception:
+                if failure_kind is None:
+                    failure_kind = LiveFailureKind.EVIDENCE_ERROR
 
         def drain_once(timeout: float) -> None:
             nonlocal prompt_offset, stderr_bytes, stderr_truncated
@@ -998,10 +1043,27 @@ class CodexProcessRunner:
                 name in {"stdout", "stderr"} for name in self._registered_names(selector)
             ) and failure_kind is None:
                 failure_kind = LiveFailureKind.EVIDENCE_ERROR
+        except Exception:
+            termination = terminate_process_group(
+                process,
+                reason=TerminationReason.EMERGENCY_CLEANUP,
+                grace_seconds=self._runner.termination_grace_ms / 1000,
+                drain=lambda _timeout: None,
+            )
+            return_code = process.poll()
+            failure_kind = (
+                LiveFailureKind.EVIDENCE_ERROR
+                if termination.process_group_cleared
+                else LiveFailureKind.PROCESS_CLEANUP_ERROR
+            )
         finally:
             for name in tuple(streams):
                 close_stream(name)
-            selector.close()
+            try:
+                selector.close()
+            except Exception:
+                if failure_kind is None:
+                    failure_kind = LiveFailureKind.EVIDENCE_ERROR
 
         summary = parser.summary()
         if protocol_error is None:
