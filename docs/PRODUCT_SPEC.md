@@ -94,7 +94,8 @@ Phase 3ではSpec検証、ローカルCLI能力確認、保存済みRecordingの
   UTF-8不正、timeout、残存process、preflight一時directory削除失敗はfail closedし、
   一時directoryの作成・準備・cleanup失敗はProvider能力ではなくHarness障害として扱う。
   process group回収失敗は一時directoryやWorkspaceのcleanup失敗より優先し、実際の
-  preflight termination情報とともに保持する。
+  preflight termination情報とともに保持する。`mkdtemp()`後のpath解決に失敗した場合も
+  作成済みrootを削除し、Live Workspaceは削除結果をlifecycleへ記録する。
 - PromptはSpec基準の通常UTF-8 fileから上限付きで一度読み、stdinだけで渡す。本文を
   argv、Recording、Evidenceへ保存せず、SHA-256、byte数、redacted flagだけを保存する。
 - Codex processはworkspace-write、明示configによるapproval never、ephemeral、JSONL、

@@ -232,12 +232,24 @@ def prepare_disposable_workspace(
     source_snapshot: DirectorySnapshot,
 ) -> DisposableWorkspace:
     """Copy a validated fixture and allocate isolated HOME/cache/temp directories."""
+    temporary_root: Path | None = None
     try:
-        temporary_root = Path(tempfile.mkdtemp(prefix="agentlab-run-")).resolve()
-    except OSError as error:
+        created_root = Path(tempfile.mkdtemp(prefix="agentlab-run-"))
+        temporary_root = created_root
+        temporary_root = created_root.resolve()
+    except (OSError, RuntimeError) as error:
+        if temporary_root is None:
+            lifecycle = WorkspaceLifecycle.NOT_CREATED
+        else:
+            removed, _cleanup_error = _remove_temporary_root(temporary_root)
+            lifecycle = (
+                WorkspaceLifecycle.REMOVED
+                if removed
+                else WorkspaceLifecycle.CLEANUP_FAILED
+            )
         raise WorkspaceError(
             f"could not create temporary workspace: {type(error).__name__}",
-            lifecycle=WorkspaceLifecycle.NOT_CREATED,
+            lifecycle=lifecycle,
         ) from error
 
     workspace = temporary_root / "workspace"

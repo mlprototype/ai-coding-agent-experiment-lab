@@ -509,6 +509,74 @@ def test_workspace_preparation_failure_is_persisted_with_lifecycle(
     assert isinstance(recording.failed, LiveRunFailedEvent)
 
 
+@pytest.mark.parametrize(
+    ("cleanup_succeeds", "expected_lifecycle"),
+    [
+        (True, WorkspaceLifecycle.REMOVED),
+        (False, WorkspaceLifecycle.CLEANUP_FAILED),
+    ],
+)
+def test_workspace_root_resolve_failure_persists_cleanup_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_succeeds: bool,
+    expected_lifecycle: WorkspaceLifecycle,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+    preflight_result = codex_provider_module.preflight_codex(
+        parent_environment=environment
+    )
+    temporary_root = tmp_path / "unresolved-live-run-root"
+    resolve = Path.resolve
+
+    monkeypatch.setattr(
+        "agentlab.workspace.tempfile.mkdtemp",
+        lambda **_kwargs: str(temporary_root.mkdir() or temporary_root),
+    )
+
+    def fail_created_root_resolve(
+        path: Path,
+        strict: bool = False,
+    ) -> Path:
+        if path == temporary_root:
+            raise OSError("synthetic Live workspace root resolve failure")
+        return resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", fail_created_root_resolve)
+    if not cleanup_succeeds:
+        monkeypatch.setattr(
+            "agentlab.workspace._remove_temporary_root",
+            lambda _path: (False, "synthetic cleanup failure"),
+        )
+
+    outcome = run_live_codex(
+        spec_path,
+        task_id="task-1",
+        repetition_index=0,
+        run_id="workspace-resolve-failure",
+        output_path=output,
+        confirm_live_codex=True,
+        parent_environment=environment,
+        preflight=lambda **_kwargs: preflight_result,
+    )
+    recording = load_replay_recording(outcome.recording_path)
+
+    assert outcome.artifact.overall_status is LiveOverallStatus.HARNESS_ERROR
+    assert outcome.artifact.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+    assert outcome.artifact.workspace_lifecycle is expected_lifecycle
+    assert outcome.artifact.codex.process_started is False
+    assert (
+        outcome.artifact.codex.execution_stage
+        is CodexExecutionStage.PREFLIGHT_COMPLETED
+    )
+    assert isinstance(recording.failed, LiveRunFailedEvent)
+    assert recording.failed.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+    assert temporary_root.exists() is (not cleanup_succeeds)
+    if temporary_root.exists():
+        temporary_root.rmdir()
+
+
 def test_provider_environment_preparation_failure_preserves_selected_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

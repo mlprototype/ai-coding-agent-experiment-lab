@@ -182,6 +182,36 @@ def test_preflight_temporary_root_creation_failure_is_a_harness_error(
     assert error.value.termination.process_group_cleared is True
 
 
+def test_preflight_temporary_root_resolve_failure_removes_created_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment, _inspection = _fake_codex(tmp_path)
+    temporary_root = tmp_path / "unresolved-preflight-root"
+    resolve = Path.resolve
+
+    monkeypatch.setattr(
+        "agentlab.codex_provider.tempfile.mkdtemp",
+        lambda **_kwargs: str(temporary_root.mkdir() or temporary_root),
+    )
+
+    def fail_created_root_resolve(
+        path: Path,
+        strict: bool = False,
+    ) -> Path:
+        if path == temporary_root:
+            raise OSError("synthetic preflight root resolve failure")
+        return resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", fail_created_root_resolve)
+
+    with pytest.raises(CodexPreflightError) as error:
+        preflight_codex(parent_environment=environment)
+
+    assert error.value.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+    assert not temporary_root.exists()
+
+
 def test_preflight_workspace_creation_failure_is_a_harness_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

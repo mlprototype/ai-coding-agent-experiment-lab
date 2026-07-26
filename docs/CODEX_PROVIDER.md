@@ -16,7 +16,8 @@ selector生成や収集loopの未知例外でもprocess groupを緊急回収す�
 作成・Workspace準備・cleanup失敗はProvider能力エラーへ変換せず`evidence_error`とするが、
 process group回収も失敗した場合は`process_cleanup_error`を優先する。preflight commandの
 process回収に失敗した場合は、実際のtermination情報を
-`preflight_not_completed`のCodex Evidenceへ保持する。
+`preflight_not_completed`のCodex Evidenceへ保持する。`mkdtemp()`後は未解決pathを先に
+保持し、path解決に失敗しても作成済みのpreflight rootをcleanupする。
 AI Prompt、Login、auth file読取り、network refreshは行わない。
 
 helpには`--json`、`--ephemeral`、`--sandbox`、

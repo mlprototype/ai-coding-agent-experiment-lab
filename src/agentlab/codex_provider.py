@@ -429,9 +429,11 @@ def _run_preflight_command(
     harness_error: _PreflightHarnessError | None = None
     try:
         try:
-            temporary_root = Path(
+            created_root = Path(
                 tempfile.mkdtemp(prefix="agentlab-codex-preflight-")
-            ).resolve()
+            )
+            temporary_root = created_root
+            temporary_root = created_root.resolve()
             workspace = temporary_root / "workspace"
             environment_root = temporary_root / "environment"
             workspace.mkdir()
