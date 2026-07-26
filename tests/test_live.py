@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import textwrap
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, NoReturn
@@ -1050,6 +1051,103 @@ def test_post_spawn_handoff_faults_preserve_process_lifecycle(
         os.kill(spawned_pids[0], 0)
     persisted = output.read_bytes() + outcome.recording_path.read_bytes()
     assert b"synthetic handoff secret" not in persisted
+
+
+@pytest.mark.parametrize(
+    "interruption",
+    [
+        KeyboardInterrupt("synthetic interrupt"),
+        SystemExit(73),
+    ],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+def test_post_spawn_base_exception_reaps_process_tree_without_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: BaseException,
+) -> None:
+    live_code = (
+        "subprocess=__import__('subprocess');signal=__import__('signal')\n"
+        "child=subprocess.Popen("
+        "[sys.executable,'-c','import signal; signal.pause()'])\n"
+        "inspection.write_text(json.dumps({"
+        "'parent':os.getpid(),'child':child.pid"
+        "}),encoding='utf-8')\n"
+        "signal.pause()"
+    )
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, inspection = _fake_codex(tmp_path, live_code=live_code)
+    preflight_result = codex_provider_module.preflight_codex(
+        parent_environment=environment
+    )
+    selector_factory = codex_provider_module.selectors.DefaultSelector
+    prepare_workspace = live_module.prepare_disposable_workspace
+    temporary_roots: list[Path] = []
+
+    class InterruptingSelector:
+        def __init__(self) -> None:
+            self._selector = selector_factory()
+
+        def register(self, *args: object, **kwargs: object):
+            return self._selector.register(*args, **kwargs)
+
+        def unregister(self, *args: object, **kwargs: object):
+            return self._selector.unregister(*args, **kwargs)
+
+        def get_map(self):
+            return self._selector.get_map()
+
+        def select(self, _timeout: float):
+            deadline = time.monotonic() + 2
+            while not inspection.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not inspection.exists():
+                raise AssertionError("fake Provider did not start")
+            raise interruption
+
+        def close(self) -> None:
+            self._selector.close()
+
+    def track_workspace(*args: object, **kwargs: object):
+        workspace = prepare_workspace(*args, **kwargs)
+        temporary_roots.append(workspace.temporary_root)
+        return workspace
+
+    monkeypatch.setattr(
+        "agentlab.codex_provider.selectors.DefaultSelector",
+        InterruptingSelector,
+    )
+    monkeypatch.setattr(
+        "agentlab.live.prepare_disposable_workspace",
+        track_workspace,
+    )
+    monkeypatch.setattr(
+        "agentlab.live.execute_quality_gates_in_workspace",
+        lambda *_args, **_kwargs: pytest.fail("quality Gates must not run"),
+    )
+
+    with pytest.raises(type(interruption)) as raised:
+        run_live_codex(
+            spec_path,
+            task_id="task-1",
+            repetition_index=0,
+            run_id="offline-interrupted-provider",
+            output_path=output,
+            confirm_live_codex=True,
+            parent_environment=environment,
+            preflight=lambda **_kwargs: preflight_result,
+        )
+
+    assert raised.value is interruption
+    process_ids = json.loads(inspection.read_text(encoding="utf-8"))
+    for process_id in process_ids.values():
+        with pytest.raises(ProcessLookupError):
+            os.kill(process_id, 0)
+    recording_path = spec_path.parent / "recordings" / "live.jsonl"
+    assert not output.exists()
+    assert not recording_path.exists()
+    assert len(temporary_roots) == 1
+    assert not temporary_roots[0].exists()
 
 
 def test_failed_emergency_cleanup_is_not_recorded_as_cleared(

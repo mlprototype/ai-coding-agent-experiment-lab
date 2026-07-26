@@ -146,6 +146,8 @@ non-blockingで回収し、大量出力時もraw streamをmemoryへ蓄積しな�
 selector生成、pipe設定、収集loopの未知例外も緊急cleanup境界で処理し、group回収成功を
 `evidence_error`、回収失敗を`process_cleanup_error`として保存する。parser summary、
 Codex Evidence構築、runner result構築で失敗しても同じ全体例外境界で回収状態を維持する。
+`KeyboardInterrupt`と`SystemExit`でもprocess groupを緊急回収し、中断は通常の
+Provider失敗へ変換せずそのまま再送出するため、paired Evidence／Recordingは公開しない。
 
 Provider成功時だけ同じWorkspaceでPhase 2 Gateをgroup順に実行する。Provider失敗時は
 Gateを実行しない。最終diff後は成否に関係なくtemporary rootを削除し、Fixture/Prompt

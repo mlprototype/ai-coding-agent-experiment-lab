@@ -1014,6 +1014,9 @@ class CodexProcessRunner:
                 environment_root=environment_root,
                 parent_environment=parent_environment,
             )
+        except (KeyboardInterrupt, SystemExit):
+            self._emergency_cleanup()
+            raise
         except UnsupportedRunnerPlatformError:
             raise
         except Exception as error:
