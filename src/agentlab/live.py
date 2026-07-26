@@ -17,9 +17,12 @@ from typing import Any, NoReturn
 from pydantic import ValidationError
 
 from agentlab.codex_provider import (
+    CodexLifecycleTracker,
     CodexPreflight,
     CodexPreflightError,
     CodexProcessRunner,
+    CodexRunnerError,
+    lifecycle_failure_evidence,
     post_preflight_failure_evidence,
     preflight_codex,
     preflight_failure_evidence,
@@ -702,6 +705,25 @@ def _map_gate_harness(_gate_result: GateExecutionResult) -> LiveFailureKind:
     return LiveFailureKind.GATE_HARNESS_ERROR
 
 
+def _strict_lifecycle_failure_evidence(
+    preflight: CodexPreflight,
+    *,
+    spec: ExperimentSpec,
+    lifecycle: CodexLifecycleTracker,
+) -> CodexExecutionEvidence:
+    assert spec.live is not None
+    try:
+        return lifecycle_failure_evidence(
+            preflight,
+            live=spec.live,
+            lifecycle=lifecycle,
+        )
+    except Exception as error:
+        raise LiveCodexError(
+            "could not construct strict Codex lifecycle failure Evidence"
+        ) from error
+
+
 def run_live_codex(
     spec_path: Path,
     *,
@@ -848,6 +870,7 @@ def run_live_codex(
     gate_result: GateExecutionResult | None = None
     codex: CodexExecutionEvidence | None = None
     failure_kind: LiveFailureKind | None = None
+    lifecycle = CodexLifecycleTracker()
     try:
         workspace = prepare_disposable_workspace(source, source_snapshot)
         try:
@@ -865,15 +888,24 @@ def run_live_codex(
             )
         else:
             try:
-                codex_result = CodexProcessRunner(
+                lifecycle.failure_stage = (
+                    CodexFailureStage.PROVIDER_RUNNER_CONSTRUCTION
+                )
+                runner = CodexProcessRunner(
                     live=spec.live,
                     runner=spec.runner,
-                ).run(
+                    lifecycle=lifecycle,
+                )
+                lifecycle.mark_runner_started()
+                codex_result = runner.run(
                     preflight=preflight_result,
                     prompt=prompt.content,
                     workspace=workspace.workspace,
                     environment_root=provider_environment_root,
                     parent_environment=parent_environment,
+                )
+                lifecycle.failure_stage = (
+                    CodexFailureStage.PROVIDER_RUNNER_RESULT_EXTRACTION
                 )
                 codex = codex_result.evidence
             except UnsupportedRunnerPlatformError as error:
@@ -881,6 +913,18 @@ def run_live_codex(
                     error,
                     preflight=preflight_result,
                     live=spec.live,
+                )
+            except CodexRunnerError as error:
+                codex = _strict_lifecycle_failure_evidence(
+                    preflight_result,
+                    spec=spec,
+                    lifecycle=error.lifecycle,
+                )
+            except Exception:
+                codex = _strict_lifecycle_failure_evidence(
+                    preflight_result,
+                    spec=spec,
+                    lifecycle=lifecycle,
                 )
         if codex.status is ProviderExecutionStatus.SUCCEEDED:
             gate_environment_root = _prepare_live_environment_root(
@@ -914,13 +958,16 @@ def run_live_codex(
                 live=spec.live,
                 failure_stage=CodexFailureStage.WORKSPACE_PREPARATION,
             )
+    except LiveCodexError:
+        raise
     except Exception:
         failure_kind = LiveFailureKind.EVIDENCE_ERROR
         if codex is None:
-            codex = post_preflight_failure_evidence(
+            lifecycle.failure_stage = CodexFailureStage.PROVIDER_ORCHESTRATION
+            codex = _strict_lifecycle_failure_evidence(
                 preflight_result,
-                live=spec.live,
-                failure_stage=CodexFailureStage.PROVIDER_ORCHESTRATION,
+                spec=spec,
+                lifecycle=lifecycle,
             )
     finally:
         if workspace is not None:

@@ -22,10 +22,13 @@ from agentlab.codex_provider import (
 )
 from agentlab.models import (
     CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS,
+    CodexCleanupState,
     CodexCliProfile,
     CodexExecutionStage,
     CodexFailureStage,
+    CodexInvocationState,
     CodexItemType,
+    CodexRunnerState,
     CodexTerminalEvent,
     LiveFailureKind,
     LiveSettings,
@@ -707,6 +710,13 @@ def test_process_runner_uses_safe_argv_stdin_and_separate_environment(
     argv = observed["argv"]
 
     assert result.evidence.status is ProviderExecutionStatus.SUCCEEDED
+    assert result.evidence.schema_version == "1.3"
+    assert result.evidence.runner_state is CodexRunnerState.STARTED
+    assert (
+        result.evidence.invocation_state
+        is CodexInvocationState.PROCESS_STARTED
+    )
+    assert result.evidence.cleanup_state is CodexCleanupState.CLEARED
     assert observed["prompt"] == prompt_secret
     assert prompt_secret not in argv
     assert observed["cwd"] == str(workspace)
@@ -902,6 +912,12 @@ def test_process_runner_classifies_spawn_failure(
 
     assert result.evidence.failure_kind is LiveFailureKind.PROVIDER_SPAWN_ERROR
     assert result.evidence.failure_stage is CodexFailureStage.PROVIDER_PROCESS_SPAWN
+    assert result.evidence.runner_state is CodexRunnerState.STARTED
+    assert (
+        result.evidence.invocation_state
+        is CodexInvocationState.SPAWN_ATTEMPTED
+    )
+    assert result.evidence.cleanup_state is CodexCleanupState.NOT_APPLICABLE
     assert result.evidence.exit_code is None
 
 

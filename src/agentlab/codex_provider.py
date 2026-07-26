@@ -11,9 +11,9 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any, Literal, NoReturn, cast
@@ -22,11 +22,14 @@ from agentlab.models import (
     CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS,
     CODEX_REQUIRED_EXEC_FLAGS,
     CodexApprovalBasis,
+    CodexCleanupState,
     CodexCliProfile,
     CodexExecutionEvidence,
     CodexExecutionStage,
     CodexFailureStage,
+    CodexInvocationState,
     CodexItemType,
+    CodexRunnerState,
     CodexTerminalEvent,
     CommandStatus,
     FailureKind,
@@ -111,6 +114,14 @@ class CodexProtocolError(ValueError):
         self.failure_kind = failure_kind
 
 
+class CodexRunnerError(RuntimeError):
+    """A Provider runner boundary failed after preserving its safe lifecycle."""
+
+    def __init__(self, lifecycle: CodexLifecycleTracker) -> None:
+        super().__init__("Codex Provider runner failed at a redacted lifecycle boundary")
+        self.lifecycle = lifecycle
+
+
 class _PreflightHarnessError(subprocess.SubprocessError):
     """A read-only probe hit an Evidence/process-cleanup Harness failure."""
 
@@ -161,6 +172,53 @@ class CodexParseSummary:
 @dataclass(frozen=True)
 class CodexRunResult:
     evidence: CodexExecutionEvidence
+
+
+@dataclass
+class CodexLifecycleTracker:
+    """In-memory Provider lifecycle used to construct truthful failure Evidence."""
+
+    runner_state: CodexRunnerState = CodexRunnerState.NOT_STARTED
+    invocation_state: CodexInvocationState = CodexInvocationState.NOT_ATTEMPTED
+    cleanup_state: CodexCleanupState | None = CodexCleanupState.NOT_APPLICABLE
+    failure_stage: CodexFailureStage = CodexFailureStage.PROVIDER_RUNNER_CONSTRUCTION
+    termination: TerminationEvidence = field(default_factory=termination_without_signal)
+    process: subprocess.Popen[bytes] | None = field(default=None, repr=False)
+    parser: CodexJsonlParser | None = field(default=None, repr=False)
+    started_at: datetime | None = None
+    started_monotonic: float | None = None
+    return_code: int | None = None
+    stderr_bytes: int = 0
+    stderr_truncated: bool = False
+    stdout_limit_exceeded: bool = False
+
+    def mark_runner_started(self) -> None:
+        self.runner_state = CodexRunnerState.STARTED
+        self.failure_stage = CodexFailureStage.PROVIDER_RUNNER_ENTRY
+
+    def mark_spawn_attempted(self) -> None:
+        self.invocation_state = CodexInvocationState.SPAWN_ATTEMPTED
+        self.cleanup_state = CodexCleanupState.NOT_APPLICABLE
+        self.failure_stage = CodexFailureStage.PROVIDER_PROCESS_SPAWN
+
+    def mark_process_started(self, process: subprocess.Popen[bytes]) -> None:
+        self.process = process
+        self.invocation_state = CodexInvocationState.PROCESS_STARTED
+        self.cleanup_state = None
+
+    def observe_termination(self, termination: TerminationEvidence) -> None:
+        self.termination = termination
+        if self.invocation_state is CodexInvocationState.PROCESS_STARTED:
+            self.cleanup_state = (
+                CodexCleanupState.CLEARED
+                if termination.process_group_cleared
+                else CodexCleanupState.FAILED
+            )
+
+    def persisted_cleanup_state(self) -> CodexCleanupState:
+        if self.cleanup_state is None:
+            raise RuntimeError("Provider cleanup state was not observed")
+        return self.cleanup_state
 
 
 class _DuplicateKeyError(ValueError):
@@ -409,6 +467,37 @@ class CodexJsonlParser:
             **parsed,
             source=UsageMetricSource.PROVIDER_REPORTED,
         )
+
+
+def _parser_snapshot(parser: CodexJsonlParser | None) -> CodexParseSummary:
+    if parser is None:
+        return CodexParseSummary(
+            event_count=0,
+            unknown_event_count=0,
+            thread_started_count=0,
+            turn_started_count=0,
+            terminal_event=CodexTerminalEvent.NONE,
+            turn_completed_count=0,
+            turn_failed_count=0,
+            error_event_count=0,
+            item_type_counts={},
+            usage_metrics=_not_available_usage(),
+            turn_failed=False,
+        )
+    return CodexParseSummary(
+        event_count=parser.event_count,
+        unknown_event_count=parser.unknown_event_count,
+        thread_started_count=parser.thread_started_count,
+        turn_started_count=parser.turn_started_count,
+        terminal_event=parser.terminal_event,
+        turn_completed_count=parser.turn_completed_count,
+        turn_failed_count=parser.turn_failed_count,
+        error_event_count=parser.error_event_count,
+        item_type_counts=dict(sorted(parser.item_type_counts.items())),
+        usage_metrics=parser.usage_metrics,
+        turn_failed=parser.terminal_event
+        in {CodexTerminalEvent.TURN_FAILED, CodexTerminalEvent.ERROR},
+    )
 
 
 def _probe_environment(parent_environment: Mapping[str, str]) -> dict[str, str]:
@@ -701,12 +790,15 @@ def _preflight_failure_evidence(
     assert live.reasoning_effort is not None
     now = datetime.now(UTC)
     return CodexExecutionEvidence(
-        schema_version="1.2",
+        schema_version="1.3",
         provider=Provider.CODEX,
         cli_version=error.cli_version,
         cli_profile=CodexCliProfile.NOT_SELECTED,
         execution_stage=CodexExecutionStage.PREFLIGHT_NOT_COMPLETED,
         failure_stage=CodexFailureStage.PREFLIGHT,
+        runner_state=CodexRunnerState.NOT_STARTED,
+        invocation_state=CodexInvocationState.NOT_ATTEMPTED,
+        cleanup_state=CodexCleanupState.NOT_APPLICABLE,
         preflight_checked_at=error.checked_at,
         verified_flags=sorted(error.verified_flags),
         requested_model=live.model,
@@ -756,18 +848,22 @@ def post_preflight_failure_evidence(
     live: LiveSettings,
     failure_kind: LiveFailureKind = LiveFailureKind.EVIDENCE_ERROR,
     failure_stage: CodexFailureStage,
+    runner_state: CodexRunnerState = CodexRunnerState.NOT_STARTED,
 ) -> CodexExecutionEvidence:
     """Record selected compatibility metadata before any Provider invocation."""
     assert live.model is not None
     assert live.reasoning_effort is not None
     now = datetime.now(UTC)
     return CodexExecutionEvidence(
-        schema_version="1.2",
+        schema_version="1.3",
         provider=Provider.CODEX,
         cli_version=preflight.cli_version,
         cli_profile=preflight.cli_profile,
         execution_stage=CodexExecutionStage.PREFLIGHT_COMPLETED,
         failure_stage=failure_stage,
+        runner_state=runner_state,
+        invocation_state=CodexInvocationState.NOT_ATTEMPTED,
+        cleanup_state=CodexCleanupState.NOT_APPLICABLE,
         preflight_checked_at=preflight.checked_at,
         verified_flags=sorted(preflight.verified_flags),
         requested_model=live.model,
@@ -803,14 +899,128 @@ def post_preflight_failure_evidence(
     )
 
 
+def lifecycle_failure_evidence(
+    preflight: CodexPreflight,
+    *,
+    live: LiveSettings,
+    lifecycle: CodexLifecycleTracker,
+) -> CodexExecutionEvidence:
+    """Build redacted 1.3 Evidence from observations shared with the runner."""
+    assert live.model is not None
+    assert live.reasoning_effort is not None
+    now = datetime.now(UTC)
+    started_at = lifecycle.started_at or now
+    parsed = _parser_snapshot(lifecycle.parser)
+    invocation_attempted = (
+        lifecycle.invocation_state is not CodexInvocationState.NOT_ATTEMPTED
+    )
+    process_started = (
+        lifecycle.invocation_state is CodexInvocationState.PROCESS_STARTED
+    )
+    cleanup_state = lifecycle.persisted_cleanup_state()
+    failure_kind = (
+        LiveFailureKind.PROCESS_CLEANUP_ERROR
+        if cleanup_state is CodexCleanupState.FAILED
+        else LiveFailureKind.EVIDENCE_ERROR
+    )
+    duration_ms = 0
+    if process_started and lifecycle.started_monotonic is not None:
+        duration_ms = max(
+            0,
+            int((time.monotonic() - lifecycle.started_monotonic) * 1000),
+        )
+    return CodexExecutionEvidence(
+        schema_version="1.3",
+        provider=Provider.CODEX,
+        cli_version=preflight.cli_version,
+        cli_profile=preflight.cli_profile,
+        execution_stage=(
+            CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+            if invocation_attempted
+            else CodexExecutionStage.PREFLIGHT_COMPLETED
+        ),
+        failure_stage=lifecycle.failure_stage,
+        runner_state=lifecycle.runner_state,
+        invocation_state=lifecycle.invocation_state,
+        cleanup_state=cleanup_state,
+        preflight_checked_at=preflight.checked_at,
+        verified_flags=sorted(preflight.verified_flags),
+        requested_model=live.model,
+        requested_reasoning_effort=live.reasoning_effort,
+        sandbox_mode="workspace-write",
+        approval_policy="never" if invocation_attempted else None,
+        approval_basis=(
+            CodexApprovalBasis.EXPLICIT_CONFIG_NEVER
+            if invocation_attempted
+            else None
+        ),
+        web_search_disabled=True,
+        command_network_disabled=True,
+        raw_stream_persisted=False,
+        process_started=process_started,
+        status=ProviderExecutionStatus.FAILED,
+        failure_kind=failure_kind,
+        exit_code=lifecycle.return_code if process_started else None,
+        started_at=started_at,
+        completed_at=now,
+        duration_ms=duration_ms,
+        event_count=parsed.event_count,
+        unknown_event_count=parsed.unknown_event_count,
+        thread_started_count=parsed.thread_started_count,
+        turn_started_count=parsed.turn_started_count,
+        terminal_event=parsed.terminal_event,
+        turn_completed_count=parsed.turn_completed_count,
+        turn_failed_count=parsed.turn_failed_count,
+        error_event_count=parsed.error_event_count,
+        item_type_counts=parsed.item_type_counts,
+        usage_metrics=parsed.usage_metrics,
+        stdout_bytes=0 if lifecycle.parser is None else lifecycle.parser.total_bytes,
+        stderr_bytes=lifecycle.stderr_bytes,
+        stdout_limit_exceeded=lifecycle.stdout_limit_exceeded,
+        stderr_truncated=lifecycle.stderr_truncated,
+        termination=lifecycle.termination,
+    )
+
+
 class CodexProcessRunner:
     """Run one preflighted Codex process without retaining raw stdout or stderr."""
 
-    def __init__(self, *, live: LiveSettings, runner: RunnerSettings) -> None:
+    def __init__(
+        self,
+        *,
+        live: LiveSettings,
+        runner: RunnerSettings,
+        lifecycle: CodexLifecycleTracker | None = None,
+    ) -> None:
         self._live = live
         self._runner = runner
+        self.lifecycle = lifecycle or CodexLifecycleTracker()
 
     def run(
+        self,
+        *,
+        preflight: CodexPreflight,
+        prompt: bytes,
+        workspace: Path,
+        environment_root: Path,
+        parent_environment: Mapping[str, str] | None = None,
+    ) -> CodexRunResult:
+        self.lifecycle.mark_runner_started()
+        try:
+            return self._run(
+                preflight=preflight,
+                prompt=prompt,
+                workspace=workspace,
+                environment_root=environment_root,
+                parent_environment=parent_environment,
+            )
+        except UnsupportedRunnerPlatformError:
+            raise
+        except Exception as error:
+            self._emergency_cleanup()
+            raise CodexRunnerError(self.lifecycle) from error
+
+    def _run(
         self,
         *,
         preflight: CodexPreflight,
@@ -826,22 +1036,29 @@ class CodexProcessRunner:
         assert live.max_event_line_bytes is not None
         assert live.max_provider_output_bytes is not None
         max_provider_output_bytes = live.max_provider_output_bytes
+        self.lifecycle.failure_stage = CodexFailureStage.PROVIDER_RUNTIME_PRECHECK
         ensure_runner_platform_supported()
         started_at = datetime.now(UTC)
         started_monotonic = time.monotonic()
+        self.lifecycle.started_at = started_at
+        self.lifecycle.started_monotonic = started_monotonic
+        self.lifecycle.failure_stage = CodexFailureStage.JSONL_PARSER_INITIALIZATION
         try:
             parser = CodexJsonlParser(
                 max_line_bytes=live.max_event_line_bytes,
                 max_total_bytes=live.max_provider_output_bytes,
             )
         except Exception:
-            return CodexRunResult(
-                evidence=post_preflight_failure_evidence(
+            return self._result_from_evidence(
+                lambda: post_preflight_failure_evidence(
                     preflight,
                     live=live,
                     failure_stage=CodexFailureStage.JSONL_PARSER_INITIALIZATION,
+                    runner_state=CodexRunnerState.STARTED,
                 )
             )
+        self.lifecycle.parser = parser
+        self.lifecycle.failure_stage = CodexFailureStage.PROVIDER_ARGV_CONSTRUCTION
         try:
             argv = build_codex_argv(
                 preflight,
@@ -849,26 +1066,30 @@ class CodexProcessRunner:
                 reasoning_effort=live.reasoning_effort,
             )
         except Exception:
-            return CodexRunResult(
-                evidence=post_preflight_failure_evidence(
+            return self._result_from_evidence(
+                lambda: post_preflight_failure_evidence(
                     preflight,
                     live=live,
                     failure_stage=CodexFailureStage.PROVIDER_ARGV_CONSTRUCTION,
+                    runner_state=CodexRunnerState.STARTED,
                 )
             )
+        self.lifecycle.failure_stage = CodexFailureStage.PROVIDER_ENVIRONMENT_CONSTRUCTION
         try:
             environment = build_codex_environment(
                 environment_root,
                 parent_environment=parent_environment,
             )
         except Exception:
-            return CodexRunResult(
-                evidence=post_preflight_failure_evidence(
+            return self._result_from_evidence(
+                lambda: post_preflight_failure_evidence(
                     preflight,
                     live=live,
                     failure_stage=CodexFailureStage.PROVIDER_ENVIRONMENT_CONSTRUCTION,
+                    runner_state=CodexRunnerState.STARTED,
                 )
             )
+        self.lifecycle.mark_spawn_attempted()
         try:
             process = subprocess.Popen(
                 argv,
@@ -886,8 +1107,8 @@ class CodexProcessRunner:
                 if isinstance(error, FileNotFoundError)
                 else LiveFailureKind.PROVIDER_SPAWN_ERROR
             )
-            return CodexRunResult(
-                evidence=self._build_evidence(
+            return self._result_from_evidence(
+                lambda: self._build_evidence(
                     preflight=preflight,
                     started_at=started_at,
                     started_monotonic=started_monotonic,
@@ -902,6 +1123,10 @@ class CodexProcessRunner:
                     termination=termination_without_signal(),
                 )
             )
+        self.lifecycle.mark_process_started(process)
+        self.lifecycle.failure_stage = (
+            CodexFailureStage.PROVIDER_PIPE_SELECTOR_INITIALIZATION
+        )
 
         streams: dict[str, IO[bytes]] = {}
         try:
@@ -933,8 +1158,10 @@ class CodexProcessRunner:
                 if termination.process_group_cleared
                 else LiveFailureKind.PROCESS_CLEANUP_ERROR
             )
-            return CodexRunResult(
-                evidence=self._build_evidence(
+            self.lifecycle.observe_termination(termination)
+            self.lifecycle.return_code = process.poll()
+            return self._result_from_evidence(
+                lambda: self._build_evidence(
                     preflight=preflight,
                     started_at=started_at,
                     started_monotonic=started_monotonic,
@@ -973,8 +1200,10 @@ class CodexProcessRunner:
                 if termination.process_group_cleared
                 else LiveFailureKind.PROCESS_CLEANUP_ERROR
             )
-            return CodexRunResult(
-                evidence=self._build_evidence(
+            self.lifecycle.observe_termination(termination)
+            self.lifecycle.return_code = process.poll()
+            return self._result_from_evidence(
+                lambda: self._build_evidence(
                     preflight=preflight,
                     started_at=started_at,
                     started_monotonic=started_monotonic,
@@ -991,6 +1220,7 @@ class CodexProcessRunner:
                 )
             )
 
+        self.lifecycle.failure_stage = CodexFailureStage.PROVIDER_PROCESS_COLLECTION
         prompt_offset = 0
         stderr_bytes = 0
         stderr_truncated = False
@@ -1066,6 +1296,8 @@ class CodexProcessRunner:
                     stderr_bytes += len(chunk)
                     if stderr_bytes > max_provider_output_bytes:
                         stderr_truncated = True
+                    self.lifecycle.stderr_bytes = stderr_bytes
+                    self.lifecycle.stderr_truncated = stderr_truncated
 
         try:
             deadline = started_monotonic + live.provider_timeout_ms / 1000
@@ -1161,6 +1393,10 @@ class CodexProcessRunner:
                 if failure_kind is None:
                     failure_kind = LiveFailureKind.EVIDENCE_ERROR
 
+        self.lifecycle.observe_termination(termination)
+        self.lifecycle.return_code = return_code
+        self.lifecycle.stderr_bytes = stderr_bytes
+        self.lifecycle.stderr_truncated = stderr_truncated
         summary = parser.summary()
         if protocol_error is None:
             try:
@@ -1191,8 +1427,20 @@ class CodexProcessRunner:
             if final_failure is LiveFailureKind.NONE
             else ProviderExecutionStatus.FAILED
         )
-        return CodexRunResult(
-            evidence=self._build_evidence(
+        self.lifecycle.observe_termination(termination)
+        self.lifecycle.return_code = return_code
+        self.lifecycle.stderr_bytes = stderr_bytes
+        self.lifecycle.stderr_truncated = stderr_truncated
+        self.lifecycle.stdout_limit_exceeded = (
+            failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
+            or (
+                protocol_error is not None
+                and protocol_error.failure_kind
+                is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
+            )
+        )
+        return self._result_from_evidence(
+            lambda: self._build_evidence(
                 preflight=preflight,
                 started_at=started_at,
                 started_monotonic=started_monotonic,
@@ -1207,18 +1455,52 @@ class CodexProcessRunner:
                 parser=parser,
                 stderr_bytes=stderr_bytes,
                 stderr_truncated=stderr_truncated,
-                stdout_limit_exceeded=(
-                    failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
-                    or (
-                        protocol_error is not None
-                        and protocol_error.failure_kind
-                        is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
-                    )
-                ),
+                stdout_limit_exceeded=self.lifecycle.stdout_limit_exceeded,
                 termination=termination,
                 summary=summary,
             )
         )
+
+    def _result_from_evidence(
+        self,
+        build: Callable[[], CodexExecutionEvidence],
+    ) -> CodexRunResult:
+        self.lifecycle.failure_stage = CodexFailureStage.CODEX_EVIDENCE_CONSTRUCTION
+        evidence = build()
+        self.lifecycle.failure_stage = (
+            CodexFailureStage.PROVIDER_RUNNER_RESULT_CONSTRUCTION
+        )
+        return CodexRunResult(evidence=evidence)
+
+    def _emergency_cleanup(self) -> None:
+        lifecycle = self.lifecycle
+        process = lifecycle.process
+        if (
+            process is None
+            or lifecycle.invocation_state is not CodexInvocationState.PROCESS_STARTED
+            or lifecycle.cleanup_state is not None
+        ):
+            return
+        try:
+            termination = terminate_process_group(
+                process,
+                reason=TerminationReason.EMERGENCY_CLEANUP,
+                grace_seconds=self._runner.termination_grace_ms / 1000,
+                drain=lambda _timeout: None,
+            )
+        except Exception:
+            termination = TerminationEvidence(
+                reason=TerminationReason.EMERGENCY_CLEANUP,
+                sigterm_sent=False,
+                sigkill_sent=False,
+                process_group_cleared=False,
+                error="Provider emergency cleanup could not be completed",
+            )
+        try:
+            lifecycle.return_code = process.poll()
+        except Exception:
+            lifecycle.return_code = None
+        lifecycle.observe_termination(termination)
 
     @staticmethod
     def _registered_names(selector: selectors.BaseSelector) -> set[str]:
@@ -1246,12 +1528,20 @@ class CodexProcessRunner:
         assert self._live.reasoning_effort is not None
         parsed = parser.summary() if summary is None else summary
         return CodexExecutionEvidence(
-            schema_version="1.2",
+            schema_version="1.3",
             provider=Provider.CODEX,
             cli_version=preflight.cli_version,
             cli_profile=preflight.cli_profile,
-            execution_stage=CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED,
+            execution_stage=(
+                CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+                if self.lifecycle.invocation_state
+                is not CodexInvocationState.NOT_ATTEMPTED
+                else CodexExecutionStage.PREFLIGHT_COMPLETED
+            ),
             failure_stage=failure_stage,
+            runner_state=self.lifecycle.runner_state,
+            invocation_state=self.lifecycle.invocation_state,
+            cleanup_state=self.lifecycle.persisted_cleanup_state(),
             preflight_checked_at=preflight.checked_at,
             verified_flags=sorted(preflight.verified_flags),
             requested_model=self._live.model,
@@ -1302,12 +1592,15 @@ def unsupported_platform_evidence(
     assert live.reasoning_effort is not None
     now = datetime.now(UTC)
     return CodexExecutionEvidence(
-        schema_version="1.2",
+        schema_version="1.3",
         provider=Provider.CODEX,
         cli_version=preflight.cli_version,
         cli_profile=preflight.cli_profile,
         execution_stage=CodexExecutionStage.PREFLIGHT_COMPLETED,
         failure_stage=CodexFailureStage.PROVIDER_RUNTIME_PRECHECK,
+        runner_state=CodexRunnerState.STARTED,
+        invocation_state=CodexInvocationState.NOT_ATTEMPTED,
+        cleanup_state=CodexCleanupState.NOT_APPLICABLE,
         preflight_checked_at=preflight.checked_at,
         verified_flags=sorted(preflight.verified_flags),
         requested_model=live.model,

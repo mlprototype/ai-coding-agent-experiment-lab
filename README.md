@@ -37,9 +37,12 @@ Phase 0〜2を完了し、現在は
 
 Replayは引き続きRecording内の保存済みMetricsだけを再構成し、外部処理を呼びません。
 通常テストは短時間のfake Codex executableだけを使い、実Codex、外部AI、network、
-quotaを呼びません。Phase 3のmanual Live smokeは1回実行しましたが、Provider起動前の
-Harness障害で失敗したため、Phase 3は引き続きCurrentです。scheduler、staged Workflow、
-Workflow A/B、Antigravity、Provider比較、比較レポートは未実装です。
+quotaを呼びません。Phase 3のmanual Live smokeは累計2回実行し、2回ともHarness障害で
+成功受入に達していないため、Phase 3は引き続きCurrentです。2回目の旧Evidenceは
+`provider_orchestration`を記録しましたが、Provider起動、Prompt送信、model API到達、
+quota消費の有無を確定できません。過去の状態を推測せず、3回目は実行しません。
+scheduler、staged Workflow、Workflow A/B、Antigravity、Provider比較、比較レポートは
+未実装です。
 
 ## Quick Start
 
@@ -63,8 +66,9 @@ uv run ruff check .
 uv run mypy src
 ```
 
-実Codexを使うmanual smokeは、実装とdiffのレビュー後に人間が外部送信とquota消費を
-承認した場合だけ、次を1回実行します。
+次はPhase 3で使用したmanual smokeのCLI形式です。実Codexを使うため、通常テストやCIでは
+実行しません。Phase 3では承認済みのmanual smokeをすでに累計2回実行し、3回目は
+実行しません。
 
 ```console
 uv run agentlab live-codex experiments/examples/codex-live-smoke.yaml \
@@ -82,9 +86,11 @@ read-only preflightに成功します。このprofileは
 `--ask-for-approval`には依存しません。profile名、CLI version、明示設定の根拠を
 Evidenceへ保存します。preflightを完了できない場合はprofileを`not_selected`とし、
 approval policyを適用済みとは記録しません。preflight完了後もProvider起動前なら、選択済み
-profileと確認済みflagを保持しつつ、approval policyはnullのままです。最初のmanual Live
-smokeはProvider process起動前に失敗しており、成功するmanual smokeはPhase 3完了条件に
-含まれたままです。
+profileと確認済みflagを保持しつつ、approval policyはnullのままです。新規Codex
+Evidence 1.3はrunner、Popen試行、process生成、process group回収の観測状態を固定Enumで
+保持します。旧1.2の`provider_orchestration` fallbackはこの状態を正確に保持できないため、
+2回目のProvider起動・Prompt送信・model API到達・quota消費は確定不能です。manual Live
+受入は未達ですが、3回目は実行しません。
 
 `--confirm-live-codex`なしではversion/help preflightを含むsubprocessを起動しません。
 確認付き実行はCodex model APIへのPrompt送信とquota消費を伴います。Promptはargvへ

@@ -4,8 +4,8 @@
 
 Phase 3は、1 task・1 Codex Provider・1 repetition・`one_shot`を人間が手動実行する最小
 vertical sliceである。scheduler、staged Workflow、比較実験、自動retryはPhase 4以降で
-あり、実装していない。通常テストはfake Codexだけを使う。manual Live smokeは1回実行
-したが、Provider process起動前のHarness障害で失敗しており、成功受入は未達である。
+あり、実装していない。通常テストはfake Codexだけを使う。manual Live smokeは累計2回
+実行し、2回ともHarness障害で失敗したため成功受入は未達である。3回目は実行しない。
 
 ## Read-only preflight
 
@@ -103,17 +103,27 @@ cost、quota、価格計算は行わない。
 ## Safe failure location Evidence
 
 CodexExecutionEvidence 1.2は、失敗時に固定Enumの`failure_stage`を必須とする。
-Workspace準備、Provider用一時環境directory準備、runtime precheck、JSONL parser初期化、
-argv構築、Provider環境構築、process起動試行、pipe/selector初期化、process収集、
-予期しないProvider orchestrationを区別する。
+1.3はrunner構築、runner entry、runtime precheck、JSONL parser初期化、argv構築、
+Provider環境構築、process起動試行、pipe/selector初期化、process収集、Codex Evidence
+構築、runner result構築／抽出、Provider orchestrationを区別する。さらに
+`runner_state`、`invocation_state`、`cleanup_state`を固定Enumで保存し、runner未開始、
+Popen未試行、Popen試行済みでprocess未生成、process生成済み、回収済み、回収失敗を
+表現する。
 `Popen`を呼んだ時点から`provider_invocation_attempted`とapproval
 `never`/`explicit_config_never`を記録し、spawn失敗では`process_started=false`を保つ。
 それ以前は`preflight_completed`、`process_started=false`、approval policy/basis null
-である。例外message、任意の例外class名、pathなどの自由記述は保存しない。
+である。runnerとorchestratorは同じin-memory lifecycle trackerを共有する。runner内部の
+未知例外ではprocess group回収を行ってから固定状態だけを外側へ渡し、外側fallbackが
+未観測の`process_started=false`や回収済みを合成しない。strict Evidenceを構築できない
+場合はpaired Artifactを公開しない。例外message、任意の例外class名、PID、pathなどの
+自由記述は保存しない。
 
-既存CodexExecutionEvidence 1.1は`failure_stage`なしで引き続きstrict loaderが受理する。
-新規Evidenceだけを1.2で保存するため、保存済みRecording 1.1とLive Artifact 1.0を変換・
-上書きせず後方互換で読み込める。
+既存CodexExecutionEvidence 1.1は`failure_stage`なし、1.2は1.3のlifecycle fieldなしで
+引き続きstrict loaderが受理する。新規Evidenceだけを1.3で保存するため、保存済み
+Codex Evidence 1.1／1.2、Recording 1.1、Live Artifact 1.0を変換・上書きせず
+後方互換で読み込める。旧1.2の`provider_orchestration` fallbackはrunner内部の観測状態を
+保持しなかったため、そこからProvider起動、Prompt送信、model API到達、quota消費、
+process group回収の有無を確定してはならない。
 
 ## Persisted and excluded fields
 
@@ -121,6 +131,7 @@ CodexExecutionEvidenceにはrequested model/reasoning、sandbox/approval/network
 CLI profile/version、execution stage、時刻/duration、process開始有無、status/exit、
 thread/turn/terminal/event/unknown/item件数、Usage、stdout/stderr byte数と上限状態、
 process termination、safe failure kind、1.2以降のsafe failure stageを保存する。
+1.3ではrunner／invocation／cleanupの固定状態も保存する。
 
 Prompt本文、agent最終回答、reasoning、command本文/output、file content、raw JSONL、
 raw stderr、thread/session ID、executable path、HOME/CODEX_HOME、認証情報は保存しない。
@@ -133,7 +144,8 @@ ProviderもPhase 2と同じPOSIX新規session/process group、monotonic timeout�
 grace、SIGKILL、正常終了後のbackground child回収を使う。stdin/stdout/stderrを
 non-blockingで回収し、大量出力時もraw streamをmemoryへ蓄積しない。Popen成功後は
 selector生成、pipe設定、収集loopの未知例外も緊急cleanup境界で処理し、group回収成功を
-`evidence_error`、回収失敗を`process_cleanup_error`として保存する。
+`evidence_error`、回収失敗を`process_cleanup_error`として保存する。parser summary、
+Codex Evidence構築、runner result構築で失敗しても同じ全体例外境界で回収状態を維持する。
 
 Provider成功時だけ同じWorkspaceでPhase 2 Gateをgroup順に実行する。Provider失敗時は
 Gateを実行しない。最終diff後は成否に関係なくtemporary rootを削除し、Fixture/Prompt
@@ -187,7 +199,7 @@ smoke成功だけでは保証できない。ProviderがPrompt本文をWorkspace�
 
 通常テストのAutoReview相当configケースは、fake executableが明示approval configをargvで
 受け取ることだけを確認する。実Codex CLIがcloud/managed configを解決した最終policyは、
-Provider processを開始したmanual Live smokeがないため検証済みとはしない。
+2回の旧EvidenceだけではProvider process開始を確定できないため検証済みとはしない。
 
 Phase 3は一つの`one_shot` taskを手動実行するだけである。複数task/条件/反復scheduler、
 `staged` Workflow、A/B比較、集計はPhase 4であり、Phase 3 Providerへ先行実装しない。
@@ -196,11 +208,15 @@ Phase 3は一つの`one_shot` taskを手動実行するだけである。複数t
 
 実装、Prompt非保存、JSONL parser、環境分離、process tree、Recording/Replayをレビューし、
 CLI helpが必須flagをすべて持ち、ChatGPT-managed auth、model/quota、送信対象を確認した後、
-READMEの`live-codex ... --confirm-live-codex`を1回だけ手動実行する。
+READMEの`live-codex ... --confirm-live-codex`を明示承認の範囲で手動実行した。
 
 現在確認した`codex-cli 0.146.0-alpha.3.1`は
 `headless_exec_explicit_never_v2`のversion allowlistとread-only preflightに成功した。
-manual Live smokeは1回実行したが、preflightとWorkspace準備の後、Provider process起動前
-の`evidence_error`で失敗した。これはCodex model品質の結果ではなく、Prompt送信とquota
-消費も発生していない。過去の自由記述されない例外は復元・推測せず、failure stage追加後の
-offline fault injectionと再レビューを行う。Phase 3はCurrentであり、完了していない。
+manual Live smokeは累計2回実行し、2回ともHarness障害だった。2回目は
+`overall_status=harness_error`、`failure_kind=evidence_error`、
+`failure_stage=provider_orchestration`だったが、旧1.2 fallbackが起動・回収状態を
+ゼロ値で合成しうる欠陥があった。この成果物だけからProvider起動、Prompt送信、model API
+到達、quota消費、process group回収の有無は確定できず、過去の正確な例外も復元できない。
+これらを推測せず、1.3 lifecycle trackerとoffline fault injectionで将来のEvidence契約を
+修正した。Live成功受入は未達で、Phase 3はCurrentのままであり、3回目は実行しない。
+4件のLive Evidence／RecordingはGit管理外で保存する。

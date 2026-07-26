@@ -156,6 +156,8 @@ class CodexFailureStage(StrEnum):
     PROVIDER_ENVIRONMENT_DIRECTORY_PREPARATION = (
         "provider_environment_directory_preparation"
     )
+    PROVIDER_RUNNER_CONSTRUCTION = "provider_runner_construction"
+    PROVIDER_RUNNER_ENTRY = "provider_runner_entry"
     PROVIDER_RUNTIME_PRECHECK = "provider_runtime_precheck"
     JSONL_PARSER_INITIALIZATION = "jsonl_parser_initialization"
     PROVIDER_ARGV_CONSTRUCTION = "provider_argv_construction"
@@ -163,7 +165,33 @@ class CodexFailureStage(StrEnum):
     PROVIDER_PROCESS_SPAWN = "provider_process_spawn"
     PROVIDER_PIPE_SELECTOR_INITIALIZATION = "provider_pipe_selector_initialization"
     PROVIDER_PROCESS_COLLECTION = "provider_process_collection"
+    CODEX_EVIDENCE_CONSTRUCTION = "codex_evidence_construction"
+    PROVIDER_RUNNER_RESULT_CONSTRUCTION = "provider_runner_result_construction"
+    PROVIDER_RUNNER_RESULT_EXTRACTION = "provider_runner_result_extraction"
     PROVIDER_ORCHESTRATION = "provider_orchestration"
+
+
+class CodexRunnerState(StrEnum):
+    """Whether the Provider runner entry boundary was reached."""
+
+    NOT_STARTED = "not_started"
+    STARTED = "started"
+
+
+class CodexInvocationState(StrEnum):
+    """Observed subprocess creation state without storing process identifiers."""
+
+    NOT_ATTEMPTED = "not_attempted"
+    SPAWN_ATTEMPTED = "spawn_attempted"
+    PROCESS_STARTED = "process_started"
+
+
+class CodexCleanupState(StrEnum):
+    """Observed Provider process-group cleanup result."""
+
+    NOT_APPLICABLE = "not_applicable"
+    CLEARED = "cleared"
+    FAILED = "failed"
 
 
 class CodexTerminalEvent(StrEnum):
@@ -857,12 +885,15 @@ class LiveEvaluationSummary(ContractModel):
 class CodexExecutionEvidence(ContractModel):
     """Redacted summary of one Codex CLI process; raw events are never persisted."""
 
-    schema_version: Literal["1.1", "1.2"]
+    schema_version: Literal["1.1", "1.2", "1.3"]
     provider: Literal[Provider.CODEX]
     cli_version: StrictStr | None
     cli_profile: CodexCliProfile
     execution_stage: CodexExecutionStage
     failure_stage: CodexFailureStage | None = None
+    runner_state: CodexRunnerState | None = None
+    invocation_state: CodexInvocationState | None = None
+    cleanup_state: CodexCleanupState | None = None
     preflight_checked_at: datetime
     verified_flags: list[StrictStr]
     requested_model: StrictStr
@@ -926,7 +957,123 @@ class CodexExecutionEvidence(ContractModel):
             if self.failure_stage is not None:
                 raise ValueError("successful Codex Evidence must not contain failure_stage")
         elif self.failure_stage is None:
-            raise ValueError("failed Codex Evidence 1.2 requires failure_stage")
+            raise ValueError("failed Codex Evidence 1.2+ requires failure_stage")
+
+        lifecycle_values = (
+            self.runner_state,
+            self.invocation_state,
+            self.cleanup_state,
+        )
+        if self.schema_version in {"1.1", "1.2"}:
+            if any(value is not None for value in lifecycle_values):
+                raise ValueError(
+                    "Codex Evidence 1.1/1.2 must not contain 1.3 lifecycle state"
+                )
+        else:
+            if any(value is None for value in lifecycle_values):
+                raise ValueError(
+                    "Codex Evidence 1.3 requires complete lifecycle state"
+                )
+            assert self.runner_state is not None
+            assert self.invocation_state is not None
+            assert self.cleanup_state is not None
+            invocation_attempted = (
+                self.invocation_state is not CodexInvocationState.NOT_ATTEMPTED
+            )
+            process_started = (
+                self.invocation_state is CodexInvocationState.PROCESS_STARTED
+            )
+            if process_started is not self.process_started:
+                raise ValueError(
+                    "process_started must match the observed invocation state"
+                )
+            if (
+                self.runner_state is CodexRunnerState.NOT_STARTED
+                and invocation_attempted
+            ):
+                raise ValueError(
+                    "a runner that was not started cannot attempt Provider invocation"
+                )
+            if (
+                self.execution_stage
+                is CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+            ) is not invocation_attempted:
+                raise ValueError(
+                    "execution_stage must match the observed invocation state"
+                )
+            if process_started:
+                expected_cleanup = (
+                    CodexCleanupState.CLEARED
+                    if self.termination.process_group_cleared
+                    else CodexCleanupState.FAILED
+                )
+                if self.cleanup_state is not expected_cleanup:
+                    raise ValueError(
+                        "cleanup_state must match Provider termination Evidence"
+                    )
+            elif self.cleanup_state is not CodexCleanupState.NOT_APPLICABLE:
+                raise ValueError(
+                    "cleanup_state must be not_applicable without a process"
+                )
+            runner_started_stages = {
+                CodexFailureStage.PROVIDER_RUNNER_ENTRY,
+                CodexFailureStage.PROVIDER_RUNTIME_PRECHECK,
+                CodexFailureStage.JSONL_PARSER_INITIALIZATION,
+                CodexFailureStage.PROVIDER_ARGV_CONSTRUCTION,
+                CodexFailureStage.PROVIDER_ENVIRONMENT_CONSTRUCTION,
+                CodexFailureStage.PROVIDER_PROCESS_SPAWN,
+                CodexFailureStage.PROVIDER_PIPE_SELECTOR_INITIALIZATION,
+                CodexFailureStage.PROVIDER_PROCESS_COLLECTION,
+            }
+            if (
+                self.failure_stage is CodexFailureStage.PROVIDER_RUNNER_CONSTRUCTION
+                and self.runner_state is not CodexRunnerState.NOT_STARTED
+            ):
+                raise ValueError(
+                    "runner construction failure requires a not_started runner"
+                )
+            if (
+                self.failure_stage in runner_started_stages
+                and self.runner_state is not CodexRunnerState.STARTED
+            ):
+                raise ValueError(
+                    "runner-internal failure stage requires a started runner"
+                )
+            if (
+                self.failure_stage
+                in {
+                    CodexFailureStage.PROVIDER_RUNNER_ENTRY,
+                    CodexFailureStage.PROVIDER_RUNTIME_PRECHECK,
+                    CodexFailureStage.JSONL_PARSER_INITIALIZATION,
+                    CodexFailureStage.PROVIDER_ARGV_CONSTRUCTION,
+                    CodexFailureStage.PROVIDER_ENVIRONMENT_CONSTRUCTION,
+                }
+                and self.invocation_state
+                is not CodexInvocationState.NOT_ATTEMPTED
+            ):
+                raise ValueError(
+                    "pre-spawn runner failure cannot record an invocation attempt"
+                )
+            if (
+                self.failure_stage is CodexFailureStage.PROVIDER_PROCESS_SPAWN
+                and self.invocation_state
+                is not CodexInvocationState.SPAWN_ATTEMPTED
+            ):
+                raise ValueError(
+                    "process spawn failure requires a spawn attempt without a process"
+                )
+            if (
+                self.failure_stage
+                in {
+                    CodexFailureStage.PROVIDER_PIPE_SELECTOR_INITIALIZATION,
+                    CodexFailureStage.PROVIDER_PROCESS_COLLECTION,
+                }
+                and self.invocation_state
+                is not CodexInvocationState.PROCESS_STARTED
+            ):
+                raise ValueError(
+                    "post-spawn runner failure requires a started process"
+                )
 
         preflight_failure_stages = {
             CodexFailureStage.PREFLIGHT,
@@ -934,6 +1081,8 @@ class CodexExecutionEvidence(ContractModel):
         pre_invocation_failure_stages = {
             CodexFailureStage.WORKSPACE_PREPARATION,
             CodexFailureStage.PROVIDER_ENVIRONMENT_DIRECTORY_PREPARATION,
+            CodexFailureStage.PROVIDER_RUNNER_CONSTRUCTION,
+            CodexFailureStage.PROVIDER_RUNNER_ENTRY,
             CodexFailureStage.PROVIDER_RUNTIME_PRECHECK,
             CodexFailureStage.JSONL_PARSER_INITIALIZATION,
             CodexFailureStage.PROVIDER_ARGV_CONSTRUCTION,
@@ -944,6 +1093,11 @@ class CodexExecutionEvidence(ContractModel):
             CodexFailureStage.PROVIDER_PROCESS_SPAWN,
             CodexFailureStage.PROVIDER_PIPE_SELECTOR_INITIALIZATION,
             CodexFailureStage.PROVIDER_PROCESS_COLLECTION,
+        }
+        lifecycle_dependent_failure_stages = {
+            CodexFailureStage.CODEX_EVIDENCE_CONSTRUCTION,
+            CodexFailureStage.PROVIDER_RUNNER_RESULT_CONSTRUCTION,
+            CodexFailureStage.PROVIDER_RUNNER_RESULT_EXTRACTION,
         }
         if (
             self.failure_stage in preflight_failure_stages
@@ -966,6 +1120,13 @@ class CodexExecutionEvidence(ContractModel):
             raise ValueError(
                 "Provider invocation failure_stage requires an invocation attempt"
             )
+        if (
+            self.failure_stage in lifecycle_dependent_failure_stages
+            and self.schema_version != "1.3"
+        ):
+            raise ValueError(
+                "runner handoff failure stages require Codex Evidence 1.3"
+            )
         if self.failure_stage in {
             CodexFailureStage.PROVIDER_PROCESS_SPAWN,
             *pre_invocation_failure_stages,
@@ -985,6 +1146,8 @@ class CodexExecutionEvidence(ContractModel):
         evidence_error_only_stages = {
             CodexFailureStage.WORKSPACE_PREPARATION,
             CodexFailureStage.PROVIDER_ENVIRONMENT_DIRECTORY_PREPARATION,
+            CodexFailureStage.PROVIDER_RUNNER_CONSTRUCTION,
+            CodexFailureStage.PROVIDER_RUNNER_ENTRY,
             CodexFailureStage.JSONL_PARSER_INITIALIZATION,
             CodexFailureStage.PROVIDER_ARGV_CONSTRUCTION,
             CodexFailureStage.PROVIDER_ENVIRONMENT_CONSTRUCTION,
@@ -998,11 +1161,26 @@ class CodexExecutionEvidence(ContractModel):
                 "initialization failure_stage requires evidence_error"
             )
         if (
-            self.failure_stage is CodexFailureStage.PROVIDER_RUNTIME_PRECHECK
-            and self.failure_kind is not LiveFailureKind.UNSUPPORTED_PLATFORM
+            self.failure_stage in lifecycle_dependent_failure_stages
+            and self.failure_kind
+            not in {
+                LiveFailureKind.EVIDENCE_ERROR,
+                LiveFailureKind.PROCESS_CLEANUP_ERROR,
+            }
         ):
             raise ValueError(
-                "provider_runtime_precheck requires unsupported_platform"
+                "runner handoff failure stage requires a Harness failure kind"
+            )
+        if (
+            self.failure_stage is CodexFailureStage.PROVIDER_RUNTIME_PRECHECK
+            and self.failure_kind
+            not in {
+                LiveFailureKind.UNSUPPORTED_PLATFORM,
+                LiveFailureKind.EVIDENCE_ERROR,
+            }
+        ):
+            raise ValueError(
+                "provider_runtime_precheck requires a runtime Harness failure"
             )
         if (
             self.failure_stage is CodexFailureStage.PROVIDER_PROCESS_SPAWN
