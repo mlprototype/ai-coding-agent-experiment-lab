@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 import agentlab.codex_provider as codex_provider_module
 import agentlab.live as live_module
+import agentlab.runner as runner_module
 from agentlab.codex_provider import REQUIRED_CODEX_EXEC_FLAGS
 from agentlab.live import (
     LiveArtifactLoadError,
@@ -51,6 +52,7 @@ def _fake_codex(
     tmp_path: Path,
     *,
     live_code: str,
+    version_code: str = f"print({_SUPPORTED_CODEX_VERSION!r})",
 ) -> tuple[dict[str, str], Path]:
     fake_directory = tmp_path / "fake-bin"
     fake_directory.mkdir(exist_ok=True)
@@ -60,7 +62,7 @@ def _fake_codex(
         "import json,os,pathlib,sys\n"
         f"inspection=pathlib.Path({str(inspection)!r})\n"
         "if sys.argv[1:] == ['--version']:\n"
-        f"    print({_SUPPORTED_CODEX_VERSION!r})\n"
+        f"{textwrap.indent(version_code, '    ')}\n"
         "elif sys.argv[1:] == ['exec','--help']:\n"
         f"    print({' '.join(REQUIRED_CODEX_EXEC_FLAGS)!r})\n"
         "else:\n"
@@ -707,6 +709,78 @@ def test_preflight_failure_is_saved_without_creating_workspace(tmp_path: Path) -
     assert outcome.artifact.codex.approval_policy is None
     assert outcome.artifact.codex.approval_basis is None
     assert isinstance(recording.failed, LiveRunFailedEvent)
+
+
+def test_preflight_process_cleanup_failure_is_saved_with_termination_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(
+        tmp_path,
+        live_code="raise SystemExit(99)",
+        version_code="import signal;signal.pause()",
+    )
+    spawned_pids: list[int] = []
+    popen = runner_module.subprocess.Popen
+    terminate_process_group = runner_module._terminate_process_group
+
+    def track_spawn(*args: object, **kwargs: object):
+        process = popen(*args, **kwargs)
+        spawned_pids.append(process.pid)
+        return process
+
+    def fail_selector_creation() -> NoReturn:
+        raise RuntimeError("synthetic unexpected preflight collection failure")
+
+    def report_cleanup_failure(*args: object, **kwargs: object):
+        termination = terminate_process_group(*args, **kwargs)
+        assert termination.process_group_cleared
+        return termination.model_copy(
+            update={
+                "process_group_cleared": False,
+                "error": "synthetic preflight process cleanup failure",
+            }
+        )
+
+    monkeypatch.setattr("agentlab.runner.subprocess.Popen", track_spawn)
+    monkeypatch.setattr(
+        "agentlab.runner.selectors.DefaultSelector",
+        fail_selector_creation,
+    )
+    monkeypatch.setattr(
+        "agentlab.runner._terminate_process_group",
+        report_cleanup_failure,
+    )
+
+    outcome = _run(spec_path, output, environment)
+    artifact = load_live_artifact(output)
+    recording = load_replay_recording(outcome.recording_path)
+
+    assert output.is_file()
+    assert outcome.recording_path.is_file()
+    assert artifact == outcome.artifact
+    assert artifact.overall_status is LiveOverallStatus.HARNESS_ERROR
+    assert artifact.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+    assert artifact.workspace_lifecycle is WorkspaceLifecycle.NOT_CREATED
+    assert (
+        artifact.codex.execution_stage
+        is CodexExecutionStage.PREFLIGHT_NOT_COMPLETED
+    )
+    assert artifact.codex.process_started is False
+    assert artifact.codex.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+    assert artifact.codex.termination.process_group_cleared is False
+    assert (
+        artifact.codex.termination.error
+        == "synthetic preflight process cleanup failure"
+    )
+    assert isinstance(recording.failed, LiveRunFailedEvent)
+    assert recording.failed.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+    assert recording.failed.codex.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+    assert recording.failed.codex.termination.process_group_cleared is False
+    assert len(spawned_pids) == 1
+    with pytest.raises(ProcessLookupError):
+        os.kill(spawned_pids[0], 0)
 
 
 def test_live_outputs_require_force_before_preflight_and_replace_explicitly(

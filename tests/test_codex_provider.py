@@ -161,6 +161,69 @@ def test_preflight_cleanup_failure_is_a_harness_error(
     assert error.value.failure_kind is LiveFailureKind.EVIDENCE_ERROR
 
 
+def test_preflight_temporary_root_creation_failure_is_a_harness_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment, _inspection = _fake_codex(tmp_path)
+
+    def fail_temporary_root_creation(*_args: object, **_kwargs: object) -> NoReturn:
+        raise OSError("synthetic preflight temporary root creation failure")
+
+    monkeypatch.setattr(
+        "agentlab.codex_provider.tempfile.mkdtemp",
+        fail_temporary_root_creation,
+    )
+
+    with pytest.raises(CodexPreflightError) as error:
+        preflight_codex(parent_environment=environment)
+
+    assert error.value.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+    assert error.value.termination.process_group_cleared is True
+
+
+def test_preflight_workspace_creation_failure_is_a_harness_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment, _inspection = _fake_codex(tmp_path)
+    mkdir = Path.mkdir
+    temporary_roots: list[Path] = []
+    mkdtemp = codex_provider_module.tempfile.mkdtemp
+
+    def track_temporary_root(*args: object, **kwargs: object) -> str:
+        created = Path(mkdtemp(*args, **kwargs))
+        temporary_roots.append(created)
+        return str(created)
+
+    def fail_workspace_creation(
+        path: Path,
+        mode: int = 0o777,
+        parents: bool = False,
+        exist_ok: bool = False,
+    ) -> None:
+        if (
+            path.name == "workspace"
+            and path.parent.name.startswith("agentlab-codex-preflight-")
+        ):
+            raise PermissionError("synthetic preflight workspace creation failure")
+        mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(
+        "agentlab.codex_provider.tempfile.mkdtemp",
+        track_temporary_root,
+    )
+    monkeypatch.setattr(Path, "mkdir", fail_workspace_creation)
+
+    with pytest.raises(CodexPreflightError) as error:
+        preflight_codex(parent_environment=environment)
+
+    assert error.value.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+    assert error.value.termination.process_group_cleared is True
+    assert len(temporary_roots) == 1
+    assert not temporary_roots[0].exists()
+
+
 def test_preflight_unexpected_collection_error_cleans_process_group(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -249,6 +312,11 @@ def test_preflight_preserves_process_cleanup_failure_kind(
         preflight_codex(parent_environment=environment)
 
     assert error.value.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+    assert error.value.termination.process_group_cleared is False
+    assert (
+        error.value.termination.error
+        == "synthetic preflight process cleanup failure"
+    )
     assert len(spawned_pids) == 1
     with pytest.raises(ProcessLookupError):
         os.kill(spawned_pids[0], 0)

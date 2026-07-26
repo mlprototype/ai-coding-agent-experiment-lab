@@ -13,8 +13,10 @@ vertical sliceである。scheduler、staged Workflow、比較実験、自動ret
 strict UTF-8、`shell=False`で確認する。各probeも新規POSIX session/process groupで
 起動し、timeout、正常終了後の残存子process、SIGTERM無視時のSIGKILLをboundedに扱う。
 selector生成や収集loopの未知例外でもprocess groupを緊急回収する。一時directoryの
-cleanup失敗はProvider能力エラーへ変換せず`evidence_error`とするが、process group回収も
-失敗した場合は`process_cleanup_error`を優先する。
+作成・Workspace準備・cleanup失敗はProvider能力エラーへ変換せず`evidence_error`とするが、
+process group回収も失敗した場合は`process_cleanup_error`を優先する。preflight commandの
+process回収に失敗した場合は、実際のtermination情報を
+`preflight_not_completed`のCodex Evidenceへ保持する。
 AI Prompt、Login、auth file読取り、network refreshは行わない。
 
 helpには`--json`、`--ephemeral`、`--sandbox`、
