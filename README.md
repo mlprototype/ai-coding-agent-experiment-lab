@@ -37,8 +37,9 @@ Phase 0〜2を完了し、現在は
 
 Replayは引き続きRecording内の保存済みMetricsだけを再構成し、外部処理を呼びません。
 通常テストは短時間のfake Codex executableだけを使い、実Codex、外部AI、network、
-quotaを呼びません。Phase 3のmanual Live smokeは未実行です。scheduler、staged
-Workflow、Workflow A/B、Antigravity、Provider比較、比較レポートは未実装です。
+quotaを呼びません。Phase 3のmanual Live smokeは1回実行しましたが、Provider起動前の
+Harness障害で失敗したため、Phase 3は引き続きCurrentです。scheduler、staged Workflow、
+Workflow A/B、Antigravity、Provider比較、比較レポートは未実装です。
 
 ## Quick Start
 
@@ -81,8 +82,9 @@ read-only preflightに成功します。このprofileは
 `--ask-for-approval`には依存しません。profile名、CLI version、明示設定の根拠を
 Evidenceへ保存します。preflightを完了できない場合はprofileを`not_selected`とし、
 approval policyを適用済みとは記録しません。preflight完了後もProvider起動前なら、選択済み
-profileと確認済みflagを保持しつつ、approval policyはnullのままです。manual Live smoke
-自体はまだ実行しておらず、Phase 3完了条件には含まれたままです。
+profileと確認済みflagを保持しつつ、approval policyはnullのままです。最初のmanual Live
+smokeはProvider process起動前に失敗しており、成功するmanual smokeはPhase 3完了条件に
+含まれたままです。
 
 `--confirm-live-codex`なしではversion/help preflightを含むsubprocessを起動しません。
 確認付き実行はCodex model APIへのPrompt送信とquota消費を伴います。Promptはargvへ
@@ -132,7 +134,7 @@ macOSはlocal process-tree testで検証済みです。Linux実装経路は有�
 - Phase 0: Foundation and Capability Spike（完了）
 - Phase 1: Replay Vertical Slice（完了）
 - Phase 2: Safe Runner, Evidence and Quality Gate（完了）
-- Phase 3: Codex CLI Provider（現在、manual Live smoke未実施）
+- Phase 3: Codex CLI Provider（現在、manual Live smokeのoffline修正・再レビュー中）
 - Phase 4: Workflow A/B Experiment
 - Phase 5: Antigravity CLI Provider
 - Phase 6: Multi-language Fixtures and Public Report

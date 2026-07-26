@@ -60,9 +60,10 @@ JSONL parser、Provider process tree停止、正規化Codex Evidence、redaction
 
 **受入条件:** 手動の隔離環境で一つのfixtureを実行・Recordでき、その記録をReplayして
 同じ正規化eventを得る。認証情報や機密Promptを成果物へ保存しない。通常CIは呼ばない。
-offline実装とfake CLI受入を進めている。実Codexによるmanual Live smokeは未実施であり、
-diff、redaction、認証環境分離、process tree、Recording/Replayをレビューした後の残受入
-条件とする。manual smokeが成功するまでPhase 3をCompleteへ変更しない。
+実Codexによるmanual Live smokeは1回実行したが、Provider process起動前のHarness障害で
+失敗した。固定Enumのsafe failure stageを追加するoffline修正と再レビューを行い、diff、
+redaction、認証環境分離、process tree、Recording/Replayを確認できる成功manual smokeを
+残受入条件とする。成功するまでPhase 3をCompleteへ変更しない。
 
 ## Phase 4: Workflow A/B Experiment
 

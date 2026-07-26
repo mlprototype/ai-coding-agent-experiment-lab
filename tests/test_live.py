@@ -28,6 +28,7 @@ from agentlab.models import (
     CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS,
     CodexCliProfile,
     CodexExecutionStage,
+    CodexFailureStage,
     LiveFailureKind,
     LiveOverallStatus,
     LiveRunArtifact,
@@ -198,6 +199,78 @@ def _run(
         force=force,
         parent_environment=environment,
     )
+
+
+def _assert_safe_failed_live_outputs(
+    outcome: Any,
+    output_path: Path,
+    prompt_path: Path,
+    environment: dict[str, str],
+    *,
+    expected_stage: CodexFailureStage,
+    expected_execution_stage: CodexExecutionStage,
+    expected_failure_kind: LiveFailureKind,
+) -> None:
+    artifact = load_live_artifact(output_path)
+    recording = load_replay_recording(outcome.recording_path)
+    recording_bytes = outcome.recording_path.read_bytes()
+
+    assert artifact == outcome.artifact
+    assert artifact.failure_kind is expected_failure_kind
+    assert artifact.codex.failure_kind is expected_failure_kind
+    assert artifact.codex.failure_stage is expected_stage
+    assert artifact.codex.execution_stage is expected_execution_stage
+    assert artifact.codex.process_started is False
+    assert artifact.gate_commands == []
+    assert artifact.metrics is None
+    assert artifact.workspace_lifecycle is WorkspaceLifecycle.REMOVED
+    assert artifact.recording_sha256 == hashlib.sha256(recording_bytes).hexdigest()
+    assert isinstance(recording.failed, LiveRunFailedEvent)
+    assert recording.completed is None
+    assert recording.failed.failure_kind is expected_failure_kind
+    assert recording.failed.codex.failure_stage is expected_stage
+    assert len(recording_bytes.splitlines()) == 2
+
+    persisted = output_path.read_bytes() + recording_bytes
+    forbidden_values = [
+        prompt_path.read_bytes(),
+        environment["CODEX_HOME"].encode(),
+        environment["OPENAI_API_KEY"].encode(),
+        environment["CODEX_API_KEY"].encode(),
+        environment["AGENTLAB_PARENT_SECRET"].encode(),
+    ]
+    assert all(value not in persisted for value in forbidden_values)
+
+    forbidden_keys = {
+        "prompt",
+        "raw_jsonl",
+        "raw_stderr",
+        "agent_message",
+        "reasoning",
+        "command_output",
+        "thread_id",
+        "session_id",
+        "executable_path",
+        "home",
+        "codex_home",
+        "authentication",
+        "api_key",
+    }
+    payloads = [json.loads(output_path.read_text(encoding="utf-8"))]
+    payloads.extend(
+        json.loads(line)
+        for line in outcome.recording_path.read_text(encoding="utf-8").splitlines()
+    )
+    observed_keys: set[str] = set()
+    stack: list[object] = list(payloads)
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            observed_keys.update(str(key).casefold() for key in value)
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    assert observed_keys.isdisjoint(forbidden_keys)
 
 
 def test_live_success_runs_provider_and_gates_in_same_workspace_and_replays(
@@ -500,6 +573,10 @@ def test_workspace_preparation_failure_is_persisted_with_lifecycle(
         outcome.artifact.codex.execution_stage
         is CodexExecutionStage.PREFLIGHT_COMPLETED
     )
+    assert (
+        outcome.artifact.codex.failure_stage
+        is CodexFailureStage.WORKSPACE_PREPARATION
+    )
     assert outcome.artifact.codex.verified_flags == sorted(
         REQUIRED_CODEX_EXEC_FLAGS
     )
@@ -581,7 +658,7 @@ def test_provider_environment_preparation_failure_preserves_selected_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    spec_path, _fixture, prompt_path, output = _write_case(tmp_path)
     environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
 
     def fail_provider_environment(_parent: Path, name: str) -> Path:
@@ -593,8 +670,27 @@ def test_provider_environment_preparation_failure_preserves_selected_profile(
         "agentlab.live._prepare_live_environment_root",
         fail_provider_environment,
     )
+
+    def reject_gate_execution(*_args: object, **_kwargs: object) -> NoReturn:
+        raise AssertionError("quality Gates must not run after Provider failure")
+
+    monkeypatch.setattr(
+        "agentlab.live.execute_quality_gates_in_workspace",
+        reject_gate_execution,
+    )
     outcome = _run(spec_path, output, environment)
 
+    _assert_safe_failed_live_outputs(
+        outcome,
+        output,
+        prompt_path,
+        environment,
+        expected_stage=(
+            CodexFailureStage.PROVIDER_ENVIRONMENT_DIRECTORY_PREPARATION
+        ),
+        expected_execution_stage=CodexExecutionStage.PREFLIGHT_COMPLETED,
+        expected_failure_kind=LiveFailureKind.EVIDENCE_ERROR,
+    )
     assert outcome.artifact.overall_status is LiveOverallStatus.HARNESS_ERROR
     assert outcome.artifact.failure_kind is LiveFailureKind.EVIDENCE_ERROR
     assert outcome.artifact.codex.process_started is False
@@ -606,11 +702,254 @@ def test_provider_environment_preparation_failure_preserves_selected_profile(
         outcome.artifact.codex.execution_stage
         is CodexExecutionStage.PREFLIGHT_COMPLETED
     )
+    assert (
+        outcome.artifact.codex.failure_stage
+        is CodexFailureStage.PROVIDER_ENVIRONMENT_DIRECTORY_PREPARATION
+    )
     assert outcome.artifact.codex.verified_flags == sorted(
         REQUIRED_CODEX_EXEC_FLAGS
     )
     assert outcome.artifact.codex.approval_policy is None
     assert outcome.artifact.workspace_lifecycle is WorkspaceLifecycle.REMOVED
+
+
+@pytest.mark.parametrize(
+    (
+        "fault_target",
+        "expected_stage",
+        "expected_execution_stage",
+        "expected_failure_kind",
+    ),
+    [
+        (
+            "agentlab.codex_provider.CodexJsonlParser",
+            CodexFailureStage.JSONL_PARSER_INITIALIZATION,
+            CodexExecutionStage.PREFLIGHT_COMPLETED,
+            LiveFailureKind.EVIDENCE_ERROR,
+        ),
+        (
+            "agentlab.codex_provider.build_codex_argv",
+            CodexFailureStage.PROVIDER_ARGV_CONSTRUCTION,
+            CodexExecutionStage.PREFLIGHT_COMPLETED,
+            LiveFailureKind.EVIDENCE_ERROR,
+        ),
+        (
+            "agentlab.codex_provider.build_codex_environment",
+            CodexFailureStage.PROVIDER_ENVIRONMENT_CONSTRUCTION,
+            CodexExecutionStage.PREFLIGHT_COMPLETED,
+            LiveFailureKind.EVIDENCE_ERROR,
+        ),
+        (
+            "agentlab.codex_provider.subprocess.Popen",
+            CodexFailureStage.PROVIDER_PROCESS_SPAWN,
+            CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED,
+            LiveFailureKind.PROVIDER_SPAWN_ERROR,
+        ),
+    ],
+)
+def test_pre_provider_faults_persist_safe_stage_without_running_gates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_target: str,
+    expected_stage: CodexFailureStage,
+    expected_execution_stage: CodexExecutionStage,
+    expected_failure_kind: LiveFailureKind,
+) -> None:
+    spec_path, _fixture, prompt_path, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+    preflight_result = codex_provider_module.preflight_codex(
+        parent_environment=environment
+    )
+    prepare_workspace = live_module.prepare_disposable_workspace
+    temporary_roots: list[Path] = []
+
+    def track_workspace(*args: object, **kwargs: object):
+        workspace = prepare_workspace(*args, **kwargs)
+        temporary_roots.append(workspace.temporary_root)
+        return workspace
+
+    def fail_boundary(*_args: object, **_kwargs: object) -> NoReturn:
+        raise RuntimeError("synthetic failure text must not be persisted")
+
+    def reject_gate_execution(*_args: object, **_kwargs: object) -> NoReturn:
+        raise AssertionError("quality Gates must not run after Provider failure")
+
+    monkeypatch.setattr(
+        "agentlab.live.prepare_disposable_workspace",
+        track_workspace,
+    )
+    monkeypatch.setattr(fault_target, fail_boundary)
+    monkeypatch.setattr(
+        "agentlab.live.execute_quality_gates_in_workspace",
+        reject_gate_execution,
+    )
+
+    outcome = run_live_codex(
+        spec_path,
+        task_id="task-1",
+        repetition_index=0,
+        run_id=f"offline-{expected_stage.value}",
+        output_path=output,
+        confirm_live_codex=True,
+        parent_environment=environment,
+        preflight=lambda **_kwargs: preflight_result,
+    )
+
+    _assert_safe_failed_live_outputs(
+        outcome,
+        output,
+        prompt_path,
+        environment,
+        expected_stage=expected_stage,
+        expected_execution_stage=expected_execution_stage,
+        expected_failure_kind=expected_failure_kind,
+    )
+    persisted = output.read_bytes() + outcome.recording_path.read_bytes()
+    assert b"synthetic failure text must not be persisted" not in persisted
+    assert len(temporary_roots) == 1
+    assert not temporary_roots[0].exists()
+    if expected_execution_stage is CodexExecutionStage.PREFLIGHT_COMPLETED:
+        assert outcome.artifact.codex.approval_policy is None
+        assert outcome.artifact.codex.approval_basis is None
+    else:
+        assert outcome.artifact.codex.approval_policy == "never"
+        assert outcome.artifact.codex.approval_basis == "explicit_config_never"
+
+
+@pytest.mark.parametrize(
+    ("fault_mode", "expected_stage"),
+    [
+        (
+            "selector_initialization",
+            CodexFailureStage.PROVIDER_PIPE_SELECTOR_INITIALIZATION,
+        ),
+        ("process_collection", CodexFailureStage.PROVIDER_PROCESS_COLLECTION),
+    ],
+)
+def test_post_spawn_faults_persist_safe_stage_and_reap_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_mode: str,
+    expected_stage: CodexFailureStage,
+) -> None:
+    spec_path, _fixture, prompt_path, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(
+        tmp_path,
+        live_code="import signal; signal.pause()",
+    )
+    preflight_result = codex_provider_module.preflight_codex(
+        parent_environment=environment
+    )
+    prepare_workspace = live_module.prepare_disposable_workspace
+    popen = codex_provider_module.subprocess.Popen
+    selector_factory = codex_provider_module.selectors.DefaultSelector
+    temporary_roots: list[Path] = []
+    spawned_pids: list[int] = []
+
+    def track_workspace(*args: object, **kwargs: object):
+        workspace = prepare_workspace(*args, **kwargs)
+        temporary_roots.append(workspace.temporary_root)
+        return workspace
+
+    def track_spawn(*args: object, **kwargs: object):
+        process = popen(*args, **kwargs)
+        spawned_pids.append(process.pid)
+        return process
+
+    def fail_selector_initialization() -> NoReturn:
+        raise RuntimeError("synthetic selector failure must not be persisted")
+
+    class FailingCollectionSelector:
+        def __init__(self) -> None:
+            self._selector = selector_factory()
+
+        def register(self, *args: object, **kwargs: object):
+            return self._selector.register(*args, **kwargs)
+
+        def unregister(self, *args: object, **kwargs: object):
+            return self._selector.unregister(*args, **kwargs)
+
+        def get_map(self):
+            return self._selector.get_map()
+
+        def select(self, _timeout: float):
+            raise RuntimeError("synthetic collection failure must not be persisted")
+
+        def close(self) -> None:
+            self._selector.close()
+
+    def reject_gate_execution(*_args: object, **_kwargs: object) -> NoReturn:
+        raise AssertionError("quality Gates must not run after Provider failure")
+
+    monkeypatch.setattr(
+        "agentlab.live.prepare_disposable_workspace",
+        track_workspace,
+    )
+    monkeypatch.setattr(
+        "agentlab.codex_provider.subprocess.Popen",
+        track_spawn,
+    )
+    monkeypatch.setattr(
+        "agentlab.codex_provider.selectors.DefaultSelector",
+        (
+            fail_selector_initialization
+            if fault_mode == "selector_initialization"
+            else FailingCollectionSelector
+        ),
+    )
+    monkeypatch.setattr(
+        "agentlab.live.execute_quality_gates_in_workspace",
+        reject_gate_execution,
+    )
+
+    outcome = run_live_codex(
+        spec_path,
+        task_id="task-1",
+        repetition_index=0,
+        run_id=f"offline-{expected_stage.value}",
+        output_path=output,
+        confirm_live_codex=True,
+        parent_environment=environment,
+        preflight=lambda **_kwargs: preflight_result,
+    )
+
+    artifact = load_live_artifact(output)
+    recording = load_replay_recording(outcome.recording_path)
+    assert artifact.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+    assert artifact.codex.failure_stage is expected_stage
+    assert (
+        artifact.codex.execution_stage
+        is CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+    )
+    assert artifact.codex.process_started is True
+    assert artifact.codex.approval_policy == "never"
+    assert artifact.codex.approval_basis == "explicit_config_never"
+    assert artifact.codex.termination.process_group_cleared is True
+    assert artifact.gate_commands == []
+    assert artifact.metrics is None
+    assert artifact.workspace_lifecycle is WorkspaceLifecycle.REMOVED
+    assert artifact.recording_sha256 == hashlib.sha256(
+        outcome.recording_path.read_bytes()
+    ).hexdigest()
+    assert isinstance(recording.failed, LiveRunFailedEvent)
+    assert len(outcome.recording_path.read_bytes().splitlines()) == 2
+    assert len(spawned_pids) == 1
+    with pytest.raises(ProcessLookupError):
+        os.kill(spawned_pids[0], 0)
+    assert len(temporary_roots) == 1
+    assert not temporary_roots[0].exists()
+
+    persisted = output.read_bytes() + outcome.recording_path.read_bytes()
+    forbidden_values = [
+        prompt_path.read_bytes(),
+        environment["CODEX_HOME"].encode(),
+        environment["OPENAI_API_KEY"].encode(),
+        environment["CODEX_API_KEY"].encode(),
+        environment["AGENTLAB_PARENT_SECRET"].encode(),
+    ]
+    assert all(value not in persisted for value in forbidden_values)
+    assert b"synthetic selector failure must not be persisted" not in persisted
+    assert b"synthetic collection failure must not be persisted" not in persisted
 
 
 def test_workspace_error_after_provider_does_not_replace_codex_evidence(
@@ -1464,6 +1803,76 @@ def test_live_artifact_rejects_profile_with_unallowlisted_cli_version(
         LiveRunArtifact.model_validate(payload)
 
 
+def test_legacy_codex_evidence_11_failure_without_stage_remains_loadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+
+    def fail_provider_environment(_parent: Path, name: str) -> Path:
+        assert name == "provider"
+        raise OSError("synthetic Provider environment failure")
+
+    monkeypatch.setattr(
+        "agentlab.live._prepare_live_environment_root",
+        fail_provider_environment,
+    )
+    payload = _run(spec_path, output, environment).artifact.model_dump(mode="json")
+    payload["codex"]["schema_version"] = "1.1"
+    payload["codex"].pop("failure_stage")
+
+    legacy = LiveRunArtifact.model_validate(payload)
+
+    assert legacy.codex.schema_version == "1.1"
+    assert legacy.codex.failure_stage is None
+    assert legacy.codex.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+
+
+def test_codex_evidence_12_failure_requires_safe_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+
+    def fail_provider_environment(_parent: Path, name: str) -> Path:
+        assert name == "provider"
+        raise OSError("synthetic Provider environment failure")
+
+    monkeypatch.setattr(
+        "agentlab.live._prepare_live_environment_root",
+        fail_provider_environment,
+    )
+    payload = _run(spec_path, output, environment).artifact.model_dump(mode="json")
+    payload["codex"].pop("failure_stage")
+
+    with pytest.raises(ValidationError, match="requires failure_stage"):
+        LiveRunArtifact.model_validate(payload)
+
+
+def test_codex_evidence_rejects_failure_stage_execution_contradiction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+
+    def fail_provider_environment(_parent: Path, name: str) -> Path:
+        assert name == "provider"
+        raise OSError("synthetic Provider environment failure")
+
+    monkeypatch.setattr(
+        "agentlab.live._prepare_live_environment_root",
+        fail_provider_environment,
+    )
+    payload = _run(spec_path, output, environment).artifact.model_dump(mode="json")
+    payload["codex"]["failure_stage"] = "provider_process_collection"
+
+    with pytest.raises(ValidationError, match="invocation attempt"):
+        LiveRunArtifact.model_validate(payload)
+
+
 @pytest.mark.parametrize(
     "verified_flags",
     [
@@ -1539,6 +1948,7 @@ def test_artifact_and_recording_reject_invocation_without_created_workspace(
     artifact_payload["codex"]["approval_policy"] = "never"
     artifact_payload["codex"]["approval_basis"] = "explicit_config_never"
     artifact_payload["codex"]["failure_kind"] = "provider_spawn_error"
+    artifact_payload["codex"]["failure_stage"] = "provider_process_spawn"
 
     with pytest.raises(ValidationError, match="requires a created Workspace"):
         LiveRunArtifact.model_validate(artifact_payload)
@@ -1553,6 +1963,7 @@ def test_artifact_and_recording_reject_invocation_without_created_workspace(
     terminal["codex"]["approval_policy"] = "never"
     terminal["codex"]["approval_basis"] = "explicit_config_never"
     terminal["codex"]["failure_kind"] = "provider_spawn_error"
+    terminal["codex"]["failure_stage"] = "provider_process_spawn"
     outcome.recording_path.write_text(
         "\n".join(json.dumps(event) for event in events) + "\n",
         encoding="utf-8",

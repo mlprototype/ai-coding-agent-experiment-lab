@@ -24,6 +24,7 @@ from agentlab.models import (
     CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS,
     CodexCliProfile,
     CodexExecutionStage,
+    CodexFailureStage,
     CodexItemType,
     CodexTerminalEvent,
     LiveFailureKind,
@@ -900,6 +901,7 @@ def test_process_runner_classifies_spawn_failure(
     )
 
     assert result.evidence.failure_kind is LiveFailureKind.PROVIDER_SPAWN_ERROR
+    assert result.evidence.failure_stage is CodexFailureStage.PROVIDER_PROCESS_SPAWN
     assert result.evidence.exit_code is None
 
 
@@ -986,6 +988,10 @@ def test_process_runner_cleans_up_when_pipe_setup_fails(
 
     assert result.evidence.status is ProviderExecutionStatus.FAILED
     assert result.evidence.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+    assert (
+        result.evidence.failure_stage
+        is CodexFailureStage.PROVIDER_PIPE_SELECTOR_INITIALIZATION
+    )
     assert result.evidence.termination.process_group_cleared is True
 
 
@@ -1090,6 +1096,10 @@ def test_process_runner_classifies_emergency_cleanup_failure(
     )
 
     assert result.evidence.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+    assert (
+        result.evidence.failure_stage
+        is CodexFailureStage.PROVIDER_PIPE_SELECTOR_INITIALIZATION
+    )
     assert result.evidence.process_started is True
     assert result.evidence.termination.process_group_cleared is False
 
@@ -1154,6 +1164,10 @@ def test_process_runner_cleans_up_on_unexpected_collection_exception(
 
     assert len(spawned_pids) == 1
     assert result.evidence.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+    assert (
+        result.evidence.failure_stage
+        is CodexFailureStage.PROVIDER_PROCESS_COLLECTION
+    )
     assert result.evidence.process_started is True
     assert (
         result.evidence.execution_stage

@@ -148,6 +148,24 @@ class CodexExecutionStage(StrEnum):
     PROVIDER_INVOCATION_ATTEMPTED = "provider_invocation_attempted"
 
 
+class CodexFailureStage(StrEnum):
+    """Safe fixed location for a failed Codex Provider lifecycle."""
+
+    PREFLIGHT = "preflight"
+    WORKSPACE_PREPARATION = "workspace_preparation"
+    PROVIDER_ENVIRONMENT_DIRECTORY_PREPARATION = (
+        "provider_environment_directory_preparation"
+    )
+    PROVIDER_RUNTIME_PRECHECK = "provider_runtime_precheck"
+    JSONL_PARSER_INITIALIZATION = "jsonl_parser_initialization"
+    PROVIDER_ARGV_CONSTRUCTION = "provider_argv_construction"
+    PROVIDER_ENVIRONMENT_CONSTRUCTION = "provider_environment_construction"
+    PROVIDER_PROCESS_SPAWN = "provider_process_spawn"
+    PROVIDER_PIPE_SELECTOR_INITIALIZATION = "provider_pipe_selector_initialization"
+    PROVIDER_PROCESS_COLLECTION = "provider_process_collection"
+    PROVIDER_ORCHESTRATION = "provider_orchestration"
+
+
 class CodexTerminalEvent(StrEnum):
     NONE = "none"
     TURN_COMPLETED = "turn_completed"
@@ -839,11 +857,12 @@ class LiveEvaluationSummary(ContractModel):
 class CodexExecutionEvidence(ContractModel):
     """Redacted summary of one Codex CLI process; raw events are never persisted."""
 
-    schema_version: Literal["1.1"]
+    schema_version: Literal["1.1", "1.2"]
     provider: Literal[Provider.CODEX]
     cli_version: StrictStr | None
     cli_profile: CodexCliProfile
     execution_stage: CodexExecutionStage
+    failure_stage: CodexFailureStage | None = None
     preflight_checked_at: datetime
     verified_flags: list[StrictStr]
     requested_model: StrictStr
@@ -900,6 +919,112 @@ class CodexExecutionEvidence(ContractModel):
 
     @model_validator(mode="after")
     def codex_summary_must_be_semantically_consistent(self) -> CodexExecutionEvidence:
+        if self.schema_version == "1.1":
+            if self.failure_stage is not None:
+                raise ValueError("Codex Evidence 1.1 must not contain failure_stage")
+        elif self.status is ProviderExecutionStatus.SUCCEEDED:
+            if self.failure_stage is not None:
+                raise ValueError("successful Codex Evidence must not contain failure_stage")
+        elif self.failure_stage is None:
+            raise ValueError("failed Codex Evidence 1.2 requires failure_stage")
+
+        preflight_failure_stages = {
+            CodexFailureStage.PREFLIGHT,
+        }
+        pre_invocation_failure_stages = {
+            CodexFailureStage.WORKSPACE_PREPARATION,
+            CodexFailureStage.PROVIDER_ENVIRONMENT_DIRECTORY_PREPARATION,
+            CodexFailureStage.PROVIDER_RUNTIME_PRECHECK,
+            CodexFailureStage.JSONL_PARSER_INITIALIZATION,
+            CodexFailureStage.PROVIDER_ARGV_CONSTRUCTION,
+            CodexFailureStage.PROVIDER_ENVIRONMENT_CONSTRUCTION,
+            CodexFailureStage.PROVIDER_ORCHESTRATION,
+        }
+        invocation_failure_stages = {
+            CodexFailureStage.PROVIDER_PROCESS_SPAWN,
+            CodexFailureStage.PROVIDER_PIPE_SELECTOR_INITIALIZATION,
+            CodexFailureStage.PROVIDER_PROCESS_COLLECTION,
+        }
+        if (
+            self.failure_stage in preflight_failure_stages
+            and self.execution_stage
+            is not CodexExecutionStage.PREFLIGHT_NOT_COMPLETED
+        ):
+            raise ValueError("preflight failure_stage requires incomplete preflight")
+        if (
+            self.failure_stage in pre_invocation_failure_stages
+            and self.execution_stage is not CodexExecutionStage.PREFLIGHT_COMPLETED
+        ):
+            raise ValueError(
+                "pre-invocation failure_stage requires completed preflight"
+            )
+        if (
+            self.failure_stage in invocation_failure_stages
+            and self.execution_stage
+            is not CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+        ):
+            raise ValueError(
+                "Provider invocation failure_stage requires an invocation attempt"
+            )
+        if self.failure_stage in {
+            CodexFailureStage.PROVIDER_PROCESS_SPAWN,
+            *pre_invocation_failure_stages,
+            *preflight_failure_stages,
+        } and self.process_started:
+            raise ValueError("pre-spawn failure_stage cannot have a started process")
+        if (
+            self.failure_stage
+            in {
+                CodexFailureStage.PROVIDER_PIPE_SELECTOR_INITIALIZATION,
+                CodexFailureStage.PROVIDER_PROCESS_COLLECTION,
+            }
+            and not self.process_started
+        ):
+            raise ValueError("post-spawn failure_stage requires a started process")
+
+        evidence_error_only_stages = {
+            CodexFailureStage.WORKSPACE_PREPARATION,
+            CodexFailureStage.PROVIDER_ENVIRONMENT_DIRECTORY_PREPARATION,
+            CodexFailureStage.JSONL_PARSER_INITIALIZATION,
+            CodexFailureStage.PROVIDER_ARGV_CONSTRUCTION,
+            CodexFailureStage.PROVIDER_ENVIRONMENT_CONSTRUCTION,
+            CodexFailureStage.PROVIDER_ORCHESTRATION,
+        }
+        if (
+            self.failure_stage in evidence_error_only_stages
+            and self.failure_kind is not LiveFailureKind.EVIDENCE_ERROR
+        ):
+            raise ValueError(
+                "initialization failure_stage requires evidence_error"
+            )
+        if (
+            self.failure_stage is CodexFailureStage.PROVIDER_RUNTIME_PRECHECK
+            and self.failure_kind is not LiveFailureKind.UNSUPPORTED_PLATFORM
+        ):
+            raise ValueError(
+                "provider_runtime_precheck requires unsupported_platform"
+            )
+        if (
+            self.failure_stage is CodexFailureStage.PROVIDER_PROCESS_SPAWN
+            and self.failure_kind
+            not in {
+                LiveFailureKind.PROVIDER_UNAVAILABLE,
+                LiveFailureKind.PROVIDER_SPAWN_ERROR,
+            }
+        ):
+            raise ValueError("provider_process_spawn requires a spawn failure kind")
+        if (
+            self.failure_stage
+            is CodexFailureStage.PROVIDER_PIPE_SELECTOR_INITIALIZATION
+            and self.failure_kind
+            not in {
+                LiveFailureKind.EVIDENCE_ERROR,
+                LiveFailureKind.PROCESS_CLEANUP_ERROR,
+            }
+        ):
+            raise ValueError(
+                "pipe/selector failure_stage requires a Harness failure kind"
+            )
         if self.cli_profile is CodexCliProfile.NOT_SELECTED:
             if (
                 self.execution_stage

@@ -4,7 +4,8 @@
 
 Phase 3は、1 task・1 Codex Provider・1 repetition・`one_shot`を人間が手動実行する最小
 vertical sliceである。scheduler、staged Workflow、比較実験、自動retryはPhase 4以降で
-あり、実装していない。通常テストはfake Codexだけを使い、manual Live smokeは未実施。
+あり、実装していない。通常テストはfake Codexだけを使う。manual Live smokeは1回実行
+したが、Provider process起動前のHarness障害で失敗しており、成功受入は未達である。
 
 ## Read-only preflight
 
@@ -99,12 +100,27 @@ duplicate key、非有限数、string `type`、1行/全体byte上限を確認す
 Tokenだけを`provider_reported`として写す。Usage欠損は0にせず`not_available`とする。
 cost、quota、価格計算は行わない。
 
+## Safe failure location Evidence
+
+CodexExecutionEvidence 1.2は、失敗時に固定Enumの`failure_stage`を必須とする。
+Workspace準備、Provider用一時環境directory準備、runtime precheck、JSONL parser初期化、
+argv構築、Provider環境構築、process起動試行、pipe/selector初期化、process収集、
+予期しないProvider orchestrationを区別する。
+`Popen`を呼んだ時点から`provider_invocation_attempted`とapproval
+`never`/`explicit_config_never`を記録し、spawn失敗では`process_started=false`を保つ。
+それ以前は`preflight_completed`、`process_started=false`、approval policy/basis null
+である。例外message、任意の例外class名、pathなどの自由記述は保存しない。
+
+既存CodexExecutionEvidence 1.1は`failure_stage`なしで引き続きstrict loaderが受理する。
+新規Evidenceだけを1.2で保存するため、保存済みRecording 1.1とLive Artifact 1.0を変換・
+上書きせず後方互換で読み込める。
+
 ## Persisted and excluded fields
 
-CodexExecutionEvidence 1.1にはrequested model/reasoning、sandbox/approval/network条件、
+CodexExecutionEvidenceにはrequested model/reasoning、sandbox/approval/network条件、
 CLI profile/version、execution stage、時刻/duration、process開始有無、status/exit、
 thread/turn/terminal/event/unknown/item件数、Usage、stdout/stderr byte数と上限状態、
-process termination、safe failure kindを保存する。
+process termination、safe failure kind、1.2以降のsafe failure stageを保存する。
 
 Prompt本文、agent最終回答、reasoning、command本文/output、file content、raw JSONL、
 raw stderr、thread/session ID、executable path、HOME/CODEX_HOME、認証情報は保存しない。
@@ -165,13 +181,13 @@ subprocess、network、GateなしでReplay Resultへ変換できる。失敗Reco
 workspace-writeとprocess groupはOS security boundaryではない。filesystem readの完全隔離、
 firewall、CPU/memory/process quota、悪意あるprocessの完全な封じ込めは保証しない。
 Codex model API、認証状態、model availability、quota、vendor eventの将来互換もmanual
-smoke前には保証できない。ProviderがPrompt本文をWorkspace変更へ意図的に複製した場合、
+smoke成功だけでは保証できない。ProviderがPrompt本文をWorkspace変更へ意図的に複製した場合、
 その変更は品質Evidenceのdiff契約に現れうるため、PromptとFixtureは非機密または別途
 レビュー済みでなければならない。
 
 通常テストのAutoReview相当configケースは、fake executableが明示approval configをargvで
 受け取ることだけを確認する。実Codex CLIがcloud/managed configを解決した最終policyは、
-manual Live smoke未実施のため検証済みとはしない。
+Provider processを開始したmanual Live smokeがないため検証済みとはしない。
 
 Phase 3は一つの`one_shot` taskを手動実行するだけである。複数task/条件/反復scheduler、
 `staged` Workflow、A/B比較、集計はPhase 4であり、Phase 3 Providerへ先行実装しない。
@@ -184,4 +200,7 @@ READMEの`live-codex ... --confirm-live-codex`を1回だけ手動実行する。
 
 現在確認した`codex-cli 0.146.0-alpha.3.1`は
 `headless_exec_explicit_never_v2`のversion allowlistとread-only preflightに成功した。
-manual Live smokeは未実施であり、Phase 3は完了していない。
+manual Live smokeは1回実行したが、preflightとWorkspace準備の後、Provider process起動前
+の`evidence_error`で失敗した。これはCodex model品質の結果ではなく、Prompt送信とquota
+消費も発生していない。過去の自由記述されない例外は復元・推測せず、failure stage追加後の
+offline fault injectionと再レビューを行う。Phase 3はCurrentであり、完了していない。

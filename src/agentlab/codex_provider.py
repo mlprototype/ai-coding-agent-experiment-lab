@@ -25,6 +25,7 @@ from agentlab.models import (
     CodexCliProfile,
     CodexExecutionEvidence,
     CodexExecutionStage,
+    CodexFailureStage,
     CodexItemType,
     CodexTerminalEvent,
     CommandStatus,
@@ -700,11 +701,12 @@ def _preflight_failure_evidence(
     assert live.reasoning_effort is not None
     now = datetime.now(UTC)
     return CodexExecutionEvidence(
-        schema_version="1.1",
+        schema_version="1.2",
         provider=Provider.CODEX,
         cli_version=error.cli_version,
         cli_profile=CodexCliProfile.NOT_SELECTED,
         execution_stage=CodexExecutionStage.PREFLIGHT_NOT_COMPLETED,
+        failure_stage=CodexFailureStage.PREFLIGHT,
         preflight_checked_at=error.checked_at,
         verified_flags=sorted(error.verified_flags),
         requested_model=live.model,
@@ -753,17 +755,19 @@ def post_preflight_failure_evidence(
     *,
     live: LiveSettings,
     failure_kind: LiveFailureKind = LiveFailureKind.EVIDENCE_ERROR,
+    failure_stage: CodexFailureStage,
 ) -> CodexExecutionEvidence:
     """Record selected compatibility metadata before any Provider invocation."""
     assert live.model is not None
     assert live.reasoning_effort is not None
     now = datetime.now(UTC)
     return CodexExecutionEvidence(
-        schema_version="1.1",
+        schema_version="1.2",
         provider=Provider.CODEX,
         cli_version=preflight.cli_version,
         cli_profile=preflight.cli_profile,
         execution_stage=CodexExecutionStage.PREFLIGHT_COMPLETED,
+        failure_stage=failure_stage,
         preflight_checked_at=preflight.checked_at,
         verified_flags=sorted(preflight.verified_flags),
         requested_model=live.model,
@@ -825,19 +829,46 @@ class CodexProcessRunner:
         ensure_runner_platform_supported()
         started_at = datetime.now(UTC)
         started_monotonic = time.monotonic()
-        parser = CodexJsonlParser(
-            max_line_bytes=live.max_event_line_bytes,
-            max_total_bytes=live.max_provider_output_bytes,
-        )
-        argv = build_codex_argv(
-            preflight,
-            model=live.model,
-            reasoning_effort=live.reasoning_effort,
-        )
-        environment = build_codex_environment(
-            environment_root,
-            parent_environment=parent_environment,
-        )
+        try:
+            parser = CodexJsonlParser(
+                max_line_bytes=live.max_event_line_bytes,
+                max_total_bytes=live.max_provider_output_bytes,
+            )
+        except Exception:
+            return CodexRunResult(
+                evidence=post_preflight_failure_evidence(
+                    preflight,
+                    live=live,
+                    failure_stage=CodexFailureStage.JSONL_PARSER_INITIALIZATION,
+                )
+            )
+        try:
+            argv = build_codex_argv(
+                preflight,
+                model=live.model,
+                reasoning_effort=live.reasoning_effort,
+            )
+        except Exception:
+            return CodexRunResult(
+                evidence=post_preflight_failure_evidence(
+                    preflight,
+                    live=live,
+                    failure_stage=CodexFailureStage.PROVIDER_ARGV_CONSTRUCTION,
+                )
+            )
+        try:
+            environment = build_codex_environment(
+                environment_root,
+                parent_environment=parent_environment,
+            )
+        except Exception:
+            return CodexRunResult(
+                evidence=post_preflight_failure_evidence(
+                    preflight,
+                    live=live,
+                    failure_stage=CodexFailureStage.PROVIDER_ENVIRONMENT_CONSTRUCTION,
+                )
+            )
         try:
             process = subprocess.Popen(
                 argv,
@@ -849,7 +880,7 @@ class CodexProcessRunner:
                 shell=False,
                 start_new_session=True,
             )
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
+        except Exception as error:
             failure = (
                 LiveFailureKind.PROVIDER_UNAVAILABLE
                 if isinstance(error, FileNotFoundError)
@@ -862,6 +893,7 @@ class CodexProcessRunner:
                     started_monotonic=started_monotonic,
                     status=ProviderExecutionStatus.FAILED,
                     failure_kind=failure,
+                    failure_stage=CodexFailureStage.PROVIDER_PROCESS_SPAWN,
                     process_started=False,
                     exit_code=None,
                     parser=parser,
@@ -908,6 +940,9 @@ class CodexProcessRunner:
                     started_monotonic=started_monotonic,
                     status=ProviderExecutionStatus.FAILED,
                     failure_kind=failure,
+                    failure_stage=(
+                        CodexFailureStage.PROVIDER_PIPE_SELECTOR_INITIALIZATION
+                    ),
                     exit_code=process.poll(),
                     parser=parser,
                     stderr_bytes=0,
@@ -945,6 +980,9 @@ class CodexProcessRunner:
                     started_monotonic=started_monotonic,
                     status=ProviderExecutionStatus.FAILED,
                     failure_kind=failure,
+                    failure_stage=(
+                        CodexFailureStage.PROVIDER_PIPE_SELECTOR_INITIALIZATION
+                    ),
                     exit_code=process.poll(),
                     parser=parser,
                     stderr_bytes=0,
@@ -1160,6 +1198,11 @@ class CodexProcessRunner:
                 started_monotonic=started_monotonic,
                 status=status,
                 failure_kind=final_failure,
+                failure_stage=(
+                    None
+                    if final_failure is LiveFailureKind.NONE
+                    else CodexFailureStage.PROVIDER_PROCESS_COLLECTION
+                ),
                 exit_code=return_code,
                 parser=parser,
                 stderr_bytes=stderr_bytes,
@@ -1189,6 +1232,7 @@ class CodexProcessRunner:
         started_monotonic: float,
         status: ProviderExecutionStatus,
         failure_kind: LiveFailureKind,
+        failure_stage: CodexFailureStage | None,
         exit_code: int | None,
         parser: CodexJsonlParser,
         stderr_bytes: int,
@@ -1202,11 +1246,12 @@ class CodexProcessRunner:
         assert self._live.reasoning_effort is not None
         parsed = parser.summary() if summary is None else summary
         return CodexExecutionEvidence(
-            schema_version="1.1",
+            schema_version="1.2",
             provider=Provider.CODEX,
             cli_version=preflight.cli_version,
             cli_profile=preflight.cli_profile,
             execution_stage=CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED,
+            failure_stage=failure_stage,
             preflight_checked_at=preflight.checked_at,
             verified_flags=sorted(preflight.verified_flags),
             requested_model=self._live.model,
@@ -1257,11 +1302,12 @@ def unsupported_platform_evidence(
     assert live.reasoning_effort is not None
     now = datetime.now(UTC)
     return CodexExecutionEvidence(
-        schema_version="1.1",
+        schema_version="1.2",
         provider=Provider.CODEX,
         cli_version=preflight.cli_version,
         cli_profile=preflight.cli_profile,
         execution_stage=CodexExecutionStage.PREFLIGHT_COMPLETED,
+        failure_stage=CodexFailureStage.PROVIDER_RUNTIME_PRECHECK,
         preflight_checked_at=preflight.checked_at,
         verified_flags=sorted(preflight.verified_flags),
         requested_model=live.model,

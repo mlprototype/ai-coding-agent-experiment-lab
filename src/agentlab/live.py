@@ -29,6 +29,7 @@ from agentlab.codex_provider import (
 from agentlab.gates import GateExecutionResult, execute_quality_gates_in_workspace
 from agentlab.models import (
     CodexExecutionEvidence,
+    CodexFailureStage,
     CommandEvidence,
     CommandStatus,
     DiffEvidence,
@@ -854,23 +855,33 @@ def run_live_codex(
                 workspace.environment_root,
                 "provider",
             )
-            codex_result = CodexProcessRunner(
+        except Exception:
+            codex = post_preflight_failure_evidence(
+                preflight_result,
                 live=spec.live,
-                runner=spec.runner,
-            ).run(
-                preflight=preflight_result,
-                prompt=prompt.content,
-                workspace=workspace.workspace,
-                environment_root=provider_environment_root,
-                parent_environment=parent_environment,
+                failure_stage=(
+                    CodexFailureStage.PROVIDER_ENVIRONMENT_DIRECTORY_PREPARATION
+                ),
             )
-            codex = codex_result.evidence
-        except UnsupportedRunnerPlatformError as error:
-            codex = unsupported_platform_evidence(
-                error,
-                preflight=preflight_result,
-                live=spec.live,
-            )
+        else:
+            try:
+                codex_result = CodexProcessRunner(
+                    live=spec.live,
+                    runner=spec.runner,
+                ).run(
+                    preflight=preflight_result,
+                    prompt=prompt.content,
+                    workspace=workspace.workspace,
+                    environment_root=provider_environment_root,
+                    parent_environment=parent_environment,
+                )
+                codex = codex_result.evidence
+            except UnsupportedRunnerPlatformError as error:
+                codex = unsupported_platform_evidence(
+                    error,
+                    preflight=preflight_result,
+                    live=spec.live,
+                )
         if codex.status is ProviderExecutionStatus.SUCCEEDED:
             gate_environment_root = _prepare_live_environment_root(
                 workspace.environment_root,
@@ -901,6 +912,7 @@ def run_live_codex(
             codex = post_preflight_failure_evidence(
                 preflight_result,
                 live=spec.live,
+                failure_stage=CodexFailureStage.WORKSPACE_PREPARATION,
             )
     except Exception:
         failure_kind = LiveFailureKind.EVIDENCE_ERROR
@@ -908,6 +920,7 @@ def run_live_codex(
             codex = post_preflight_failure_evidence(
                 preflight_result,
                 live=spec.live,
+                failure_stage=CodexFailureStage.PROVIDER_ORCHESTRATION,
             )
     finally:
         if workspace is not None:
