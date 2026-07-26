@@ -24,6 +24,7 @@ from agentlab.live import (
 from agentlab.models import (
     CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS,
     CodexCliProfile,
+    CodexExecutionStage,
     LiveFailureKind,
     LiveOverallStatus,
     LiveRunArtifact,
@@ -427,8 +428,85 @@ def test_workspace_preparation_failure_is_persisted_with_lifecycle(
     assert outcome.artifact.failure_kind is LiveFailureKind.EVIDENCE_ERROR
     assert outcome.artifact.workspace_lifecycle is WorkspaceLifecycle.REMOVED
     assert outcome.artifact.codex.process_started is False
+    assert (
+        outcome.artifact.codex.cli_profile
+        is CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2
+    )
+    assert (
+        outcome.artifact.codex.execution_stage
+        is CodexExecutionStage.PREFLIGHT_COMPLETED
+    )
+    assert outcome.artifact.codex.verified_flags == sorted(
+        REQUIRED_CODEX_EXEC_FLAGS
+    )
+    assert outcome.artifact.codex.approval_policy is None
+    assert outcome.artifact.codex.approval_basis is None
     assert outcome.artifact.metrics is None
     assert isinstance(recording.failed, LiveRunFailedEvent)
+
+
+def test_provider_environment_preparation_failure_preserves_selected_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+
+    def fail_provider_environment(_parent: Path, name: str) -> Path:
+        if name == "provider":
+            raise OSError("synthetic Provider environment failure")
+        raise AssertionError("Gate environment must not be prepared")
+
+    monkeypatch.setattr(
+        "agentlab.live._prepare_live_environment_root",
+        fail_provider_environment,
+    )
+    outcome = _run(spec_path, output, environment)
+
+    assert outcome.artifact.overall_status is LiveOverallStatus.HARNESS_ERROR
+    assert outcome.artifact.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+    assert outcome.artifact.codex.process_started is False
+    assert (
+        outcome.artifact.codex.cli_profile
+        is CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2
+    )
+    assert (
+        outcome.artifact.codex.execution_stage
+        is CodexExecutionStage.PREFLIGHT_COMPLETED
+    )
+    assert outcome.artifact.codex.verified_flags == sorted(
+        REQUIRED_CODEX_EXEC_FLAGS
+    )
+    assert outcome.artifact.codex.approval_policy is None
+    assert outcome.artifact.workspace_lifecycle is WorkspaceLifecycle.REMOVED
+
+
+def test_workspace_error_after_provider_does_not_replace_codex_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+
+    def fail_gates(*_args: object, **_kwargs: object) -> NoReturn:
+        raise WorkspaceError("synthetic post-Provider workspace failure")
+
+    monkeypatch.setattr(
+        "agentlab.live.execute_quality_gates_in_workspace",
+        fail_gates,
+    )
+    outcome = _run(spec_path, output, environment)
+
+    assert outcome.artifact.overall_status is LiveOverallStatus.HARNESS_ERROR
+    assert outcome.artifact.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+    assert outcome.artifact.codex.status.value == "succeeded"
+    assert outcome.artifact.codex.process_started is True
+    assert (
+        outcome.artifact.codex.execution_stage
+        is CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+    )
+    assert outcome.artifact.codex.approval_policy == "never"
+    assert outcome.artifact.workspace_lifecycle is WorkspaceLifecycle.REMOVED
 
 
 @pytest.mark.parametrize(
@@ -560,6 +638,10 @@ def test_preflight_failure_is_saved_without_creating_workspace(tmp_path: Path) -
     assert outcome.artifact.failure_kind is LiveFailureKind.PROVIDER_UNAVAILABLE
     assert outcome.artifact.workspace_lifecycle is WorkspaceLifecycle.NOT_CREATED
     assert outcome.artifact.codex.cli_profile is CodexCliProfile.NOT_SELECTED
+    assert (
+        outcome.artifact.codex.execution_stage
+        is CodexExecutionStage.PREFLIGHT_NOT_COMPLETED
+    )
     assert outcome.artifact.codex.approval_policy is None
     assert outcome.artifact.codex.approval_basis is None
     assert isinstance(recording.failed, LiveRunFailedEvent)
@@ -1175,6 +1257,43 @@ def test_live_artifact_rejects_profile_with_unallowlisted_cli_version(
     payload["codex"]["cli_version"] = "codex-cli 999.0.0"
 
     with pytest.raises(ValidationError, match="allowlisted CLI version"):
+        LiveRunArtifact.model_validate(payload)
+
+
+def test_live_artifact_rejects_selected_profile_without_required_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+
+    def fail_prepare(*_args: object, **_kwargs: object) -> NoReturn:
+        raise WorkspaceError("synthetic preparation failure")
+
+    monkeypatch.setattr("agentlab.live.prepare_disposable_workspace", fail_prepare)
+    payload = _run(spec_path, output, environment).artifact.model_dump(mode="json")
+    payload["codex"]["verified_flags"] = []
+
+    with pytest.raises(ValidationError, match="all preflight flags"):
+        LiveRunArtifact.model_validate(payload)
+
+
+def test_live_artifact_rejects_approval_before_provider_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+
+    def fail_prepare(*_args: object, **_kwargs: object) -> NoReturn:
+        raise WorkspaceError("synthetic preparation failure")
+
+    monkeypatch.setattr("agentlab.live.prepare_disposable_workspace", fail_prepare)
+    payload = _run(spec_path, output, environment).artifact.model_dump(mode="json")
+    payload["codex"]["approval_policy"] = "never"
+    payload["codex"]["approval_basis"] = "explicit_config_never"
+
+    with pytest.raises(ValidationError, match="absent before Provider invocation"):
         LiveRunArtifact.model_validate(payload)
 
 

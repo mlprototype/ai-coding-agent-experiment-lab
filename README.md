@@ -80,8 +80,9 @@ read-only preflightに成功します。このprofileは
 `--config approval_policy="never"`をargvで明示し、存在しない
 `--ask-for-approval`には依存しません。profile名、CLI version、明示設定の根拠を
 Evidenceへ保存します。preflightを完了できない場合はprofileを`not_selected`とし、
-approval policyを適用済みとは記録しません。manual Live smoke自体はまだ実行しておらず、
-Phase 3完了条件には含まれたままです。
+approval policyを適用済みとは記録しません。preflight完了後もProvider起動前なら、選択済み
+profileと確認済みflagを保持しつつ、approval policyはnullのままです。manual Live smoke
+自体はまだ実行しておらず、Phase 3完了条件には含まれたままです。
 
 `--confirm-live-codex`なしではversion/help preflightを含むsubprocessを起動しません。
 確認付き実行はCodex model APIへのPrompt送信とquota消費を伴います。Promptはargvへ

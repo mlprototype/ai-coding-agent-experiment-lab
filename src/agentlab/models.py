@@ -140,6 +140,14 @@ class CodexApprovalBasis(StrEnum):
     EXPLICIT_CONFIG_NEVER = "explicit_config_never"
 
 
+class CodexExecutionStage(StrEnum):
+    """Furthest completed step at the Codex Provider boundary."""
+
+    PREFLIGHT_NOT_COMPLETED = "preflight_not_completed"
+    PREFLIGHT_COMPLETED = "preflight_completed"
+    PROVIDER_INVOCATION_ATTEMPTED = "provider_invocation_attempted"
+
+
 class CodexTerminalEvent(StrEnum):
     NONE = "none"
     TURN_COMPLETED = "turn_completed"
@@ -831,10 +839,11 @@ class LiveEvaluationSummary(ContractModel):
 class CodexExecutionEvidence(ContractModel):
     """Redacted summary of one Codex CLI process; raw events are never persisted."""
 
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.1"]
     provider: Literal[Provider.CODEX]
     cli_version: StrictStr | None
     cli_profile: CodexCliProfile
+    execution_stage: CodexExecutionStage
     preflight_checked_at: datetime
     verified_flags: list[StrictStr]
     requested_model: StrictStr
@@ -893,7 +902,9 @@ class CodexExecutionEvidence(ContractModel):
     def codex_summary_must_be_semantically_consistent(self) -> CodexExecutionEvidence:
         if self.cli_profile is CodexCliProfile.NOT_SELECTED:
             if (
-                self.process_started
+                self.execution_stage
+                is not CodexExecutionStage.PREFLIGHT_NOT_COMPLETED
+                or self.process_started
                 or self.approval_policy is not None
                 or self.approval_basis is not None
             ):
@@ -905,12 +916,35 @@ class CodexExecutionEvidence(ContractModel):
                 raise ValueError(
                     "explicit-never Codex profile requires an allowlisted CLI version"
                 )
-            if (
+            if not set(CODEX_REQUIRED_EXEC_FLAGS).issubset(self.verified_flags):
+                raise ValueError(
+                    "selected Codex profile requires all preflight flags"
+                )
+            if self.execution_stage is CodexExecutionStage.PREFLIGHT_NOT_COMPLETED:
+                raise ValueError(
+                    "selected Codex profile requires completed preflight Evidence"
+                )
+            invocation_attempted = (
+                self.execution_stage
+                is CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+            )
+            if invocation_attempted and (
                 self.approval_policy != "never"
                 or self.approval_basis is not CodexApprovalBasis.EXPLICIT_CONFIG_NEVER
             ):
                 raise ValueError(
-                    "explicit-never Codex profile requires its explicit approval policy"
+                    "approval Evidence must match the Provider invocation stage"
+                )
+            if not invocation_attempted and (
+                self.approval_policy is not None
+                or self.approval_basis is not None
+            ):
+                raise ValueError(
+                    "approval Evidence must be absent before Provider invocation"
+                )
+            if self.process_started and not invocation_attempted:
+                raise ValueError(
+                    "a started Codex process requires a Provider invocation attempt"
                 )
         if (
             not self.web_search_disabled

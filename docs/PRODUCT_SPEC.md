@@ -96,7 +96,8 @@ Phase 3ではSpec検証、ローカルCLI能力確認、保存済みRecordingの
   argv、Recording、Evidenceへ保存せず、SHA-256、byte数、redacted flagだけを保存する。
 - Codex processはworkspace-write、明示configによるapproval never、ephemeral、JSONL、
   user config/rules無視、strict configで起動し、web searchとmodel-generated command
-  networkを無効にする。CLI profile、version、approval根拠をEvidenceへ保存する。
+  networkを無効にする。CLI profile、version、execution stageをEvidenceへ保存し、
+  approval値と根拠はProvider argvによる起動を試みた場合だけ保存する。
 - ChatGPT-managed CLI authだけを対象とし、API key、auth file copy/parseを実装しない。
   `CODEX_HOME`は明示された絶対pathの既存directoryを必須とし、暗黙fallbackしない。
   CodexとGateの環境を分離し、Gateへ`CODEX_HOME`を渡さない。

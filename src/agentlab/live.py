@@ -20,6 +20,7 @@ from agentlab.codex_provider import (
     CodexPreflight,
     CodexPreflightError,
     CodexProcessRunner,
+    post_preflight_failure_evidence,
     preflight_codex,
     preflight_failure_evidence,
     resolve_codex_home,
@@ -844,7 +845,7 @@ def run_live_codex(
     workspace_lifecycle = WorkspaceLifecycle.NOT_CREATED
     workspace = None
     gate_result: GateExecutionResult | None = None
-    codex: CodexExecutionEvidence
+    codex: CodexExecutionEvidence | None = None
     failure_kind: LiveFailureKind | None = None
     try:
         workspace = prepare_disposable_workspace(source, source_snapshot)
@@ -896,25 +897,18 @@ def run_live_codex(
     except WorkspaceError as error:
         workspace_lifecycle = error.lifecycle or WorkspaceLifecycle.NOT_CREATED
         failure_kind = LiveFailureKind.EVIDENCE_ERROR
-        synthetic_error = CodexPreflightError(
-            LiveFailureKind.EVIDENCE_ERROR,
-            "Live workspace preparation failed",
-            checked_at=preflight_result.checked_at,
-            cli_version=preflight_result.cli_version,
-            verified_flags=preflight_result.verified_flags,
-        )
-        codex = preflight_failure_evidence(synthetic_error, live=spec.live)
+        if codex is None:
+            codex = post_preflight_failure_evidence(
+                preflight_result,
+                live=spec.live,
+            )
     except Exception:
         failure_kind = LiveFailureKind.EVIDENCE_ERROR
-        if "codex" not in locals():
-            synthetic_error = CodexPreflightError(
-                LiveFailureKind.EVIDENCE_ERROR,
-                "Live workspace execution failed",
-                checked_at=preflight_result.checked_at,
-                cli_version=preflight_result.cli_version,
-                verified_flags=preflight_result.verified_flags,
+        if codex is None:
+            codex = post_preflight_failure_evidence(
+                preflight_result,
+                live=spec.live,
             )
-            codex = preflight_failure_evidence(synthetic_error, live=spec.live)
     finally:
         if workspace is not None:
             workspace_removed, _cleanup_error = remove_disposable_workspace(workspace)
@@ -926,6 +920,7 @@ def run_live_codex(
 
     if workspace_lifecycle is WorkspaceLifecycle.CLEANUP_FAILED:
         failure_kind = LiveFailureKind.EVIDENCE_ERROR
+    assert codex is not None
     if codex.status is ProviderExecutionStatus.FAILED and failure_kind is None:
         failure_kind = codex.failure_kind
     if (

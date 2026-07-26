@@ -31,8 +31,11 @@ Phase 2 allowlist環境と別の一時HOME/TMP/cacheで起動する。
 しない。`--config approval_policy="never"`を明示する契約を
 `headless_exec_explicit_never_v2` profileとして固定し、対応CLI versionをallowlistする。
 Evidenceへprofile、CLI version、`explicit_config_never`のapproval根拠を保存する。
-preflight未完了時はprofileを`not_selected`とし、policy/basisをnullにする。将来別の設定
-方法やCLI versionへ対応する場合は新しいprofileを追加し、既存profileの意味を変更しない。
+preflight未完了、preflight完了、Provider起動試行済みをexecution stageで分離する。
+preflight未完了時はprofileを`not_selected`とし、policy/basisをnullにする。選択完了後も
+Provider起動試行前はprofile/version/flagだけを保持し、policy/basisはnullにする。argvを
+使った起動試行時だけ`never`と根拠を記録する。将来別の設定方法やCLI versionへ対応する
+場合は新しいprofileを追加し、既存profileの意味を変更しない。
 
 ## Consequences
 

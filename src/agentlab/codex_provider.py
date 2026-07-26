@@ -24,6 +24,7 @@ from agentlab.models import (
     CodexApprovalBasis,
     CodexCliProfile,
     CodexExecutionEvidence,
+    CodexExecutionStage,
     CodexItemType,
     CodexTerminalEvent,
     CommandStatus,
@@ -641,10 +642,11 @@ def _preflight_failure_evidence(
     assert live.reasoning_effort is not None
     now = datetime.now(UTC)
     return CodexExecutionEvidence(
-        schema_version="1.0",
+        schema_version="1.1",
         provider=Provider.CODEX,
         cli_version=error.cli_version,
         cli_profile=CodexCliProfile.NOT_SELECTED,
+        execution_stage=CodexExecutionStage.PREFLIGHT_NOT_COMPLETED,
         preflight_checked_at=error.checked_at,
         verified_flags=sorted(error.verified_flags),
         requested_model=live.model,
@@ -686,6 +688,57 @@ def preflight_failure_evidence(
     live: LiveSettings,
 ) -> CodexExecutionEvidence:
     return _preflight_failure_evidence(error, live=live)
+
+
+def post_preflight_failure_evidence(
+    preflight: CodexPreflight,
+    *,
+    live: LiveSettings,
+    failure_kind: LiveFailureKind = LiveFailureKind.EVIDENCE_ERROR,
+) -> CodexExecutionEvidence:
+    """Record selected compatibility metadata before any Provider invocation."""
+    assert live.model is not None
+    assert live.reasoning_effort is not None
+    now = datetime.now(UTC)
+    return CodexExecutionEvidence(
+        schema_version="1.1",
+        provider=Provider.CODEX,
+        cli_version=preflight.cli_version,
+        cli_profile=preflight.cli_profile,
+        execution_stage=CodexExecutionStage.PREFLIGHT_COMPLETED,
+        preflight_checked_at=preflight.checked_at,
+        verified_flags=sorted(preflight.verified_flags),
+        requested_model=live.model,
+        requested_reasoning_effort=live.reasoning_effort,
+        sandbox_mode="workspace-write",
+        approval_policy=None,
+        approval_basis=None,
+        web_search_disabled=True,
+        command_network_disabled=True,
+        raw_stream_persisted=False,
+        process_started=False,
+        status=ProviderExecutionStatus.FAILED,
+        failure_kind=failure_kind,
+        exit_code=None,
+        started_at=now,
+        completed_at=now,
+        duration_ms=0,
+        event_count=0,
+        unknown_event_count=0,
+        thread_started_count=0,
+        turn_started_count=0,
+        terminal_event=CodexTerminalEvent.NONE,
+        turn_completed_count=0,
+        turn_failed_count=0,
+        error_event_count=0,
+        item_type_counts={},
+        usage_metrics=_not_available_usage(),
+        stdout_bytes=0,
+        stderr_bytes=0,
+        stdout_limit_exceeded=False,
+        stderr_truncated=False,
+        termination=termination_without_signal(),
+    )
 
 
 class CodexProcessRunner:
@@ -1029,10 +1082,11 @@ class CodexProcessRunner:
         assert self._live.reasoning_effort is not None
         parsed = parser.summary() if summary is None else summary
         return CodexExecutionEvidence(
-            schema_version="1.0",
+            schema_version="1.1",
             provider=Provider.CODEX,
             cli_version=preflight.cli_version,
             cli_profile=preflight.cli_profile,
+            execution_stage=CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED,
             preflight_checked_at=preflight.checked_at,
             verified_flags=sorted(preflight.verified_flags),
             requested_model=self._live.model,
@@ -1083,17 +1137,18 @@ def unsupported_platform_evidence(
     assert live.reasoning_effort is not None
     now = datetime.now(UTC)
     return CodexExecutionEvidence(
-        schema_version="1.0",
+        schema_version="1.1",
         provider=Provider.CODEX,
         cli_version=preflight.cli_version,
         cli_profile=preflight.cli_profile,
+        execution_stage=CodexExecutionStage.PREFLIGHT_COMPLETED,
         preflight_checked_at=preflight.checked_at,
         verified_flags=sorted(preflight.verified_flags),
         requested_model=live.model,
         requested_reasoning_effort=live.reasoning_effort,
         sandbox_mode="workspace-write",
-        approval_policy="never",
-        approval_basis=CodexApprovalBasis.EXPLICIT_CONFIG_NEVER,
+        approval_policy=None,
+        approval_basis=None,
         web_search_disabled=True,
         command_network_disabled=True,
         raw_stream_persisted=False,

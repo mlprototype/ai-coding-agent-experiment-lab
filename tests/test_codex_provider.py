@@ -21,6 +21,7 @@ from agentlab.codex_provider import (
 from agentlab.models import (
     CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS,
     CodexCliProfile,
+    CodexExecutionStage,
     CodexItemType,
     CodexTerminalEvent,
     LiveFailureKind,
@@ -517,7 +518,7 @@ def test_process_runner_uses_safe_argv_stdin_and_separate_environment(
         assert secret not in persisted
 
 
-def test_explicit_never_is_passed_with_auto_review_managed_config(
+def test_explicit_never_argv_is_present_with_auto_review_like_config(
     tmp_path: Path,
 ) -> None:
     live_code = (
@@ -555,6 +556,10 @@ def test_explicit_never_is_passed_with_auto_review_managed_config(
     assert (
         result.evidence.cli_profile
         is CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2
+    )
+    assert (
+        result.evidence.execution_stage
+        is CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
     )
     assert result.evidence.approval_basis == "explicit_config_never"
 

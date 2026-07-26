@@ -20,13 +20,18 @@ helpには`--json`、`--ephemeral`、`--sandbox`、
 現在のprofileは`headless_exec_explicit_never_v2`で、対応versionを
 `codex-cli 0.146.0-alpha.3.1`へallowlistする。flag集合が同じでもallowlist外のversionは
 model呼出し前にfail closedする。
-[OpenAI Codexの固定commitにあるheadless `exec`実装](https://github.com/openai/codex/blob/bb6a127bca6c9e190cc9285c4d7bd22c1dff5acb/codex-rs/exec/src/lib.rs)
+[OpenAI Codex 0.146.0-alpha.3.1の固定commitにあるheadless `exec`実装](https://github.com/openai/codex/blob/ff75c5b939c477c49eb1bd5248da6dab71b109d1/codex-rs/exec/src/lib.rs)
 では初期値の`Never`が解決後の`approvals_reviewer`に応じて再構築されうるため、内部既定や
 `--ignore-user-config`だけを根拠にしない。profileはCLIに存在しない
 `--ask-for-approval`を要求せず、`--config approval_policy="never"`を明示する。
 永続化するpreflight metadataはprofile、CLI version、確認時刻、flag名、明示approval
-設定の根拠で、実行pathは保存しない。preflight未完了時はprofileを`not_selected`、
-approval policy/basisをnullにする。対応versionや設定方法を変える場合は、同じprofileを
+設定の根拠で、実行pathは保存しない。選択済みprofileはstatusにかかわらず必須flagを
+すべて要求する。preflight未完了時はprofileを`not_selected`、execution stageを
+`preflight_not_completed`、approval policy/basisをnullにする。preflight完了後、
+Provider起動試行前の失敗ではallowlist済みversion、profile、flagを保持し、stageを
+`preflight_completed`、approval policy/basisをnullにする。argvを使った起動を試みた
+時点でstageを`provider_invocation_attempted`とし、初めて`never`と
+`explicit_config_never`を記録する。対応versionや設定方法を変える場合は、同じprofileを
 書き換えず別profileとして追加する。
 
 ## Fixed invocation and Prompt
@@ -90,8 +95,8 @@ cost、quota、価格計算は行わない。
 
 ## Persisted and excluded fields
 
-CodexExecutionEvidenceにはrequested model/reasoning、sandbox/approval/network条件、
-CLI profile/version、時刻/duration、process開始有無、status/exit、
+CodexExecutionEvidence 1.1にはrequested model/reasoning、sandbox/approval/network条件、
+CLI profile/version、execution stage、時刻/duration、process開始有無、status/exit、
 thread/turn/terminal/event/unknown/item件数、Usage、stdout/stderr byte数と上限状態、
 process termination、safe failure kindを保存する。
 
@@ -150,6 +155,10 @@ Codex model API、認証状態、model availability、quota、vendor eventの将
 smoke前には保証できない。ProviderがPrompt本文をWorkspace変更へ意図的に複製した場合、
 その変更は品質Evidenceのdiff契約に現れうるため、PromptとFixtureは非機密または別途
 レビュー済みでなければならない。
+
+通常テストのAutoReview相当configケースは、fake executableが明示approval configをargvで
+受け取ることだけを確認する。実Codex CLIがcloud/managed configを解決した最終policyは、
+manual Live smoke未実施のため検証済みとはしない。
 
 Phase 3は一つの`one_shot` taskを手動実行するだけである。複数task/条件/反復scheduler、
 `staged` Workflow、A/B比較、集計はPhase 4であり、Phase 3 Providerへ先行実装しない。

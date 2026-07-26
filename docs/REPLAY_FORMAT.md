@@ -22,7 +22,8 @@ file content、thread/session IDは含めない。
 `prompt_redacted=true`、requested model/reasoning effort、CLI versionを保持する。
 
 `run_completed`はProviderと全Gateが必要なEvidenceを残した場合に、Phase 3 RunMetrics、
-redaction済みCodexExecutionEvidence、Gate種別ごとのcommand/pass/fail件数、
+redaction済みCodexExecutionEvidence 1.1（profile選択とProvider起動試行を分けるstageを
+含む）、Gate種別ごとのcommand/pass/fail件数、
 evaluation duration、diff/Workspace lifecycle summaryを保持する。品質Gate通常不合格でも
 Metricsを生成できるためcompletedである。loaderはこのsummaryとMetricsを照合する。
 

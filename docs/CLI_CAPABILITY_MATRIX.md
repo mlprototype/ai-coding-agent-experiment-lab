@@ -31,7 +31,7 @@
   Phase 3の現profileも要求しない。
 - 上記versionをprofileのallowlistへ固定し、必要flag集合でboundedなread-only Phase 3
   preflightが成功した。allowlist外のversionはflagが同じでも拒否する。
-- [OpenAI Codex releaseの固定commitにある公式source](https://github.com/openai/codex/blob/bb6a127bca6c9e190cc9285c4d7bd22c1dff5acb/codex-rs/exec/src/lib.rs)
+- [OpenAI Codex 0.146.0-alpha.3.1 releaseの固定commitにある公式source](https://github.com/openai/codex/blob/ff75c5b939c477c49eb1bd5248da6dab71b109d1/codex-rs/exec/src/lib.rs)
   ではheadless modeの初期approval policyが、解決後の`approvals_reviewer`に応じて
   再構築されうる。Phase 3は内部既定へ依存せず、
   `--config approval_policy="never"`を明示し、その根拠をprofile名とCLI versionへ
@@ -50,4 +50,6 @@
   schema、Token/コスト取得、quota情報、終了/timeout時の挙動は確認していない。
 - Codex JSONL parserと変換はfake CLIでoffline検証済みだが、実CLI eventとのLive統合は
   manual smoke未実施のため未確認である。
+- AutoReview相当の設定を置くfakeテストは明示configがargvへ含まれることだけを確認し、
+  実CLIのcloud/managed config解決後の最終approval policyは確認していない。
 - Antigravityの非対話実行、構造化出力、Usage指標を含む全能力は`not_verified`である。
