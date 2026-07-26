@@ -56,16 +56,19 @@ Evidence不完全ではMetricsを生成しない。Phase 1 Replayのbyte決定�
 
 **成果物:** Codex adapter、能力/版のread-only preflight、stdin Prompt、incremental
 JSONL parser、Provider process tree停止、正規化Codex Evidence、redaction済みRecording
-1.1、Live Evidence、成功RecordingのReplay、明示的Live opt-in、fake CLI offline test。
+1.1、Live Evidence、成功RecordingのReplay、明示的Live opt-in、strict paired成果物を
+構築できない場合の独立Failure Diagnostic、fake CLI offline test。
 
 **受入条件:** 手動の隔離環境で一つのfixtureを実行・Recordでき、その記録をReplayして
 同じ正規化eventを得る。認証情報や機密Promptを成果物へ保存しない。通常CIは呼ばない。
-実Codexによるmanual Live smokeは累計2回実行し、2回ともHarness障害で成功受入に達して
-いない。2回目は`provider_orchestration`だったが、旧EvidenceからProvider起動、Prompt
-送信、model API到達、quota消費、process group回収の有無は確定できない。過去の状態を
-推測せず、新規Evidence 1.3でrunner／Popen／cleanupの観測状態を固定Enumとして保持する
-offline修正と再レビューを行う。Live成果物4件はGit管理外で保持し、3回目のmanual smokeは
-実行しない。Phase 3はCurrentのままとし、Completeへ変更しない。
+実Codexによるmanual Live smokeは累計3回実行し、3回とも成功受入に達していない。003は
+strict lifecycle Evidenceを構築できず、Evidence／Recordingは作成されなかったため、
+Provider起動、Prompt送信、model API到達、quota消費は確定不能である。003 Spec予約commitと
+001／002のGit管理外Live成果物4件を保持し、003は再実行しない。strict契約を緩めず、
+Evidence構築失敗時だけ固定Enumと観測済みlifecycleをatomic・上書き禁止で保存する独立
+Failure Diagnosticのoffline修正と再レビューを行う。DiagnosticはReplay対象でも受入成功の
+根拠でもない。次回Liveには新しい修正commitのレビューと別の明示承認を必要とする。
+Phase 3はCurrentのままとし、Completeへ変更しない。
 
 ## Phase 4: Workflow A/B Experiment
 

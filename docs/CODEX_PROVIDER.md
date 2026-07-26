@@ -4,8 +4,9 @@
 
 Phase 3は、1 task・1 Codex Provider・1 repetition・`one_shot`を人間が手動実行する最小
 vertical sliceである。scheduler、staged Workflow、比較実験、自動retryはPhase 4以降で
-あり、実装していない。通常テストはfake Codexだけを使う。manual Live smokeは累計2回
-実行し、2回ともHarness障害で失敗したため成功受入は未達である。3回目は実行しない。
+あり、実装していない。通常テストはfake Codexだけを使う。manual Live smokeは累計3回
+実行し、3回とも成功受入に達していない。003は再実行せず、次回Liveには新しい修正commit
+のレビューと別の明示承認が必要である。
 
 ## Read-only preflight
 
@@ -115,8 +116,28 @@ Popen未試行、Popen試行済みでprocess未生成、process生成済み、�
 である。runnerとorchestratorは同じin-memory lifecycle trackerを共有する。runner内部の
 未知例外ではprocess group回収を行ってから固定状態だけを外側へ渡し、外側fallbackが
 未観測の`process_started=false`や回収済みを合成しない。strict Evidenceを構築できない
-場合はpaired Artifactを公開しない。例外message、任意の例外class名、PID、pathなどの
-自由記述は保存しない。
+場合はpaired Artifactを公開しない。
+
+この場合だけ、Evidence／Recordingとは独立したFailure Diagnostic 1.0を保存できる。
+Diagnosticはrun／experiment／taskの識別子、Harness failure kind、固定
+`diagnostic_code`、共有lifecycle trackerから得た固定stageとrunner／invocation／cleanup
+状態、Workspace lifecycle、Gate実行有無、作成時刻だけを持つ。未観測状態は`unknown`で
+保持し、`false`や未起動へ丸めない。Provider活動を判定するための観測が不足すれば
+`provider_activity_determined=unknown`とし、Diagnosticの存在からProvider未起動、
+Prompt未送信、API未到達、quota未消費を推論しない。
+
+`diagnostic_code`はCodex Evidence validation、lifecycle fallback Evidence validation、
+Recording構築、Live Artifact構築、paired output公開を区別する。Diagnostic自体の公開失敗
+は固定`diagnostic_publication_failed`としてCLI境界へ返すが、書けなかったDiagnosticが
+存在するとは記録しない。Diagnosticは単独fileとして一時fileからatomic createし、既存file
+を置換しない。Replay対象ではなく、作成されてもLive受入成功を意味しない。
+`live.diagnostic_to`を指定すれば将来のSpecで出力先を明示でき、未指定の既存Specでは
+Evidence出力名から別名を導出する。既存Specのstrict load契約は変えない。
+
+Prompt本文、raw JSONL／stderr、agent message、reasoning、command本文／output、PID、
+thread/session ID、`CODEX_HOME`、executable path、認証情報、親process環境、例外message、
+traceback、filesystem pathはDiagnosticへ保存しない。任意の例外class名も含めず、
+固定Enum以外の失敗理由を永続化しない。
 
 既存CodexExecutionEvidence 1.1は`failure_stage`なし、1.2は1.3のlifecycle fieldなしで
 引き続きstrict loaderが受理する。新規Evidenceだけを1.3で保存するため、保存済み
@@ -201,7 +222,7 @@ smoke成功だけでは保証できない。ProviderがPrompt本文をWorkspace�
 
 通常テストのAutoReview相当configケースは、fake executableが明示approval configをargvで
 受け取ることだけを確認する。実Codex CLIがcloud/managed configを解決した最終policyは、
-2回の旧EvidenceだけではProvider process開始を確定できないため検証済みとはしない。
+001／002の旧EvidenceだけではProvider process開始を確定できないため検証済みとはしない。
 
 Phase 3は一つの`one_shot` taskを手動実行するだけである。複数task/条件/反復scheduler、
 `staged` Workflow、A/B比較、集計はPhase 4であり、Phase 3 Providerへ先行実装しない。
@@ -214,11 +235,18 @@ READMEの`live-codex ... --confirm-live-codex`を明示承認の範囲で手動�
 
 現在確認した`codex-cli 0.146.0-alpha.3.1`は
 `headless_exec_explicit_never_v2`のversion allowlistとread-only preflightに成功した。
-manual Live smokeは累計2回実行し、2回ともHarness障害だった。2回目は
+manual Live smokeは累計3回実行し、3回とも成功受入に達していない。2回目は
 `overall_status=harness_error`、`failure_kind=evidence_error`、
 `failure_stage=provider_orchestration`だったが、旧1.2 fallbackが起動・回収状態を
 ゼロ値で合成しうる欠陥があった。この成果物だけからProvider起動、Prompt送信、model API
 到達、quota消費、process group回収の有無は確定できず、過去の正確な例外も復元できない。
 これらを推測せず、1.3 lifecycle trackerとoffline fault injectionで将来のEvidence契約を
-修正した。Live成功受入は未達で、Phase 3はCurrentのままであり、3回目は実行しない。
-4件のLive Evidence／RecordingはGit管理外で保存する。
+修正した。
+
+003ではstrict lifecycle Evidenceを構築できず、Evidence／Recordingは作成されなかった。
+したがって003のProvider起動、Prompt送信、model API到達、quota消費は確定不能であり、
+過去の内部例外も復元できない。003 Specの予約commitは保持し、003は再実行しない。
+001／002のLive Evidence／Recording 4件はGit管理外で保持する。Failure Diagnosticは
+将来の同種失敗を固定値で識別するためのoffline修正であり、003の過去状態を補完せず、
+受入成功を意味しない。Phase 3はCurrentのままである。次回Liveは新しい修正commitの
+レビューと別の明示承認がある場合だけ、新しいSpecとrun-idで1回実行する。

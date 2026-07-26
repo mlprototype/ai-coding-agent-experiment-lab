@@ -34,13 +34,15 @@ Phase 0〜2を完了し、現在は
 - stdin Prompt、上限付きincremental JSONL parser、redaction済みCodex Evidence
 - 2イベントのLive Recording 1.1と、その成功記録のoffline Replay
 - Provider成功後に同じ使い捨てWorkspaceで品質Gateを実行する最小vertical slice
+- strict paired成果物を構築できない場合だけの独立したFailure Diagnostic 1.0
 
 Replayは引き続きRecording内の保存済みMetricsだけを再構成し、外部処理を呼びません。
 通常テストは短時間のfake Codex executableだけを使い、実Codex、外部AI、network、
-quotaを呼びません。Phase 3のmanual Live smokeは累計2回実行し、2回ともHarness障害で
-成功受入に達していないため、Phase 3は引き続きCurrentです。2回目の旧Evidenceは
-`provider_orchestration`を記録しましたが、Provider起動、Prompt送信、model API到達、
-quota消費の有無を確定できません。過去の状態を推測せず、3回目は実行しません。
+quotaを呼びません。Phase 3のmanual Live smokeは累計3回実行し、3回とも成功受入に
+達していないため、Phase 3は引き続きCurrentです。003ではstrict lifecycle Evidenceを
+構築できず、Evidence／Recordingは作成されませんでした。003のProvider起動、Prompt送信、
+model API到達、quota消費は確定不能です。003は再実行せず、次回Liveには修正commitの
+レビューと別の明示承認が必要です。
 scheduler、staged Workflow、Workflow A/B、Antigravity、Provider比較、比較レポートは
 未実装です。
 
@@ -67,8 +69,8 @@ uv run mypy src
 ```
 
 次はPhase 3で使用したmanual smokeのCLI形式です。実Codexを使うため、通常テストやCIでは
-実行しません。Phase 3では承認済みのmanual smokeをすでに累計2回実行し、3回目は
-実行しません。
+実行しません。承認済みmanual smokeは累計3回で、003は再実行しません。新しい実行は
+レビュー済みの別commitと個別の明示承認なしには行いません。
 
 ```console
 uv run agentlab live-codex experiments/examples/codex-live-smoke.yaml \
@@ -90,7 +92,10 @@ profileと確認済みflagを保持しつつ、approval policyはnullのまま�
 Evidence 1.3はrunner、Popen試行、process生成、process group回収の観測状態を固定Enumで
 保持します。旧1.2の`provider_orchestration` fallbackはこの状態を正確に保持できないため、
 2回目のProvider起動・Prompt送信・model API到達・quota消費は確定不能です。manual Live
-受入は未達ですが、3回目は実行しません。
+受入は累計3回とも未達です。003はstrict lifecycle Evidence構築に失敗してpaired成果物が
+なく、Provider活動を確定できません。新しいFailure Diagnosticは、この種の失敗時に
+固定Enumの観測値だけをatomic・上書き禁止で保存します。Evidence／Recordingの代替でも
+Replay入力でもなく、作成されても受入成功を意味しません。
 
 `--confirm-live-codex`なしではversion/help preflightを含むsubprocessを起動しません。
 確認付き実行はCodex model APIへのPrompt送信とquota消費を伴います。Promptはargvへ

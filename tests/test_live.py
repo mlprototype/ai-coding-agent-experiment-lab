@@ -7,6 +7,7 @@ import sys
 import textwrap
 import time
 from copy import deepcopy
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -21,8 +22,12 @@ from agentlab.codex_provider import REQUIRED_CODEX_EXEC_FLAGS
 from agentlab.live import (
     LiveArtifactLoadError,
     LiveCodexError,
+    LiveDiagnosticCreatedError,
+    LiveDiagnosticPublicationError,
+    load_failure_diagnostic,
     load_live_artifact,
     run_live_codex,
+    write_failure_diagnostic,
     write_live_outputs,
 )
 from agentlab.models import (
@@ -33,9 +38,19 @@ from agentlab.models import (
     CodexFailureStage,
     CodexInvocationState,
     CodexRunnerState,
+    DiagnosticCleanupState,
+    DiagnosticFailureStage,
+    DiagnosticInvocationState,
+    DiagnosticRunnerState,
+    LiveDiagnosticCode,
+    LiveFailureDiagnostic,
     LiveFailureKind,
     LiveOverallStatus,
     LiveRunArtifact,
+    LiveSettings,
+    ProviderActivityDetermination,
+    TerminationEvidence,
+    TerminationReason,
     WorkspaceLifecycle,
 )
 from agentlab.recording import (
@@ -205,6 +220,31 @@ def _run(
     )
 
 
+def _diagnostic_path(output_path: Path) -> Path:
+    suffix = output_path.suffix or ".json"
+    return output_path.with_name(f"{output_path.stem}.diagnostic{suffix}")
+
+
+def _sample_diagnostic() -> LiveFailureDiagnostic:
+    return LiveFailureDiagnostic(
+        schema_version="1.0",
+        run_id="diagnostic-run",
+        experiment_id="diagnostic-experiment",
+        task_id="diagnostic-task",
+        failure_kind=LiveFailureKind.EVIDENCE_ERROR,
+        diagnostic_code=LiveDiagnosticCode.RECORDING_CONSTRUCTION_FAILED,
+        failure_stage=DiagnosticFailureStage.PREFLIGHT,
+        runner_state=DiagnosticRunnerState.NOT_STARTED,
+        invocation_state=DiagnosticInvocationState.NOT_ATTEMPTED,
+        cleanup_state=DiagnosticCleanupState.NOT_APPLICABLE,
+        workspace_lifecycle=WorkspaceLifecycle.NOT_CREATED,
+        paired_artifacts_published=False,
+        gate_executed=False,
+        provider_activity_determined=ProviderActivityDetermination.DETERMINED,
+        created_at=datetime.now(UTC),
+    )
+
+
 def _assert_safe_failed_live_outputs(
     outcome: Any,
     output_path: Path,
@@ -322,6 +362,7 @@ def test_live_success_runs_provider_and_gates_in_same_workspace_and_replays(
     assert observed["codex_key"] is None
     assert observed["parent_secret"] is None
     assert (fixture / "task.txt").read_text(encoding="utf-8") == "status=TODO\n"
+    assert not _diagnostic_path(output).exists()
     for secret in (
         prompt_secret,
         "raw-thread-secret",
@@ -943,10 +984,6 @@ def test_pre_provider_faults_persist_safe_stage_without_running_gates(
     ("fault_mode", "expected_stage"),
     [
         (
-            "evidence_construction",
-            CodexFailureStage.CODEX_EVIDENCE_CONSTRUCTION,
-        ),
-        (
             "result_construction",
             CodexFailureStage.PROVIDER_RUNNER_RESULT_CONSTRUCTION,
         ),
@@ -982,12 +1019,7 @@ def test_post_spawn_handoff_faults_preserve_process_lifecycle(
         "agentlab.codex_provider.subprocess.Popen",
         track_spawn,
     )
-    if fault_mode == "evidence_construction":
-        monkeypatch.setattr(
-            "agentlab.codex_provider.CodexProcessRunner._build_evidence",
-            fail_boundary,
-        )
-    elif fault_mode == "result_construction":
+    if fault_mode == "result_construction":
         monkeypatch.setattr(
             "agentlab.codex_provider.CodexRunResult",
             fail_boundary,
@@ -1051,6 +1083,113 @@ def test_post_spawn_handoff_faults_preserve_process_lifecycle(
         os.kill(spawned_pids[0], 0)
     persisted = output.read_bytes() + outcome.recording_path.read_bytes()
     assert b"synthetic handoff secret" not in persisted
+
+
+def test_codex_evidence_construction_failure_publishes_only_safe_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture, prompt_path, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+    preflight_result = codex_provider_module.preflight_codex(
+        parent_environment=environment
+    )
+    popen = codex_provider_module.subprocess.Popen
+    spawned_pids: list[int] = []
+
+    def track_spawn(*args: object, **kwargs: object):
+        process = popen(*args, **kwargs)
+        spawned_pids.append(process.pid)
+        return process
+
+    def fail_evidence(*_args: object, **_kwargs: object) -> NoReturn:
+        raise RuntimeError("synthetic Evidence exception path secret")
+
+    monkeypatch.setattr("agentlab.codex_provider.subprocess.Popen", track_spawn)
+    monkeypatch.setattr(
+        "agentlab.codex_provider.CodexProcessRunner._build_evidence",
+        fail_evidence,
+    )
+    monkeypatch.setattr(
+        "agentlab.live.execute_quality_gates_in_workspace",
+        lambda *_args, **_kwargs: pytest.fail("quality Gates must not run"),
+    )
+
+    with pytest.raises(LiveDiagnosticCreatedError) as raised:
+        run_live_codex(
+            spec_path,
+            task_id="task-1",
+            repetition_index=0,
+            run_id="offline-evidence-construction",
+            output_path=output,
+            confirm_live_codex=True,
+            parent_environment=environment,
+            preflight=lambda **_kwargs: preflight_result,
+        )
+
+    recording_path = spec_path.parent / "recordings" / "live.jsonl"
+    diagnostic_path = _diagnostic_path(output)
+    diagnostic = load_failure_diagnostic(diagnostic_path)
+    assert (
+        raised.value.diagnostic_code
+        is LiveDiagnosticCode.CODEX_EVIDENCE_VALIDATION_FAILED
+    )
+    assert diagnostic.schema_version == "1.0"
+    assert (
+        diagnostic.diagnostic_code
+        is LiveDiagnosticCode.CODEX_EVIDENCE_VALIDATION_FAILED
+    )
+    assert (
+        diagnostic.failure_stage
+        is DiagnosticFailureStage.CODEX_EVIDENCE_CONSTRUCTION
+    )
+    assert diagnostic.runner_state is DiagnosticRunnerState.STARTED
+    assert diagnostic.invocation_state is DiagnosticInvocationState.PROCESS_STARTED
+    assert diagnostic.cleanup_state is DiagnosticCleanupState.CLEARED
+    assert (
+        diagnostic.provider_activity_determined
+        is ProviderActivityDetermination.DETERMINED
+    )
+    assert diagnostic.workspace_lifecycle is WorkspaceLifecycle.REMOVED
+    assert diagnostic.paired_artifacts_published is False
+    assert diagnostic.gate_executed is False
+    assert not output.exists()
+    assert not recording_path.exists()
+    assert len(spawned_pids) == 1
+    with pytest.raises(ProcessLookupError):
+        os.kill(spawned_pids[0], 0)
+
+    persisted = diagnostic_path.read_bytes()
+    assert set(json.loads(persisted)) == {
+        "schema_version",
+        "run_id",
+        "experiment_id",
+        "task_id",
+        "failure_kind",
+        "diagnostic_code",
+        "failure_stage",
+        "runner_state",
+        "invocation_state",
+        "cleanup_state",
+        "workspace_lifecycle",
+        "paired_artifacts_published",
+        "gate_executed",
+        "provider_activity_determined",
+        "created_at",
+    }
+    forbidden = [
+        prompt_path.read_bytes(),
+        b"synthetic Evidence exception path secret",
+        environment["CODEX_HOME"].encode(),
+        environment["OPENAI_API_KEY"].encode(),
+        environment["CODEX_API_KEY"].encode(),
+        environment["AGENTLAB_PARENT_SECRET"].encode(),
+        b"raw-event-secret",
+        b"raw-stderr-secret",
+        str(spawned_pids[0]).encode(),
+        str(prompt_path).encode(),
+    ]
+    assert all(value not in persisted for value in forbidden)
 
 
 @pytest.mark.parametrize(
@@ -1169,6 +1308,13 @@ def test_failed_emergency_cleanup_is_not_recorded_as_cleared(
         parent_environment=environment
     )
     terminate = codex_provider_module.terminate_process_group
+    popen = codex_provider_module.subprocess.Popen
+    provider_pids: list[int] = []
+
+    def track_provider_spawn(*args: object, **kwargs: object):
+        process = popen(*args, **kwargs)
+        provider_pids.append(process.pid)
+        return process
 
     def report_cleanup_failure(*args: object, **kwargs: object):
         termination = terminate(*args, **kwargs)
@@ -1188,6 +1334,10 @@ def test_failed_emergency_cleanup_is_not_recorded_as_cleared(
         report_cleanup_failure,
     )
     monkeypatch.setattr(
+        "agentlab.codex_provider.subprocess.Popen",
+        track_provider_spawn,
+    )
+    monkeypatch.setattr(
         "agentlab.codex_provider.CodexProcessRunner._build_evidence",
         fail_evidence,
     )
@@ -1196,32 +1346,34 @@ def test_failed_emergency_cleanup_is_not_recorded_as_cleared(
         lambda *_args, **_kwargs: pytest.fail("quality Gates must not run"),
     )
 
-    outcome = run_live_codex(
-        spec_path,
-        task_id="task-1",
-        repetition_index=0,
-        run_id="offline-cleanup-failure",
-        output_path=output,
-        confirm_live_codex=True,
-        parent_environment=environment,
-        preflight=lambda **_kwargs: preflight_result,
-    )
+    with pytest.raises(LiveDiagnosticCreatedError):
+        run_live_codex(
+            spec_path,
+            task_id="task-1",
+            repetition_index=0,
+            run_id="offline-cleanup-failure",
+            output_path=output,
+            confirm_live_codex=True,
+            parent_environment=environment,
+            preflight=lambda **_kwargs: preflight_result,
+        )
     child_pid = int(inspection.read_text(encoding="utf-8"))
+    diagnostic = load_failure_diagnostic(_diagnostic_path(output))
 
-    assert outcome.artifact.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+    assert diagnostic.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
     assert (
-        outcome.artifact.codex.failure_stage
-        is CodexFailureStage.CODEX_EVIDENCE_CONSTRUCTION
+        diagnostic.failure_stage
+        is DiagnosticFailureStage.CODEX_EVIDENCE_CONSTRUCTION
     )
-    assert outcome.artifact.codex.process_started is True
-    assert (
-        outcome.artifact.codex.invocation_state
-        is CodexInvocationState.PROCESS_STARTED
-    )
-    assert outcome.artifact.codex.cleanup_state is CodexCleanupState.FAILED
-    assert outcome.artifact.codex.termination.process_group_cleared is False
-    assert outcome.artifact.gate_commands == []
-    assert outcome.artifact.workspace_lifecycle is WorkspaceLifecycle.REMOVED
+    assert diagnostic.invocation_state is DiagnosticInvocationState.PROCESS_STARTED
+    assert diagnostic.cleanup_state is DiagnosticCleanupState.FAILED
+    assert diagnostic.gate_executed is False
+    assert diagnostic.workspace_lifecycle is WorkspaceLifecycle.REMOVED
+    assert not output.exists()
+    assert not (spec_path.parent / "recordings" / "live.jsonl").exists()
+    assert len(provider_pids) == 1
+    with pytest.raises(ProcessLookupError):
+        os.kill(provider_pids[0], 0)
     with pytest.raises(ProcessLookupError):
         os.kill(child_pid, 0)
 
@@ -1263,9 +1415,9 @@ def test_unbuildable_lifecycle_evidence_publishes_no_paired_artifact(
     )
 
     with pytest.raises(
-        LiveCodexError,
-        match="strict Codex lifecycle failure Evidence",
-    ):
+        LiveDiagnosticCreatedError,
+        match="lifecycle_fallback_evidence_validation_failed",
+    ) as raised:
         run_live_codex(
             spec_path,
             task_id="task-1",
@@ -1278,10 +1430,304 @@ def test_unbuildable_lifecycle_evidence_publishes_no_paired_artifact(
         )
 
     recording_path = spec_path.parent / "recordings" / "live.jsonl"
+    diagnostic = load_failure_diagnostic(_diagnostic_path(output))
+    assert (
+        raised.value.diagnostic_code
+        is LiveDiagnosticCode.LIFECYCLE_FALLBACK_EVIDENCE_VALIDATION_FAILED
+    )
+    assert (
+        diagnostic.diagnostic_code
+        is LiveDiagnosticCode.LIFECYCLE_FALLBACK_EVIDENCE_VALIDATION_FAILED
+    )
+    assert diagnostic.runner_state is DiagnosticRunnerState.STARTED
+    assert diagnostic.invocation_state is DiagnosticInvocationState.NOT_ATTEMPTED
+    assert diagnostic.cleanup_state is DiagnosticCleanupState.NOT_APPLICABLE
+    assert diagnostic.gate_executed is False
+    assert diagnostic.workspace_lifecycle is WorkspaceLifecycle.REMOVED
     assert not output.exists()
     assert not recording_path.exists()
     assert len(temporary_roots) == 1
     assert not temporary_roots[0].exists()
+
+
+@pytest.mark.parametrize(
+    (
+        "runner_state",
+        "invocation_state",
+        "cleanup_state",
+        "failure_stage",
+        "strict_evidence_possible",
+    ),
+    [
+        (
+            CodexRunnerState.NOT_STARTED,
+            CodexInvocationState.NOT_ATTEMPTED,
+            CodexCleanupState.NOT_APPLICABLE,
+            CodexFailureStage.PROVIDER_RUNNER_CONSTRUCTION,
+            True,
+        ),
+        (
+            CodexRunnerState.STARTED,
+            CodexInvocationState.NOT_ATTEMPTED,
+            CodexCleanupState.NOT_APPLICABLE,
+            CodexFailureStage.JSONL_PARSER_INITIALIZATION,
+            True,
+        ),
+        (
+            CodexRunnerState.STARTED,
+            CodexInvocationState.SPAWN_ATTEMPTED,
+            CodexCleanupState.NOT_APPLICABLE,
+            CodexFailureStage.CODEX_EVIDENCE_CONSTRUCTION,
+            True,
+        ),
+        (
+            CodexRunnerState.STARTED,
+            CodexInvocationState.PROCESS_STARTED,
+            CodexCleanupState.CLEARED,
+            CodexFailureStage.CODEX_EVIDENCE_CONSTRUCTION,
+            True,
+        ),
+        (
+            CodexRunnerState.STARTED,
+            CodexInvocationState.PROCESS_STARTED,
+            None,
+            CodexFailureStage.CODEX_EVIDENCE_CONSTRUCTION,
+            False,
+        ),
+        (
+            CodexRunnerState.STARTED,
+            CodexInvocationState.PROCESS_STARTED,
+            CodexCleanupState.FAILED,
+            CodexFailureStage.CODEX_EVIDENCE_CONSTRUCTION,
+            True,
+        ),
+    ],
+)
+def test_reachable_lifecycle_states_build_strict_evidence_or_truthful_diagnostic(
+    runner_state: CodexRunnerState,
+    invocation_state: CodexInvocationState,
+    cleanup_state: CodexCleanupState | None,
+    failure_stage: CodexFailureStage,
+    strict_evidence_possible: bool,
+) -> None:
+    preflight_result = codex_provider_module.CodexPreflight(
+        executable="not-persisted",
+        cli_version=_SUPPORTED_CODEX_VERSION,
+        cli_profile=CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2,
+        checked_at=datetime.now(UTC),
+        verified_flags=tuple(REQUIRED_CODEX_EXEC_FLAGS),
+    )
+    live = LiveSettings.model_validate(_base_spec()["live"])
+    lifecycle = codex_provider_module.CodexLifecycleTracker(
+        runner_state=runner_state,
+        invocation_state=invocation_state,
+        cleanup_state=cleanup_state,
+        failure_stage=failure_stage,
+    )
+    if cleanup_state is CodexCleanupState.FAILED:
+        lifecycle.termination = TerminationEvidence(
+            reason=TerminationReason.EMERGENCY_CLEANUP,
+            sigterm_sent=True,
+            sigkill_sent=True,
+            process_group_cleared=False,
+            error="fixed cleanup failure",
+        )
+
+    if strict_evidence_possible:
+        evidence = codex_provider_module.lifecycle_failure_evidence(
+            preflight_result,
+            live=live,
+            lifecycle=lifecycle,
+        )
+        assert evidence.schema_version == "1.3"
+        assert evidence.runner_state is runner_state
+        assert evidence.invocation_state is invocation_state
+        assert evidence.cleanup_state is cleanup_state
+    else:
+        with pytest.raises(RuntimeError, match="cleanup state was not observed"):
+            codex_provider_module.lifecycle_failure_evidence(
+                preflight_result,
+                live=live,
+                lifecycle=lifecycle,
+            )
+        diagnostic = live_module._diagnostic_from_lifecycle(
+            run_id="lifecycle-table-run",
+            experiment_id="lifecycle-table-experiment",
+            task_id="lifecycle-table-task",
+            diagnostic_code=(
+                LiveDiagnosticCode.LIFECYCLE_FALLBACK_EVIDENCE_VALIDATION_FAILED
+            ),
+            lifecycle=lifecycle,
+            workspace_lifecycle=WorkspaceLifecycle.REMOVED,
+            gate_executed=False,
+        )
+        assert diagnostic.invocation_state is DiagnosticInvocationState.PROCESS_STARTED
+        assert diagnostic.cleanup_state is DiagnosticCleanupState.UNKNOWN
+        assert (
+            diagnostic.provider_activity_determined
+            is ProviderActivityDetermination.UNKNOWN
+        )
+        assert diagnostic.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+
+
+def test_missing_lifecycle_observation_is_unknown_not_false() -> None:
+    diagnostic = live_module._diagnostic_from_lifecycle(
+        run_id="unknown-lifecycle-run",
+        experiment_id="unknown-lifecycle-experiment",
+        task_id="unknown-lifecycle-task",
+        diagnostic_code=LiveDiagnosticCode.CODEX_EVIDENCE_VALIDATION_FAILED,
+        lifecycle=None,
+        workspace_lifecycle=WorkspaceLifecycle.NOT_CREATED,
+        gate_executed=False,
+    )
+
+    assert diagnostic.runner_state is DiagnosticRunnerState.UNKNOWN
+    assert diagnostic.invocation_state is DiagnosticInvocationState.UNKNOWN
+    assert diagnostic.cleanup_state is DiagnosticCleanupState.UNKNOWN
+    assert diagnostic.failure_stage is DiagnosticFailureStage.UNKNOWN
+    assert (
+        diagnostic.provider_activity_determined
+        is ProviderActivityDetermination.UNKNOWN
+    )
+
+
+@pytest.mark.parametrize(
+    ("fault_target", "expected_code"),
+    [
+        (
+            "recording",
+            LiveDiagnosticCode.RECORDING_CONSTRUCTION_FAILED,
+        ),
+        (
+            "artifact",
+            LiveDiagnosticCode.LIVE_ARTIFACT_CONSTRUCTION_FAILED,
+        ),
+    ],
+)
+def test_strict_paired_construction_faults_have_distinct_diagnostic_codes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_target: str,
+    expected_code: LiveDiagnosticCode,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    codex_home = tmp_path / "managed-auth"
+    codex_home.mkdir()
+    environment = {
+        "PATH": str(tmp_path / "empty-path"),
+        "HOME": str(tmp_path / "home"),
+        "CODEX_HOME": str(codex_home),
+        "AGENTLAB_PARENT_SECRET": "diagnostic-parent-secret",
+    }
+
+    def fail_construction(*_args: object, **_kwargs: object) -> NoReturn:
+        raise RuntimeError("synthetic strict construction exception secret")
+
+    if fault_target == "recording":
+        monkeypatch.setattr(
+            "agentlab.live.live_recording_jsonl_bytes",
+            fail_construction,
+        )
+    else:
+        monkeypatch.setattr("agentlab.live.LiveRunArtifact", fail_construction)
+    monkeypatch.setattr(
+        "agentlab.live.execute_quality_gates_in_workspace",
+        lambda *_args, **_kwargs: pytest.fail("quality Gates must not run"),
+    )
+
+    with pytest.raises(LiveDiagnosticCreatedError) as raised:
+        _run(spec_path, output, environment)
+
+    diagnostic_path = _diagnostic_path(output)
+    diagnostic = load_failure_diagnostic(diagnostic_path)
+    recording_path = spec_path.parent / "recordings" / "live.jsonl"
+    assert raised.value.diagnostic_code is expected_code
+    assert diagnostic.diagnostic_code is expected_code
+    assert diagnostic.failure_stage is DiagnosticFailureStage.PREFLIGHT
+    assert diagnostic.runner_state is DiagnosticRunnerState.NOT_STARTED
+    assert diagnostic.invocation_state is DiagnosticInvocationState.NOT_ATTEMPTED
+    assert diagnostic.cleanup_state is DiagnosticCleanupState.NOT_APPLICABLE
+    assert diagnostic.workspace_lifecycle is WorkspaceLifecycle.NOT_CREATED
+    assert diagnostic.gate_executed is False
+    assert not output.exists()
+    assert not recording_path.exists()
+    persisted = diagnostic_path.read_bytes()
+    assert b"synthetic strict construction exception secret" not in persisted
+    assert b"diagnostic-parent-secret" not in persisted
+    assert str(tmp_path).encode() not in persisted
+
+
+def test_paired_publication_failure_creates_standalone_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    codex_home = tmp_path / "managed-auth"
+    codex_home.mkdir()
+    environment = {
+        "PATH": str(tmp_path / "empty-path"),
+        "HOME": str(tmp_path / "home"),
+        "CODEX_HOME": str(codex_home),
+    }
+
+    def fail_publication(**_kwargs: object) -> NoReturn:
+        raise LiveCodexError("synthetic paired publication exception secret")
+
+    monkeypatch.setattr("agentlab.live.write_live_outputs", fail_publication)
+
+    with pytest.raises(LiveDiagnosticCreatedError) as raised:
+        _run(spec_path, output, environment)
+
+    diagnostic = load_failure_diagnostic(_diagnostic_path(output))
+    assert (
+        raised.value.diagnostic_code
+        is LiveDiagnosticCode.PAIRED_OUTPUT_PUBLICATION_FAILED
+    )
+    assert (
+        diagnostic.diagnostic_code
+        is LiveDiagnosticCode.PAIRED_OUTPUT_PUBLICATION_FAILED
+    )
+    assert diagnostic.paired_artifacts_published is False
+    assert not output.exists()
+    assert not (spec_path.parent / "recordings" / "live.jsonl").exists()
+    assert (
+        b"synthetic paired publication exception secret"
+        not in _diagnostic_path(output).read_bytes()
+    )
+
+
+def test_spec_can_select_future_diagnostic_output_without_changing_paired_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    spec = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
+    spec["live"]["diagnostic_to"] = "diagnostics/selected.json"
+    spec_path.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
+    codex_home = tmp_path / "managed-auth"
+    codex_home.mkdir()
+    environment = {
+        "PATH": str(tmp_path / "empty-path"),
+        "HOME": str(tmp_path / "home"),
+        "CODEX_HOME": str(codex_home),
+    }
+
+    def fail_recording(*_args: object, **_kwargs: object) -> NoReturn:
+        raise RuntimeError("synthetic selected diagnostic failure")
+
+    monkeypatch.setattr(
+        "agentlab.live.live_recording_jsonl_bytes",
+        fail_recording,
+    )
+
+    with pytest.raises(LiveDiagnosticCreatedError):
+        _run(spec_path, output, environment)
+
+    selected = spec_path.parent / "diagnostics" / "selected.json"
+    assert load_failure_diagnostic(selected).diagnostic_code is (
+        LiveDiagnosticCode.RECORDING_CONSTRUCTION_FAILED
+    )
+    assert not _diagnostic_path(output).exists()
 
 
 @pytest.mark.parametrize(
@@ -2073,6 +2519,73 @@ def test_paired_writer_rolls_back_recording_when_evidence_publish_fails(
     assert not outcome.recording_path.exists()
     assert not output.exists()
     assert list(outcome.recording_path.parent.iterdir()) == []
+
+
+def test_failure_diagnostic_writer_is_atomic_and_refuses_overwrite(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "diagnostics" / "failure.json"
+    diagnostic = _sample_diagnostic()
+
+    write_failure_diagnostic(diagnostic, path)
+    original = path.read_bytes()
+
+    assert load_failure_diagnostic(path) == diagnostic
+    assert list(path.parent.iterdir()) == [path]
+    with pytest.raises(LiveDiagnosticPublicationError) as raised:
+        write_failure_diagnostic(diagnostic, path)
+    assert (
+        raised.value.diagnostic_code
+        is LiveDiagnosticCode.DIAGNOSTIC_PUBLICATION_FAILED
+    )
+    assert path.read_bytes() == original
+    assert list(path.parent.iterdir()) == [path]
+
+
+def test_existing_failure_diagnostic_blocks_live_even_with_force(
+    tmp_path: Path,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, inspection = _fake_codex(tmp_path, live_code=_success_code())
+    path = _diagnostic_path(output)
+    write_failure_diagnostic(_sample_diagnostic(), path)
+    original = path.read_bytes()
+
+    with pytest.raises(LiveCodexError, match="Diagnostic output already exists"):
+        _run(spec_path, output, environment, force=True)
+
+    assert path.read_bytes() == original
+    assert not output.exists()
+    assert not (spec_path.parent / "recordings" / "live.jsonl").exists()
+    assert not inspection.exists()
+
+
+@pytest.mark.parametrize("fault", ["link", "fsync"])
+def test_failure_diagnostic_publication_failure_removes_temporary_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    path = tmp_path / "diagnostics" / "failure.json"
+    diagnostic = _sample_diagnostic()
+
+    def fail(*_args: object, **_kwargs: object) -> NoReturn:
+        raise OSError("synthetic diagnostic publication exception secret")
+
+    monkeypatch.setattr(
+        "agentlab.live.os.link" if fault == "link" else "agentlab.live.os.fsync",
+        fail,
+    )
+
+    with pytest.raises(LiveDiagnosticPublicationError) as raised:
+        write_failure_diagnostic(diagnostic, path)
+
+    assert (
+        raised.value.diagnostic_code
+        is LiveDiagnosticCode.DIAGNOSTIC_PUBLICATION_FAILED
+    )
+    assert not path.exists()
+    assert list(path.parent.iterdir()) == []
 
 
 def test_force_paired_writer_restores_original_recording_on_publish_failure(

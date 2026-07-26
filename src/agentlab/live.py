@@ -12,7 +12,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 from pydantic import ValidationError
 
@@ -35,16 +35,23 @@ from agentlab.models import (
     CodexFailureStage,
     CommandEvidence,
     CommandStatus,
+    DiagnosticCleanupState,
+    DiagnosticFailureStage,
+    DiagnosticInvocationState,
+    DiagnosticRunnerState,
     DiffEvidence,
     ExecutionMode,
     ExperimentSpec,
     GateKind,
     GateKindSummary,
+    LiveDiagnosticCode,
     LiveEvaluationSummary,
+    LiveFailureDiagnostic,
     LiveFailureKind,
     LiveOverallStatus,
     LiveRunArtifact,
     Provider,
+    ProviderActivityDetermination,
     ProviderExecutionStatus,
     RunMetrics,
     Workflow,
@@ -54,7 +61,6 @@ from agentlab.recording import (
     LiveRunCompletedEvent,
     LiveRunFailedEvent,
     LiveRunStartedEvent,
-    RecordingLoadError,
     live_recording_jsonl_bytes,
 )
 from agentlab.runner import UnsupportedRunnerPlatformError
@@ -93,6 +99,56 @@ class LiveCodexError(ValueError):
 
 class LiveArtifactLoadError(ValueError):
     """A persisted Live Artifact is not strict UTF-8 JSON matching its contract."""
+
+
+class LiveDiagnosticLoadError(ValueError):
+    """A Failure Diagnostic is not strict UTF-8 JSON matching its contract."""
+
+
+class LiveDiagnosticPublicationError(LiveCodexError):
+    """A safe fixed-code failure while publishing a Failure Diagnostic."""
+
+    def __init__(
+        self,
+        *,
+        workspace_lifecycle: WorkspaceLifecycle,
+    ) -> None:
+        super().__init__(
+            "Live failure diagnostic publication failed",
+            workspace_lifecycle=workspace_lifecycle,
+        )
+        self.diagnostic_code = LiveDiagnosticCode.DIAGNOSTIC_PUBLICATION_FAILED
+        self.diagnostic_published = False
+
+
+class LiveDiagnosticCreatedError(LiveCodexError):
+    """Strict paired outputs were withheld and a safe Diagnostic was published."""
+
+    def __init__(
+        self,
+        diagnostic_code: LiveDiagnosticCode,
+        *,
+        workspace_lifecycle: WorkspaceLifecycle,
+    ) -> None:
+        super().__init__(
+            f"strict Live outputs were withheld; diagnostic={diagnostic_code.value}",
+            workspace_lifecycle=workspace_lifecycle,
+        )
+        self.diagnostic_code = diagnostic_code
+        self.diagnostic_published = True
+
+
+class _StrictConstructionFailure(Exception):
+    """Internal fixed-code signal; never persist its exception cause."""
+
+    def __init__(
+        self,
+        diagnostic_code: LiveDiagnosticCode,
+        lifecycle: CodexLifecycleTracker,
+    ) -> None:
+        super().__init__(diagnostic_code.value)
+        self.diagnostic_code = diagnostic_code
+        self.lifecycle = lifecycle
 
 
 @dataclass(frozen=True)
@@ -147,6 +203,33 @@ def load_live_artifact(path: Path) -> LiveRunArtifact:
         return LiveRunArtifact.model_validate(raw)
     except ValidationError as error:
         raise LiveArtifactLoadError(f"{path}: invalid Live Evidence: {error}") from error
+
+
+def load_failure_diagnostic(path: Path) -> LiveFailureDiagnostic:
+    """Read one strict standalone Failure Diagnostic."""
+    try:
+        text = path.read_bytes().decode("utf-8")
+        raw = json.loads(
+            text,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_non_finite,
+        )
+    except _DuplicateKeyError as error:
+        raise LiveDiagnosticLoadError(f"{path}: duplicate JSON key {error}") from error
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise LiveDiagnosticLoadError(
+            f"{path}: could not read strict Failure Diagnostic JSON"
+        ) from error
+    if not isinstance(raw, dict):
+        raise LiveDiagnosticLoadError(
+            f"{path}: Failure Diagnostic must be a JSON object"
+        )
+    try:
+        return LiveFailureDiagnostic.model_validate(raw)
+    except ValidationError as error:
+        raise LiveDiagnosticLoadError(
+            f"{path}: invalid Failure Diagnostic"
+        ) from error
 
 
 def _resolve_relative_path(spec_path: Path, configured_path: str) -> Path:
@@ -309,21 +392,40 @@ def protect_live_inputs(
     fixture_snapshot: DirectorySnapshot,
     recording_path: Path,
     output_path: Path,
+    diagnostic_path: Path | None = None,
 ) -> None:
-    """Protect Spec, Prompt, Fixture, and the two outputs from aliasing."""
+    """Protect inputs and all configured outputs from aliasing."""
     _ensure_existing_components_are_not_symlinks(recording_path, "Recording output")
     _ensure_existing_components_are_not_symlinks(output_path, "Evidence output")
     _ensure_output_is_not_symlink(recording_path, "Recording output")
     _ensure_output_is_not_symlink(output_path, "Evidence output")
+    if diagnostic_path is not None:
+        _ensure_existing_components_are_not_symlinks(
+            diagnostic_path,
+            "Failure Diagnostic output",
+        )
+        _ensure_output_is_not_symlink(
+            diagnostic_path,
+            "Failure Diagnostic output",
+        )
     if paths_refer_to_same_file(recording_path, output_path):
         raise LiveCodexError("Recording and Evidence outputs must be different files")
+    if diagnostic_path is not None and (
+        paths_refer_to_same_file(diagnostic_path, recording_path)
+        or paths_refer_to_same_file(diagnostic_path, output_path)
+    ):
+        raise LiveCodexError(
+            "Failure Diagnostic, Recording, and Evidence outputs must be different files"
+        )
 
     try:
         resolved_fixture = fixture_source.resolve(strict=True)
-        resolved_outputs = (
+        resolved_outputs = [
             recording_path.resolve(strict=False),
             output_path.resolve(strict=False),
-        )
+        ]
+        if diagnostic_path is not None:
+            resolved_outputs.append(diagnostic_path.resolve(strict=False))
     except (OSError, RuntimeError) as error:
         raise LiveCodexError(
             f"could not resolve Live output paths: {type(error).__name__}"
@@ -342,15 +444,150 @@ def protect_live_inputs(
         ("Fixture source", fixture_source / relative)
         for relative in fixture_snapshot.files
     )
-    for output_label, output in (
+    outputs: list[tuple[str, Path]] = [
         ("Recording", recording_path),
         ("Evidence", output_path),
-    ):
+    ]
+    if diagnostic_path is not None:
+        outputs.append(("Failure Diagnostic", diagnostic_path))
+    for output_label, output in outputs:
         for input_label, input_path in protected_inputs:
             if paths_refer_to_same_file(output, input_path):
                 raise LiveCodexError(
                     f"{output_label} output must not overwrite or alias {input_label}"
                 )
+
+
+def _resolve_diagnostic_path(
+    *,
+    spec_path: Path,
+    spec: ExperimentSpec,
+    output_path: Path,
+) -> Path:
+    assert spec.live is not None
+    if spec.live.diagnostic_to is not None:
+        return _reject_symlink_components(
+            spec_path,
+            spec.live.diagnostic_to,
+            label="Failure Diagnostic output",
+        )
+    suffix = output_path.suffix or ".json"
+    return output_path.with_name(f"{output_path.stem}.diagnostic{suffix}")
+
+
+def _diagnostic_from_lifecycle(
+    *,
+    run_id: str,
+    experiment_id: str,
+    task_id: str,
+    diagnostic_code: LiveDiagnosticCode,
+    lifecycle: CodexLifecycleTracker | None,
+    workspace_lifecycle: WorkspaceLifecycle,
+    gate_executed: bool,
+) -> LiveFailureDiagnostic:
+    if lifecycle is None:
+        runner_state = DiagnosticRunnerState.UNKNOWN
+        invocation_state = DiagnosticInvocationState.UNKNOWN
+        cleanup_state = DiagnosticCleanupState.UNKNOWN
+        failure_stage = DiagnosticFailureStage.UNKNOWN
+    else:
+        try:
+            runner_state = DiagnosticRunnerState(lifecycle.runner_state.value)
+        except (AttributeError, ValueError):
+            runner_state = DiagnosticRunnerState.UNKNOWN
+        try:
+            invocation_state = DiagnosticInvocationState(
+                lifecycle.invocation_state.value
+            )
+        except (AttributeError, ValueError):
+            invocation_state = DiagnosticInvocationState.UNKNOWN
+        try:
+            cleanup_state = (
+                DiagnosticCleanupState.UNKNOWN
+                if lifecycle.cleanup_state is None
+                else DiagnosticCleanupState(lifecycle.cleanup_state.value)
+            )
+        except (AttributeError, ValueError):
+            cleanup_state = DiagnosticCleanupState.UNKNOWN
+        try:
+            failure_stage = DiagnosticFailureStage(lifecycle.failure_stage.value)
+        except (AttributeError, ValueError):
+            failure_stage = DiagnosticFailureStage.UNKNOWN
+
+    determination = (
+        ProviderActivityDetermination.UNKNOWN
+        if "unknown"
+        in {
+            runner_state.value,
+            invocation_state.value,
+            cleanup_state.value,
+            failure_stage.value,
+        }
+        else ProviderActivityDetermination.DETERMINED
+    )
+    failure_kind: Literal[
+        LiveFailureKind.EVIDENCE_ERROR,
+        LiveFailureKind.PROCESS_CLEANUP_ERROR,
+    ] = (
+        LiveFailureKind.PROCESS_CLEANUP_ERROR
+        if cleanup_state is DiagnosticCleanupState.FAILED
+        else LiveFailureKind.EVIDENCE_ERROR
+    )
+    return LiveFailureDiagnostic(
+        schema_version="1.0",
+        run_id=run_id,
+        experiment_id=experiment_id,
+        task_id=task_id,
+        failure_kind=failure_kind,
+        diagnostic_code=diagnostic_code,
+        failure_stage=failure_stage,
+        runner_state=runner_state,
+        invocation_state=invocation_state,
+        cleanup_state=cleanup_state,
+        workspace_lifecycle=workspace_lifecycle,
+        paired_artifacts_published=False,
+        gate_executed=gate_executed,
+        provider_activity_determined=determination,
+        created_at=datetime.now(UTC),
+    )
+
+
+def _publish_failure_diagnostic_and_raise(
+    *,
+    diagnostic_path: Path,
+    recording_path: Path,
+    output_path: Path,
+    run_id: str,
+    experiment_id: str,
+    task_id: str,
+    diagnostic_code: LiveDiagnosticCode,
+    lifecycle: CodexLifecycleTracker | None,
+    workspace_lifecycle: WorkspaceLifecycle,
+    gate_executed: bool,
+) -> NoReturn:
+    if os.path.lexists(recording_path) or os.path.lexists(output_path):
+        raise LiveDiagnosticPublicationError(
+            workspace_lifecycle=workspace_lifecycle,
+        )
+    try:
+        diagnostic = _diagnostic_from_lifecycle(
+            run_id=run_id,
+            experiment_id=experiment_id,
+            task_id=task_id,
+            diagnostic_code=diagnostic_code,
+            lifecycle=lifecycle,
+            workspace_lifecycle=workspace_lifecycle,
+            gate_executed=gate_executed,
+        )
+    except Exception as error:
+        raise LiveDiagnosticPublicationError(
+            workspace_lifecycle=workspace_lifecycle,
+        ) from error
+    write_failure_diagnostic(diagnostic, diagnostic_path)
+    raise LiveDiagnosticCreatedError(
+        diagnostic_code,
+        workspace_lifecycle=workspace_lifecycle,
+    )
 
 
 def _json_bytes(artifact: LiveRunArtifact) -> bytes:
@@ -365,6 +602,22 @@ def _json_bytes(artifact: LiveRunArtifact) -> bytes:
     except ValueError as error:
         raise LiveCodexError(
             f"Live Evidence contains a non-finite number: {error}"
+        ) from error
+    return f"{payload}\n".encode()
+
+
+def _diagnostic_json_bytes(diagnostic: LiveFailureDiagnostic) -> bytes:
+    try:
+        payload = json.dumps(
+            diagnostic.model_dump(mode="json"),
+            allow_nan=False,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    except ValueError as error:
+        raise LiveCodexError(
+            "Failure Diagnostic contains a non-finite number"
         ) from error
     return f"{payload}\n".encode()
 
@@ -391,6 +644,37 @@ def _stage_bytes(path: Path, content: bytes) -> Path:
         raise LiveCodexError(
             f"could not stage Live output: {type(error).__name__}"
         ) from error
+
+
+def write_failure_diagnostic(
+    diagnostic: LiveFailureDiagnostic,
+    path: Path,
+) -> None:
+    """Atomically create one standalone Diagnostic without replacing any file."""
+    temporary_path: Path | None = None
+    try:
+        _ensure_existing_components_are_not_symlinks(
+            path,
+            "Failure Diagnostic output",
+        )
+        _ensure_output_is_not_symlink(path, "Failure Diagnostic output")
+        if os.path.lexists(path):
+            raise FileExistsError
+        temporary_path = _stage_bytes(path, _diagnostic_json_bytes(diagnostic))
+        os.link(temporary_path, path)
+    except Exception as error:
+        if temporary_path is not None:
+            with suppress(OSError):
+                temporary_path.unlink(missing_ok=True)
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise LiveDiagnosticPublicationError(
+            workspace_lifecycle=diagnostic.workspace_lifecycle,
+        ) from error
+    finally:
+        if temporary_path is not None:
+            with suppress(OSError):
+                temporary_path.unlink(missing_ok=True)
 
 
 def _backup_existing(path: Path) -> Path | None:
@@ -435,7 +719,6 @@ def write_live_outputs(
                 raise LiveCodexError(
                     f"{label} output already exists: {path}; use --force to overwrite"
                 )
-
     recording_temporary: Path | None = None
     evidence_temporary: Path | None = None
     recording_backup: Path | None = None
@@ -608,96 +891,105 @@ def _recording_and_artifact(
     evaluation_duration_ms: int,
     overall_status: LiveOverallStatus,
     failure_kind: LiveFailureKind,
+    lifecycle: CodexLifecycleTracker,
 ) -> tuple[bytes, LiveRunArtifact]:
     spec = loaded_spec.spec
     assert spec.live is not None
     assert spec.runner is not None
     assert spec.live.model is not None
     assert spec.live.reasoning_effort is not None
-    evaluation = _evaluation_summary(
-        commands,
-        diff,
-        evaluation_duration_ms=evaluation_duration_ms,
-        workspace_lifecycle=workspace_lifecycle,
-    )
-    started_event = LiveRunStartedEvent(
-        schema_version="1.1",
-        sequence=0,
-        event_type="run_started",
-        run_id=run_id,
-        experiment_id=spec.experiment_id,
-        task_id=task_id,
-        workflow=Workflow.ONE_SHOT,
-        provider=Provider.CODEX,
-        repetition_index=repetition_index,
-        execution_mode=ExecutionMode.LIVE,
-        occurred_at=started_at,
-        prompt_sha256=prompt.sha256,
-        prompt_bytes=prompt.byte_count,
-        prompt_redacted=True,
-        requested_model=spec.live.model,
-        requested_reasoning_effort=spec.live.reasoning_effort,
-        cli_version=codex.cli_version,
-    )
-    if metrics is not None:
-        terminal: LiveRunCompletedEvent | LiveRunFailedEvent = LiveRunCompletedEvent(
-            schema_version="1.1",
-            sequence=1,
-            event_type="run_completed",
-            run_id=run_id,
-            experiment_id=spec.experiment_id,
-            occurred_at=completed_at,
-            metrics=metrics,
-            codex=codex,
-            evaluation=evaluation,
-        )
-    else:
-        terminal = LiveRunFailedEvent(
-            schema_version="1.1",
-            sequence=1,
-            event_type="run_failed",
-            run_id=run_id,
-            experiment_id=spec.experiment_id,
-            occurred_at=completed_at,
-            failure_kind=failure_kind,
-            codex=codex,
-            evaluation=evaluation,
-            metrics_included=False,
-        )
     try:
-        recording_bytes = live_recording_jsonl_bytes(started_event, terminal)
-    except RecordingLoadError as error:
-        raise LiveCodexError(
-            str(error),
+        evaluation = _evaluation_summary(
+            commands,
+            diff,
+            evaluation_duration_ms=evaluation_duration_ms,
             workspace_lifecycle=workspace_lifecycle,
+        )
+        started_event = LiveRunStartedEvent(
+            schema_version="1.1",
+            sequence=0,
+            event_type="run_started",
+            run_id=run_id,
+            experiment_id=spec.experiment_id,
+            task_id=task_id,
+            workflow=Workflow.ONE_SHOT,
+            provider=Provider.CODEX,
+            repetition_index=repetition_index,
+            execution_mode=ExecutionMode.LIVE,
+            occurred_at=started_at,
+            prompt_sha256=prompt.sha256,
+            prompt_bytes=prompt.byte_count,
+            prompt_redacted=True,
+            requested_model=spec.live.model,
+            requested_reasoning_effort=spec.live.reasoning_effort,
+            cli_version=codex.cli_version,
+        )
+        if metrics is not None:
+            terminal: LiveRunCompletedEvent | LiveRunFailedEvent = (
+                LiveRunCompletedEvent(
+                    schema_version="1.1",
+                    sequence=1,
+                    event_type="run_completed",
+                    run_id=run_id,
+                    experiment_id=spec.experiment_id,
+                    occurred_at=completed_at,
+                    metrics=metrics,
+                    codex=codex,
+                    evaluation=evaluation,
+                )
+            )
+        else:
+            terminal = LiveRunFailedEvent(
+                schema_version="1.1",
+                sequence=1,
+                event_type="run_failed",
+                run_id=run_id,
+                experiment_id=spec.experiment_id,
+                occurred_at=completed_at,
+                failure_kind=failure_kind,
+                codex=codex,
+                evaluation=evaluation,
+                metrics_included=False,
+            )
+        recording_bytes = live_recording_jsonl_bytes(started_event, terminal)
+    except Exception as error:
+        raise _StrictConstructionFailure(
+            LiveDiagnosticCode.RECORDING_CONSTRUCTION_FAILED,
+            lifecycle,
         ) from error
-    artifact = LiveRunArtifact(
-        schema_version="1.0",
-        run_id=run_id,
-        experiment_id=spec.experiment_id,
-        task_id=task_id,
-        repetition_index=repetition_index,
-        workflow=Workflow.ONE_SHOT,
-        provider=Provider.CODEX,
-        execution_mode=ExecutionMode.LIVE,
-        overall_status=overall_status,
-        failure_kind=failure_kind,
-        started_at=started_at,
-        completed_at=completed_at,
-        spec_sha256=loaded_spec.sha256,
-        fixture_sha256=source_snapshot.sha256,
-        prompt_sha256=prompt.sha256,
-        prompt_bytes=prompt.byte_count,
-        prompt_redacted=True,
-        runner=spec.runner,
-        codex=codex,
-        gate_commands=commands,
-        diff=diff,
-        metrics=metrics,
-        workspace_lifecycle=workspace_lifecycle,
-        recording_sha256=hashlib.sha256(recording_bytes).hexdigest(),
-        raw_provider_output_persisted=False,
-    )
+    try:
+        artifact = LiveRunArtifact(
+            schema_version="1.0",
+            run_id=run_id,
+            experiment_id=spec.experiment_id,
+            task_id=task_id,
+            repetition_index=repetition_index,
+            workflow=Workflow.ONE_SHOT,
+            provider=Provider.CODEX,
+            execution_mode=ExecutionMode.LIVE,
+            overall_status=overall_status,
+            failure_kind=failure_kind,
+            started_at=started_at,
+            completed_at=completed_at,
+            spec_sha256=loaded_spec.sha256,
+            fixture_sha256=source_snapshot.sha256,
+            prompt_sha256=prompt.sha256,
+            prompt_bytes=prompt.byte_count,
+            prompt_redacted=True,
+            runner=spec.runner,
+            codex=codex,
+            gate_commands=commands,
+            diff=diff,
+            metrics=metrics,
+            workspace_lifecycle=workspace_lifecycle,
+            recording_sha256=hashlib.sha256(recording_bytes).hexdigest(),
+            raw_provider_output_persisted=False,
+        )
+    except Exception as error:
+        raise _StrictConstructionFailure(
+            LiveDiagnosticCode.LIVE_ARTIFACT_CONSTRUCTION_FAILED,
+            lifecycle,
+        ) from error
     return recording_bytes, artifact
 
 
@@ -719,8 +1011,24 @@ def _strict_lifecycle_failure_evidence(
             lifecycle=lifecycle,
         )
     except Exception as error:
-        raise LiveCodexError(
-            "could not construct strict Codex lifecycle failure Evidence"
+        raise _StrictConstructionFailure(
+            LiveDiagnosticCode.LIFECYCLE_FALLBACK_EVIDENCE_VALIDATION_FAILED,
+            lifecycle,
+        ) from error
+
+
+def _strict_codex_evidence(
+    build: Callable[[], CodexExecutionEvidence],
+    *,
+    lifecycle: CodexLifecycleTracker,
+) -> CodexExecutionEvidence:
+    try:
+        return build()
+    except Exception as error:
+        lifecycle.failure_stage = CodexFailureStage.CODEX_EVIDENCE_CONSTRUCTION
+        raise _StrictConstructionFailure(
+            LiveDiagnosticCode.CODEX_EVIDENCE_VALIDATION_FAILED,
+            lifecycle,
         ) from error
 
 
@@ -757,11 +1065,14 @@ def run_live_codex(
     assert spec.runner is not None
     assert spec.live.prompt_path is not None
     assert spec.live.max_prompt_bytes is not None
+    live = spec.live
+    assert live.prompt_path is not None
+    assert live.max_prompt_bytes is not None
 
     prompt = load_prompt(
         spec_path,
-        spec.live.prompt_path,
-        max_prompt_bytes=spec.live.max_prompt_bytes,
+        live.prompt_path,
+        max_prompt_bytes=live.max_prompt_bytes,
     )
     try:
         source, source_snapshot = validate_fixture_source(
@@ -772,8 +1083,13 @@ def run_live_codex(
         raise LiveCodexError(str(error)) from error
     recording_path = _reject_symlink_components(
         spec_path,
-        spec.live.record_to,
+        live.record_to,
         label="Recording output",
+    )
+    diagnostic_path = _resolve_diagnostic_path(
+        spec_path=spec_path,
+        spec=spec,
+        output_path=output_path,
     )
     protect_live_inputs(
         spec_path=spec_path,
@@ -782,6 +1098,7 @@ def run_live_codex(
         fixture_snapshot=source_snapshot,
         recording_path=recording_path,
         output_path=output_path,
+        diagnostic_path=diagnostic_path,
     )
     if not force:
         for label, path in (("Recording", recording_path), ("Evidence", output_path)):
@@ -789,6 +1106,10 @@ def run_live_codex(
                 raise LiveCodexError(
                     f"{label} output already exists: {path}; use --force to overwrite"
                 )
+    if os.path.lexists(diagnostic_path):
+        raise LiveCodexError(
+            "Failure Diagnostic output already exists; choose a new output set"
+        )
 
     parent = os.environ if parent_environment is None else parent_environment
     try:
@@ -796,16 +1117,34 @@ def run_live_codex(
     except ValueError as error:
         raise LiveCodexError(str(error)) from error
 
+    lifecycle = CodexLifecycleTracker()
+    lifecycle.failure_stage = CodexFailureStage.PREFLIGHT
     started_at = datetime.now(UTC)
     try:
         preflight_result = preflight(parent_environment=parent_environment)
     except CodexPreflightError as error:
+        preflight_error = error
         try:
-            preflight_codex_evidence = preflight_failure_evidence(error, live=spec.live)
-        except ValidationError as validation_error:
-            raise LiveCodexError(
-                "could not construct strict Codex preflight Evidence"
-            ) from validation_error
+            preflight_codex_evidence = _strict_codex_evidence(
+                lambda: preflight_failure_evidence(
+                    preflight_error,
+                    live=live,
+                ),
+                lifecycle=lifecycle,
+            )
+        except _StrictConstructionFailure as failure:
+            _publish_failure_diagnostic_and_raise(
+                diagnostic_path=diagnostic_path,
+                recording_path=recording_path,
+                output_path=output_path,
+                run_id=run_id,
+                experiment_id=spec.experiment_id,
+                task_id=task_id,
+                diagnostic_code=failure.diagnostic_code,
+                lifecycle=failure.lifecycle,
+                workspace_lifecycle=WorkspaceLifecycle.NOT_CREATED,
+                gate_executed=False,
+            )
         diff = _empty_diff(
             source_snapshot,
             max_diff_bytes=spec.runner.max_diff_bytes,
@@ -838,12 +1177,21 @@ def run_live_codex(
                     else LiveOverallStatus.PROVIDER_ERROR
                 ),
                 failure_kind=error.failure_kind,
+                lifecycle=lifecycle,
             )
-        except ValidationError as validation_error:
-            raise LiveCodexError(
-                "could not construct strict Live failure Evidence",
+        except _StrictConstructionFailure as failure:
+            _publish_failure_diagnostic_and_raise(
+                diagnostic_path=diagnostic_path,
+                recording_path=recording_path,
+                output_path=output_path,
+                run_id=run_id,
+                experiment_id=spec.experiment_id,
+                task_id=task_id,
+                diagnostic_code=failure.diagnostic_code,
+                lifecycle=failure.lifecycle,
                 workspace_lifecycle=WorkspaceLifecycle.NOT_CREATED,
-            ) from validation_error
+                gate_executed=False,
+            )
         protect_live_inputs(
             spec_path=spec_path,
             prompt_path=prompt.path,
@@ -851,14 +1199,31 @@ def run_live_codex(
             fixture_snapshot=source_snapshot,
             recording_path=recording_path,
             output_path=output_path,
+            diagnostic_path=diagnostic_path,
         )
-        write_live_outputs(
-            recording_bytes=recording_bytes,
-            artifact=artifact,
-            recording_path=recording_path,
-            output_path=output_path,
-            force=force,
-        )
+        try:
+            write_live_outputs(
+                recording_bytes=recording_bytes,
+                artifact=artifact,
+                recording_path=recording_path,
+                output_path=output_path,
+                force=force,
+            )
+        except LiveCodexError:
+            _publish_failure_diagnostic_and_raise(
+                diagnostic_path=diagnostic_path,
+                recording_path=recording_path,
+                output_path=output_path,
+                run_id=run_id,
+                experiment_id=spec.experiment_id,
+                task_id=task_id,
+                diagnostic_code=(
+                    LiveDiagnosticCode.PAIRED_OUTPUT_PUBLICATION_FAILED
+                ),
+                lifecycle=lifecycle,
+                workspace_lifecycle=WorkspaceLifecycle.NOT_CREATED,
+                gate_executed=False,
+            )
         return LiveCodexOutcome(artifact, recording_path, output_path)
 
     commands: list[CommandEvidence] = []
@@ -870,7 +1235,8 @@ def run_live_codex(
     gate_result: GateExecutionResult | None = None
     codex: CodexExecutionEvidence | None = None
     failure_kind: LiveFailureKind | None = None
-    lifecycle = CodexLifecycleTracker()
+    lifecycle.failure_stage = CodexFailureStage.WORKSPACE_PREPARATION
+    diagnostic_failure: _StrictConstructionFailure | None = None
     try:
         workspace = prepare_disposable_workspace(source, source_snapshot)
         try:
@@ -879,12 +1245,18 @@ def run_live_codex(
                 "provider",
             )
         except Exception:
-            codex = post_preflight_failure_evidence(
-                preflight_result,
-                live=spec.live,
-                failure_stage=(
-                    CodexFailureStage.PROVIDER_ENVIRONMENT_DIRECTORY_PREPARATION
+            lifecycle.failure_stage = (
+                CodexFailureStage.PROVIDER_ENVIRONMENT_DIRECTORY_PREPARATION
+            )
+            codex = _strict_codex_evidence(
+                lambda: post_preflight_failure_evidence(
+                    preflight_result,
+                    live=live,
+                    failure_stage=(
+                        CodexFailureStage.PROVIDER_ENVIRONMENT_DIRECTORY_PREPARATION
+                    ),
                 ),
+                lifecycle=lifecycle,
             )
         else:
             try:
@@ -909,12 +1281,24 @@ def run_live_codex(
                 )
                 codex = codex_result.evidence
             except UnsupportedRunnerPlatformError as error:
-                codex = unsupported_platform_evidence(
-                    error,
-                    preflight=preflight_result,
-                    live=spec.live,
+                platform_error = error
+                codex = _strict_codex_evidence(
+                    lambda: unsupported_platform_evidence(
+                        platform_error,
+                        preflight=preflight_result,
+                        live=live,
+                    ),
+                    lifecycle=lifecycle,
                 )
             except CodexRunnerError as error:
+                if (
+                    error.lifecycle.failure_stage
+                    is CodexFailureStage.CODEX_EVIDENCE_CONSTRUCTION
+                ):
+                    raise _StrictConstructionFailure(
+                        LiveDiagnosticCode.CODEX_EVIDENCE_VALIDATION_FAILED,
+                        error.lifecycle,
+                    ) from error
                 codex = _strict_lifecycle_failure_evidence(
                     preflight_result,
                     spec=spec,
@@ -949,26 +1333,38 @@ def run_live_codex(
         except SnapshotError:
             diff = incomplete_diff_evidence("Live diff collection failed")
             failure_kind = LiveFailureKind.EVIDENCE_ERROR
+    except _StrictConstructionFailure as error:
+        diagnostic_failure = error
     except WorkspaceError as error:
         workspace_lifecycle = error.lifecycle or WorkspaceLifecycle.NOT_CREATED
         failure_kind = LiveFailureKind.EVIDENCE_ERROR
         if codex is None:
-            codex = post_preflight_failure_evidence(
-                preflight_result,
-                live=spec.live,
-                failure_stage=CodexFailureStage.WORKSPACE_PREPARATION,
-            )
+            lifecycle.failure_stage = CodexFailureStage.WORKSPACE_PREPARATION
+            try:
+                codex = _strict_codex_evidence(
+                    lambda: post_preflight_failure_evidence(
+                        preflight_result,
+                        live=live,
+                        failure_stage=CodexFailureStage.WORKSPACE_PREPARATION,
+                    ),
+                    lifecycle=lifecycle,
+                )
+            except _StrictConstructionFailure as construction_error:
+                diagnostic_failure = construction_error
     except LiveCodexError:
         raise
     except Exception:
         failure_kind = LiveFailureKind.EVIDENCE_ERROR
         if codex is None:
             lifecycle.failure_stage = CodexFailureStage.PROVIDER_ORCHESTRATION
-            codex = _strict_lifecycle_failure_evidence(
-                preflight_result,
-                spec=spec,
-                lifecycle=lifecycle,
-            )
+            try:
+                codex = _strict_lifecycle_failure_evidence(
+                    preflight_result,
+                    spec=spec,
+                    lifecycle=lifecycle,
+                )
+            except _StrictConstructionFailure as construction_error:
+                diagnostic_failure = construction_error
     finally:
         if workspace is not None:
             workspace_removed, _cleanup_error = remove_disposable_workspace(workspace)
@@ -977,6 +1373,20 @@ def run_live_codex(
                 if workspace_removed
                 else WorkspaceLifecycle.CLEANUP_FAILED
             )
+
+    if diagnostic_failure is not None:
+        _publish_failure_diagnostic_and_raise(
+            diagnostic_path=diagnostic_path,
+            recording_path=recording_path,
+            output_path=output_path,
+            run_id=run_id,
+            experiment_id=spec.experiment_id,
+            task_id=task_id,
+            diagnostic_code=diagnostic_failure.diagnostic_code,
+            lifecycle=diagnostic_failure.lifecycle,
+            workspace_lifecycle=workspace_lifecycle,
+            gate_executed=gate_result is not None,
+        )
 
     assert codex is not None
     provider_cleanup_failed = (
@@ -1063,12 +1473,21 @@ def run_live_codex(
             evaluation_duration_ms=evaluation_duration_ms,
             overall_status=overall_status,
             failure_kind=final_failure,
+            lifecycle=lifecycle,
         )
-    except ValidationError as error:
-        raise LiveCodexError(
-            "could not construct strict Live Evidence",
+    except _StrictConstructionFailure as construction_error:
+        _publish_failure_diagnostic_and_raise(
+            diagnostic_path=diagnostic_path,
+            recording_path=recording_path,
+            output_path=output_path,
+            run_id=run_id,
+            experiment_id=spec.experiment_id,
+            task_id=task_id,
+            diagnostic_code=construction_error.diagnostic_code,
+            lifecycle=construction_error.lifecycle,
             workspace_lifecycle=workspace_lifecycle,
-        ) from error
+            gate_executed=gate_result is not None,
+        )
     protect_live_inputs(
         spec_path=spec_path,
         prompt_path=prompt.path,
@@ -1076,6 +1495,7 @@ def run_live_codex(
         fixture_snapshot=source_snapshot,
         recording_path=recording_path,
         output_path=output_path,
+        diagnostic_path=diagnostic_path,
     )
     try:
         write_live_outputs(
@@ -1085,9 +1505,17 @@ def run_live_codex(
             output_path=output_path,
             force=force,
         )
-    except LiveCodexError as error:
-        raise LiveCodexError(
-            str(error),
+    except LiveCodexError:
+        _publish_failure_diagnostic_and_raise(
+            diagnostic_path=diagnostic_path,
+            recording_path=recording_path,
+            output_path=output_path,
+            run_id=run_id,
+            experiment_id=spec.experiment_id,
+            task_id=task_id,
+            diagnostic_code=LiveDiagnosticCode.PAIRED_OUTPUT_PUBLICATION_FAILED,
+            lifecycle=lifecycle,
             workspace_lifecycle=workspace_lifecycle,
-        ) from error
+            gate_executed=gate_result is not None,
+        )
     return LiveCodexOutcome(artifact, recording_path, output_path)

@@ -194,6 +194,76 @@ class CodexCleanupState(StrEnum):
     FAILED = "failed"
 
 
+class DiagnosticRunnerState(StrEnum):
+    """Runner observation retained when strict paired Evidence cannot be built."""
+
+    NOT_STARTED = "not_started"
+    STARTED = "started"
+    UNKNOWN = "unknown"
+
+
+class DiagnosticInvocationState(StrEnum):
+    """Provider invocation observation with an explicit unknown state."""
+
+    NOT_ATTEMPTED = "not_attempted"
+    SPAWN_ATTEMPTED = "spawn_attempted"
+    PROCESS_STARTED = "process_started"
+    UNKNOWN = "unknown"
+
+
+class DiagnosticCleanupState(StrEnum):
+    """Provider cleanup observation with an explicit unknown state."""
+
+    NOT_APPLICABLE = "not_applicable"
+    CLEARED = "cleared"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+class DiagnosticFailureStage(StrEnum):
+    """Safe failure location copied from the shared lifecycle tracker."""
+
+    PREFLIGHT = "preflight"
+    WORKSPACE_PREPARATION = "workspace_preparation"
+    PROVIDER_ENVIRONMENT_DIRECTORY_PREPARATION = (
+        "provider_environment_directory_preparation"
+    )
+    PROVIDER_RUNNER_CONSTRUCTION = "provider_runner_construction"
+    PROVIDER_RUNNER_ENTRY = "provider_runner_entry"
+    PROVIDER_RUNTIME_PRECHECK = "provider_runtime_precheck"
+    JSONL_PARSER_INITIALIZATION = "jsonl_parser_initialization"
+    PROVIDER_ARGV_CONSTRUCTION = "provider_argv_construction"
+    PROVIDER_ENVIRONMENT_CONSTRUCTION = "provider_environment_construction"
+    PROVIDER_PROCESS_SPAWN = "provider_process_spawn"
+    PROVIDER_PIPE_SELECTOR_INITIALIZATION = "provider_pipe_selector_initialization"
+    PROVIDER_PROCESS_COLLECTION = "provider_process_collection"
+    CODEX_EVIDENCE_CONSTRUCTION = "codex_evidence_construction"
+    PROVIDER_RUNNER_RESULT_CONSTRUCTION = "provider_runner_result_construction"
+    PROVIDER_RUNNER_RESULT_EXTRACTION = "provider_runner_result_extraction"
+    PROVIDER_ORCHESTRATION = "provider_orchestration"
+    UNKNOWN = "unknown"
+
+
+class LiveDiagnosticCode(StrEnum):
+    """Fixed reason why paired strict Live outputs were not published."""
+
+    CODEX_EVIDENCE_VALIDATION_FAILED = "codex_evidence_validation_failed"
+    LIFECYCLE_FALLBACK_EVIDENCE_VALIDATION_FAILED = (
+        "lifecycle_fallback_evidence_validation_failed"
+    )
+    RECORDING_CONSTRUCTION_FAILED = "recording_construction_failed"
+    LIVE_ARTIFACT_CONSTRUCTION_FAILED = "live_artifact_construction_failed"
+    PAIRED_OUTPUT_PUBLICATION_FAILED = "paired_output_publication_failed"
+    DIAGNOSTIC_PUBLICATION_FAILED = "diagnostic_publication_failed"
+
+
+class ProviderActivityDetermination(StrEnum):
+    """Whether all Provider lifecycle observations needed for diagnosis are known."""
+
+    DETERMINED = "determined"
+    UNKNOWN = "unknown"
+
+
 class CodexTerminalEvent(StrEnum):
     NONE = "none"
     TURN_COMPLETED = "turn_completed"
@@ -282,6 +352,7 @@ class LiveSettings(ContractModel):
     """Backward-compatible Live contract; Phase 3 fields opt into Codex execution."""
 
     record_to: str = Field(min_length=1)
+    diagnostic_to: StrictStr | None = Field(default=None, min_length=1)
     prompt_path: StrictStr | None = Field(default=None, min_length=1)
     model: StrictStr | None = Field(default=None, min_length=1, max_length=128)
     reasoning_effort: ReasoningEffort | None = None
@@ -348,6 +419,11 @@ class LiveSettings(ContractModel):
         if self.prompt_path is not None:
             _validate_relative_posix_file_path(self.prompt_path, "live.prompt_path")
             _validate_relative_posix_file_path(self.record_to, "live.record_to")
+        if self.diagnostic_to is not None:
+            _validate_relative_posix_file_path(
+                self.diagnostic_to,
+                "live.diagnostic_to",
+            )
         return self
 
 
@@ -1399,6 +1475,114 @@ class CodexExecutionEvidence(ContractModel):
             and self.termination.process_group_cleared
         ):
             raise ValueError("process_cleanup_error requires an uncleared process group")
+        return self
+
+
+class LiveFailureDiagnostic(ContractModel):
+    """Standalone redacted diagnosis when strict paired Live outputs cannot be built."""
+
+    schema_version: Literal["1.0"]
+    run_id: StrictStr = Field(min_length=1)
+    experiment_id: StrictStr = Field(min_length=1)
+    task_id: StrictStr = Field(min_length=1)
+    failure_kind: Literal[
+        LiveFailureKind.EVIDENCE_ERROR,
+        LiveFailureKind.PROCESS_CLEANUP_ERROR,
+    ]
+    diagnostic_code: LiveDiagnosticCode
+    failure_stage: DiagnosticFailureStage
+    runner_state: DiagnosticRunnerState
+    invocation_state: DiagnosticInvocationState
+    cleanup_state: DiagnosticCleanupState
+    workspace_lifecycle: WorkspaceLifecycle
+    paired_artifacts_published: Literal[False]
+    gate_executed: StrictBool
+    provider_activity_determined: ProviderActivityDetermination
+    created_at: datetime
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def diagnostic_timestamp_must_use_datetime_or_iso_string(
+        cls,
+        value: object,
+    ) -> object:
+        if not isinstance(value, (str, datetime)):
+            raise ValueError(
+                "Failure Diagnostic timestamp must be an ISO string or datetime value"
+            )
+        return value
+
+    @field_validator("created_at")
+    @classmethod
+    def diagnostic_timestamp_must_be_timezone_aware(
+        cls,
+        value: datetime,
+    ) -> datetime:
+        if (
+            value.tzinfo is None
+            or value.utcoffset() is None
+            or value.utcoffset() != timedelta(0)
+        ):
+            raise ValueError("Failure Diagnostic timestamp must be timezone-aware UTC")
+        return value
+
+    @model_validator(mode="after")
+    def diagnostic_lifecycle_must_be_truthful(self) -> LiveFailureDiagnostic:
+        lifecycle_values = (
+            self.runner_state,
+            self.invocation_state,
+            self.cleanup_state,
+            self.failure_stage,
+        )
+        contains_unknown = any(value.value == "unknown" for value in lifecycle_values)
+        expected_determination = (
+            ProviderActivityDetermination.UNKNOWN
+            if contains_unknown
+            else ProviderActivityDetermination.DETERMINED
+        )
+        if self.provider_activity_determined is not expected_determination:
+            raise ValueError(
+                "provider_activity_determined must match lifecycle observations"
+            )
+
+        invocation_attempted = self.invocation_state in {
+            DiagnosticInvocationState.SPAWN_ATTEMPTED,
+            DiagnosticInvocationState.PROCESS_STARTED,
+        }
+        if (
+            self.runner_state is DiagnosticRunnerState.NOT_STARTED
+            and invocation_attempted
+        ):
+            raise ValueError("a not-started runner cannot have an invocation attempt")
+        if (
+            self.invocation_state is DiagnosticInvocationState.PROCESS_STARTED
+            and self.runner_state is not DiagnosticRunnerState.STARTED
+        ):
+            raise ValueError("a started process requires a started runner")
+        if self.cleanup_state in {
+            DiagnosticCleanupState.CLEARED,
+            DiagnosticCleanupState.FAILED,
+        } and self.invocation_state is not DiagnosticInvocationState.PROCESS_STARTED:
+            raise ValueError("a Provider cleanup result requires a started process")
+        if (
+            self.invocation_state
+            in {
+                DiagnosticInvocationState.NOT_ATTEMPTED,
+                DiagnosticInvocationState.SPAWN_ATTEMPTED,
+            }
+            and self.cleanup_state is not DiagnosticCleanupState.NOT_APPLICABLE
+        ):
+            raise ValueError(
+                "a lifecycle without a started process requires not_applicable cleanup"
+            )
+        if (
+            self.cleanup_state is DiagnosticCleanupState.FAILED
+        ) is not (
+            self.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+        ):
+            raise ValueError(
+                "process_cleanup_error must exactly match an observed failed cleanup"
+            )
         return self
 
 

@@ -49,6 +49,7 @@ def test_phase0_live_settings_remain_backward_compatible(
 def test_phase3_live_settings_are_strict_and_complete() -> None:
     settings = {
         "record_to": "recordings/live.jsonl",
+        "diagnostic_to": "diagnostics/live-failure.json",
         "prompt_path": "prompts/task.md",
         "model": "gpt-test-fixed",
         "reasoning_effort": "high",
@@ -84,6 +85,7 @@ def test_phase3_live_settings_are_strict_and_complete() -> None:
 
     assert parsed.live is not None
     assert parsed.live.provider_timeout_ms == 600000
+    assert parsed.live.diagnostic_to == "diagnostics/live-failure.json"
 
 
 @pytest.mark.parametrize(
@@ -91,6 +93,7 @@ def test_phase3_live_settings_are_strict_and_complete() -> None:
     [
         ("prompt_path", "../secret.md"),
         ("record_to", "/tmp/live.jsonl"),
+        ("diagnostic_to", "../diagnostics/live.json"),
         ("model", "latest"),
         ("model", "gpt-5-latest"),
         ("provider_timeout_ms", "600000"),
