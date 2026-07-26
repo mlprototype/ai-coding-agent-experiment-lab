@@ -16,8 +16,12 @@ from agentlab.codex_provider import (
     CodexProtocolError,
     build_codex_argv,
     preflight_codex,
+    resolve_codex_home,
 )
 from agentlab.models import (
+    CodexCliProfile,
+    CodexItemType,
+    CodexTerminalEvent,
     LiveFailureKind,
     LiveSettings,
     ProviderExecutionStatus,
@@ -115,7 +119,9 @@ def test_preflight_uses_only_version_and_help(tmp_path: Path) -> None:
     result = preflight_codex(parent_environment=environment)
 
     assert result.cli_version == "codex-cli fake-1.0"
+    assert result.cli_profile is CodexCliProfile.HEADLESS_EXEC_INTERNAL_NEVER_V1
     assert result.verified_flags == tuple(sorted(REQUIRED_CODEX_EXEC_FLAGS))
+    assert "--ask-for-approval" not in result.verified_flags
     assert not inspection.exists()
 
 
@@ -124,6 +130,14 @@ def test_preflight_rejects_missing_command(tmp_path: Path) -> None:
         preflight_codex(parent_environment={"PATH": str(tmp_path)})
 
     assert error.value.failure_kind is LiveFailureKind.PROVIDER_UNAVAILABLE
+
+
+def test_codex_home_must_be_an_existing_absolute_directory(tmp_path: Path) -> None:
+    configured_file = tmp_path / "not-a-directory"
+    configured_file.write_text("not auth", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="directory"):
+        resolve_codex_home({"CODEX_HOME": str(configured_file)})
 
 
 def test_preflight_does_not_accept_required_flag_as_a_longer_name(
@@ -190,6 +204,72 @@ def test_preflight_fails_closed(
     assert error.value.failure_kind is expected_kind
 
 
+@pytest.mark.parametrize(
+    ("version_code", "help_code"),
+    [
+        ("os.write(1,b'x'*70000)", None),
+        ("os.write(2,b'x'*70000); print('codex-cli fake-1.0')", None),
+        ("print('codex-cli fake-1.0')", "os.write(1,b'x'*70000)"),
+        ("print('codex-cli fake-1.0')", "os.write(2,b'x'*70000)"),
+    ],
+)
+def test_preflight_rejects_bounded_output_overflow(
+    tmp_path: Path,
+    version_code: str,
+    help_code: str | None,
+) -> None:
+    environment, _inspection = _fake_codex(
+        tmp_path,
+        version_code=version_code,
+        help_code=help_code,
+    )
+
+    with pytest.raises(CodexPreflightError):
+        preflight_codex(parent_environment=environment)
+
+
+def test_preflight_timeout_removes_background_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    version_code = (
+        "child=subprocess.Popen([sys.executable,'-c','import signal;signal.pause()'])\n"
+        "inspection.write_text(str(child.pid),encoding='utf-8')\n"
+        "signal.pause()"
+    )
+    environment, inspection = _fake_codex(tmp_path, version_code=version_code)
+    monkeypatch.setattr("agentlab.codex_provider.PREFLIGHT_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr("agentlab.codex_provider.PREFLIGHT_TERMINATION_GRACE_MS", 50)
+
+    with pytest.raises(CodexPreflightError):
+        preflight_codex(parent_environment=environment)
+
+    child_pid = int(inspection.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+
+def test_preflight_timeout_escalates_past_ignored_sigterm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    version_code = (
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+        "inspection.write_text(str(os.getpid()),encoding='utf-8')\n"
+        "signal.pause()"
+    )
+    environment, inspection = _fake_codex(tmp_path, version_code=version_code)
+    monkeypatch.setattr("agentlab.codex_provider.PREFLIGHT_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr("agentlab.codex_provider.PREFLIGHT_TERMINATION_GRACE_MS", 50)
+
+    with pytest.raises(CodexPreflightError):
+        preflight_codex(parent_environment=environment)
+
+    process_pid = int(inspection.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(process_pid, 0)
+
+
 def test_jsonl_parser_normalizes_counts_and_provider_usage() -> None:
     parser = CodexJsonlParser(max_line_bytes=4096, max_total_bytes=16384)
     secret = "synthetic-raw-item-secret"
@@ -215,7 +295,12 @@ def test_jsonl_parser_normalizes_counts_and_provider_usage() -> None:
 
     assert summary.event_count == 5
     assert summary.unknown_event_count == 1
-    assert summary.item_type_counts == {"message": 1}
+    assert summary.thread_started_count == 1
+    assert summary.turn_started_count == 1
+    assert summary.terminal_event is CodexTerminalEvent.TURN_COMPLETED
+    assert summary.turn_completed_count == 1
+    assert summary.turn_failed_count == 0
+    assert summary.item_type_counts == {CodexItemType.MESSAGE: 1}
     assert summary.usage_metrics.input_tokens == 12
     assert summary.usage_metrics.source is UsageMetricSource.PROVIDER_REPORTED
     assert secret not in repr(summary)
@@ -396,7 +481,9 @@ def test_process_runner_uses_safe_argv_stdin_and_separate_environment(
     assert "--json" in argv
     assert "--ephemeral" in argv
     assert argv[argv.index("--sandbox") + 1] == "workspace-write"
-    assert argv[argv.index("--ask-for-approval") + 1] == "never"
+    assert "--ask-for-approval" not in argv
+    assert result.evidence.approval_policy == "never"
+    assert result.evidence.approval_basis == "headless_exec_internal_never"
     assert "sandbox_workspace_write.network_access=false" in argv
     assert 'web_search="disabled"' in argv
     assert "--dangerously-bypass-approvals-and-sandbox" not in argv
@@ -469,6 +556,37 @@ def test_process_runner_classifies_cli_and_protocol_failures(
 
     assert result.evidence.status is ProviderExecutionStatus.FAILED
     assert result.evidence.failure_kind is expected
+
+
+def test_process_runner_classifies_signal_termination(tmp_path: Path) -> None:
+    environment, _inspection = _fake_codex(
+        tmp_path,
+        live_code=(
+            "sys.stdin.read()\n"
+            "os.kill(os.getpid(),signal.SIGTERM)"
+        ),
+    )
+    preflight = preflight_codex(parent_environment=environment)
+    workspace, environment_root = _workspace(tmp_path)
+
+    result = CodexProcessRunner(
+        live=_live_settings(),
+        runner=_runner_settings(),
+    ).run(
+        preflight=preflight,
+        prompt=b"safe prompt",
+        workspace=workspace,
+        environment_root=environment_root,
+        parent_environment=environment,
+    )
+
+    assert result.evidence.status is ProviderExecutionStatus.FAILED
+    assert (
+        result.evidence.failure_kind
+        is LiveFailureKind.PROVIDER_SIGNAL_TERMINATION
+    )
+    assert result.evidence.exit_code is not None
+    assert result.evidence.exit_code < 0
 
 
 def test_process_runner_classifies_spawn_failure(

@@ -21,11 +21,12 @@ file content、thread/session IDは含めない。
 `run_started`は既存ID/条件/時刻に加え、`execution_mode=live`、Prompt SHA-256とbyte数、
 `prompt_redacted=true`、requested model/reasoning effort、CLI versionを保持する。
 
-`run_completed`はProviderと全Gateが必要なEvidenceを残した場合に、Phase 3 RunMetricsと
-redaction済みCodexExecutionEvidenceを保持する。品質Gate通常不合格でもMetricsを生成
-できるためcompletedである。
+`run_completed`はProviderと全Gateが必要なEvidenceを残した場合に、Phase 3 RunMetrics、
+redaction済みCodexExecutionEvidence、Gate種別ごとのcommand/pass/fail件数、
+evaluation duration、diff/Workspace lifecycle summaryを保持する。品質Gate通常不合格でも
+Metricsを生成できるためcompletedである。loaderはこのsummaryとMetricsを照合する。
 
-`run_failed`はfailure kindとredaction済みCodexExecutionEvidenceだけを保持し、
+`run_failed`はfailure kind、redaction済みCodexExecutionEvidence、同じ評価summaryを保持し、
 `metrics_included=false`とする。Provider失敗、timeout、protocol/output上限、
 process/Gate Harness、diff/cleanup不完全を品質結果へ変換しない。
 

@@ -15,14 +15,21 @@ ProviderとGateが同じ親環境を継承すると、CLI認証情報が評価co
 Promptは通常fileから一度だけ読みstdinで渡し、本文を永続化対象へ入れない。SHA-256、
 UTF-8 byte数、redacted flagだけを保存する。Codex JSONLは上限付きで逐次parseし、raw
 payloadを破棄してevent件数、unknown件数、item type件数、terminal Usageだけを
-CodexExecutionEvidenceへ正規化する。raw stdout/stderr、thread/session IDは保存しない。
+CodexExecutionEvidenceへ正規化する。thread/turn/terminalの各件数も保存し、総event数と
+照合する。raw stdout/stderr、thread/session IDは保存しない。
 
 Phase 3の認証は既存Codex CLIのChatGPT-managed authだけを対象とする。API keyを継承せず、
-auth fileをcopy/parseしない。Codex processにだけ既存`CODEX_HOME` pathを渡し、Gateは
+auth fileをcopy/parseしない。Codex processにだけ明示された絶対pathかつ既存directoryの
+`CODEX_HOME`を渡し、暗黙fallbackしない。Gateは
 Phase 2 allowlist環境と別の一時HOME/TMP/cacheで起動する。
 
 実Codex smokeは通常テスト/CIから分離し、レビュー後の明示確認で1回だけ行う。通常テスト
 はfake executableだけを使う。
+
+現行の`codex exec`には`--ask-for-approval`がなく、headless実装がapproval policyを
+`Never`へ設定する。この契約を`headless_exec_internal_never_v1` profileとして固定し、
+Evidenceへprofile、CLI version、approval根拠を保存する。将来別の明示flagを持つCLIへ
+対応する場合は新しいprofileを追加し、既存profileの意味を変更しない。
 
 ## Consequences
 

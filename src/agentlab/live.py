@@ -22,6 +22,7 @@ from agentlab.codex_provider import (
     CodexProcessRunner,
     preflight_codex,
     preflight_failure_evidence,
+    resolve_codex_home,
     unsupported_platform_evidence,
 )
 from agentlab.gates import GateExecutionResult, execute_quality_gates_in_workspace
@@ -33,6 +34,8 @@ from agentlab.models import (
     ExecutionMode,
     ExperimentSpec,
     GateKind,
+    GateKindSummary,
+    LiveEvaluationSummary,
     LiveFailureKind,
     LiveOverallStatus,
     LiveRunArtifact,
@@ -40,6 +43,7 @@ from agentlab.models import (
     ProviderExecutionStatus,
     RunMetrics,
     Workflow,
+    WorkspaceLifecycle,
 )
 from agentlab.recording import (
     LiveRunCompletedEvent,
@@ -67,9 +71,19 @@ from agentlab.workspace import (
 class LiveCodexError(ValueError):
     """A safe CLI-boundary error that never contains Prompt or raw Provider output."""
 
-    def __init__(self, message: str, *, workspace_removed: bool | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        workspace_lifecycle: WorkspaceLifecycle | None = None,
+    ) -> None:
         super().__init__(message)
-        self.workspace_removed = workspace_removed
+        self.workspace_lifecycle = workspace_lifecycle
+        self.workspace_removed = (
+            None
+            if workspace_lifecycle is None
+            else workspace_lifecycle is WorkspaceLifecycle.REMOVED
+        )
 
 
 class LiveArtifactLoadError(ValueError):
@@ -526,6 +540,44 @@ def _empty_diff(snapshot: DirectorySnapshot, *, max_diff_bytes: int) -> DiffEvid
     return build_diff_evidence(snapshot, snapshot, max_diff_bytes=max_diff_bytes)
 
 
+def _evaluation_summary(
+    commands: list[CommandEvidence],
+    diff: DiffEvidence,
+    *,
+    evaluation_duration_ms: int,
+    workspace_lifecycle: WorkspaceLifecycle,
+) -> LiveEvaluationSummary:
+    def gate_summary(gate: GateKind) -> GateKindSummary:
+        selected = [command for command in commands if command.gate is gate]
+        return GateKindSummary(
+            command_count=len(selected),
+            passed_count=sum(
+                command.status is CommandStatus.PASSED for command in selected
+            ),
+            failed_count=sum(
+                command.status is CommandStatus.FAILED for command in selected
+            ),
+        )
+
+    return LiveEvaluationSummary(
+        acceptance=gate_summary(GateKind.ACCEPTANCE),
+        regression=gate_summary(GateKind.REGRESSION),
+        lint=gate_summary(GateKind.LINT),
+        typecheck=gate_summary(GateKind.TYPECHECK),
+        all_commands_completed_normally=all(
+            command.status in {CommandStatus.PASSED, CommandStatus.FAILED}
+            and command.termination.process_group_cleared
+            for command in commands
+        ),
+        evaluation_duration_ms=evaluation_duration_ms,
+        changed_files=diff.changed_files,
+        added_lines=diff.added_lines,
+        deleted_lines=diff.deleted_lines,
+        diff_line_counts_complete=diff.line_counts_complete,
+        workspace_lifecycle=workspace_lifecycle,
+    )
+
+
 def _prepare_live_environment_root(parent: Path, name: str) -> Path:
     root = parent / name
     for directory in ("home", "tmp", "cache"):
@@ -547,7 +599,8 @@ def _recording_and_artifact(
     commands: list[CommandEvidence],
     diff: DiffEvidence,
     metrics: RunMetrics | None,
-    workspace_removed: bool,
+    workspace_lifecycle: WorkspaceLifecycle,
+    evaluation_duration_ms: int,
     overall_status: LiveOverallStatus,
     failure_kind: LiveFailureKind,
 ) -> tuple[bytes, LiveRunArtifact]:
@@ -556,6 +609,12 @@ def _recording_and_artifact(
     assert spec.runner is not None
     assert spec.live.model is not None
     assert spec.live.reasoning_effort is not None
+    evaluation = _evaluation_summary(
+        commands,
+        diff,
+        evaluation_duration_ms=evaluation_duration_ms,
+        workspace_lifecycle=workspace_lifecycle,
+    )
     started_event = LiveRunStartedEvent(
         schema_version="1.1",
         sequence=0,
@@ -585,6 +644,7 @@ def _recording_and_artifact(
             occurred_at=completed_at,
             metrics=metrics,
             codex=codex,
+            evaluation=evaluation,
         )
     else:
         terminal = LiveRunFailedEvent(
@@ -596,12 +656,16 @@ def _recording_and_artifact(
             occurred_at=completed_at,
             failure_kind=failure_kind,
             codex=codex,
+            evaluation=evaluation,
             metrics_included=False,
         )
     try:
         recording_bytes = live_recording_jsonl_bytes(started_event, terminal)
     except RecordingLoadError as error:
-        raise LiveCodexError(str(error), workspace_removed=workspace_removed) from error
+        raise LiveCodexError(
+            str(error),
+            workspace_lifecycle=workspace_lifecycle,
+        ) from error
     artifact = LiveRunArtifact(
         schema_version="1.0",
         run_id=run_id,
@@ -625,7 +689,7 @@ def _recording_and_artifact(
         gate_commands=commands,
         diff=diff,
         metrics=metrics,
-        workspace_removed=workspace_removed,
+        workspace_lifecycle=workspace_lifecycle,
         recording_sha256=hashlib.sha256(recording_bytes).hexdigest(),
         raw_provider_output_persisted=False,
     )
@@ -702,6 +766,12 @@ def run_live_codex(
                     f"{label} output already exists: {path}; use --force to overwrite"
                 )
 
+    parent = os.environ if parent_environment is None else parent_environment
+    try:
+        resolve_codex_home(parent)
+    except ValueError as error:
+        raise LiveCodexError(str(error)) from error
+
     started_at = datetime.now(UTC)
     try:
         preflight_result = preflight(parent_environment=parent_environment)
@@ -731,14 +801,24 @@ def run_live_codex(
                 commands=[],
                 diff=diff,
                 metrics=None,
-                workspace_removed=True,
-                overall_status=LiveOverallStatus.PROVIDER_ERROR,
+                workspace_lifecycle=WorkspaceLifecycle.NOT_CREATED,
+                evaluation_duration_ms=0,
+                overall_status=(
+                    LiveOverallStatus.HARNESS_ERROR
+                    if error.failure_kind
+                    in {
+                        LiveFailureKind.PROCESS_CLEANUP_ERROR,
+                        LiveFailureKind.EVIDENCE_ERROR,
+                        LiveFailureKind.UNSUPPORTED_PLATFORM,
+                    }
+                    else LiveOverallStatus.PROVIDER_ERROR
+                ),
                 failure_kind=error.failure_kind,
             )
         except ValidationError as validation_error:
             raise LiveCodexError(
                 "could not construct strict Live failure Evidence",
-                workspace_removed=True,
+                workspace_lifecycle=WorkspaceLifecycle.NOT_CREATED,
             ) from validation_error
         protect_live_inputs(
             spec_path=spec_path,
@@ -761,7 +841,7 @@ def run_live_codex(
     evaluation_duration_ms = 0
     metrics: RunMetrics | None = None
     diff = incomplete_diff_evidence("Live diff collection did not complete")
-    workspace_removed = False
+    workspace_lifecycle = WorkspaceLifecycle.NOT_CREATED
     workspace = None
     gate_result: GateExecutionResult | None = None
     codex: CodexExecutionEvidence
@@ -814,10 +894,16 @@ def run_live_codex(
             diff = incomplete_diff_evidence("Live diff collection failed")
             failure_kind = LiveFailureKind.EVIDENCE_ERROR
     except WorkspaceError as error:
-        raise LiveCodexError(
-            str(error),
-            workspace_removed=None,
-        ) from error
+        workspace_lifecycle = error.lifecycle or WorkspaceLifecycle.NOT_CREATED
+        failure_kind = LiveFailureKind.EVIDENCE_ERROR
+        synthetic_error = CodexPreflightError(
+            LiveFailureKind.EVIDENCE_ERROR,
+            "Live workspace preparation failed",
+            checked_at=preflight_result.checked_at,
+            cli_version=preflight_result.cli_version,
+            verified_flags=preflight_result.verified_flags,
+        )
+        codex = preflight_failure_evidence(synthetic_error, live=spec.live)
     except Exception:
         failure_kind = LiveFailureKind.EVIDENCE_ERROR
         if "codex" not in locals():
@@ -832,8 +918,13 @@ def run_live_codex(
     finally:
         if workspace is not None:
             workspace_removed, _cleanup_error = remove_disposable_workspace(workspace)
+            workspace_lifecycle = (
+                WorkspaceLifecycle.REMOVED
+                if workspace_removed
+                else WorkspaceLifecycle.CLEANUP_FAILED
+            )
 
-    if not workspace_removed:
+    if workspace_lifecycle is WorkspaceLifecycle.CLEANUP_FAILED:
         failure_kind = LiveFailureKind.EVIDENCE_ERROR
     if codex.status is ProviderExecutionStatus.FAILED and failure_kind is None:
         failure_kind = codex.failure_kind
@@ -857,7 +948,7 @@ def run_live_codex(
         and codex.status is ProviderExecutionStatus.SUCCEEDED
         and gate_result is not None
         and diff.line_counts_complete
-        and workspace_removed
+        and workspace_lifecycle is WorkspaceLifecycle.REMOVED
     ):
         metrics = _gate_metrics(
             commands,
@@ -877,6 +968,7 @@ def run_live_codex(
         if final_failure in {
             LiveFailureKind.PROVIDER_TURN_FAILED,
             LiveFailureKind.PROVIDER_CLI_NONZERO,
+            LiveFailureKind.PROVIDER_SIGNAL_TERMINATION,
             LiveFailureKind.PROVIDER_TIMEOUT,
             LiveFailureKind.PROVIDER_UNAVAILABLE,
             LiveFailureKind.PROVIDER_SPAWN_ERROR,
@@ -903,14 +995,15 @@ def run_live_codex(
             commands=commands,
             diff=diff,
             metrics=metrics,
-            workspace_removed=workspace_removed,
+            workspace_lifecycle=workspace_lifecycle,
+            evaluation_duration_ms=evaluation_duration_ms,
             overall_status=overall_status,
             failure_kind=final_failure,
         )
     except ValidationError as error:
         raise LiveCodexError(
             "could not construct strict Live Evidence",
-            workspace_removed=workspace_removed,
+            workspace_lifecycle=workspace_lifecycle,
         ) from error
     protect_live_inputs(
         spec_path=spec_path,
@@ -931,6 +1024,6 @@ def run_live_codex(
     except LiveCodexError as error:
         raise LiveCodexError(
             str(error),
-            workspace_removed=workspace_removed,
+            workspace_lifecycle=workspace_lifecycle,
         ) from error
     return LiveCodexOutcome(artifact, recording_path, output_path)

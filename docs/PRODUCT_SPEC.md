@@ -89,22 +89,27 @@ Phase 3ではSpec検証、ローカルCLI能力確認、保存済みRecordingの
 - `agentlab live-codex`はlive/codex/one_shot、Runner、task、repetition、完全なLive設定、
   `--confirm-live-codex`を必須とする。
 - 確認flagなしではread-only preflightを含むsubprocessを起動しない。
-- preflightはPATH、`--version`、`exec --help`、必要flagだけを確認し、Login、auth file
-  読取り、AI呼出しを行わない。flag不足は推測せずfail closedする。
+- preflightはPATH、`--version`、`exec --help`、必要flagだけを固定出力上限、timeout、
+  新規process groupで確認し、Login、auth file読取り、AI呼出しを行わない。flag不足、
+  UTF-8不正、timeout、残存processはfail closedする。
 - PromptはSpec基準の通常UTF-8 fileから上限付きで一度読み、stdinだけで渡す。本文を
   argv、Recording、Evidenceへ保存せず、SHA-256、byte数、redacted flagだけを保存する。
-- Codex processはworkspace-write、approval never、ephemeral、JSONL、user config/rules
-  無視、strict configで起動し、web searchとmodel-generated command networkを無効にする。
+- Codex processはworkspace-write、headless exec内部のapproval never、ephemeral、JSONL、
+  user config/rules無視、strict configで起動し、web searchとmodel-generated command
+  networkを無効にする。CLI profile、version、approval根拠をEvidenceへ保存する。
 - ChatGPT-managed CLI authだけを対象とし、API key、auth file copy/parseを実装しない。
+  `CODEX_HOME`は明示された絶対pathの既存directoryを必須とし、暗黙fallbackしない。
   CodexとGateの環境を分離し、Gateへ`CODEX_HOME`を渡さない。
 - JSONLはincrementalにUTF-8、JSON object、duplicate key、有限数、line/total上限、
-  lifecycleを検証する。raw payloadを保存せずevent/item件数とProvider報告Usageだけを
-  正規化する。
+  lifecycleを検証する。raw payloadを保存せずthread/turn/terminal/event/item件数と
+  Provider報告Usageだけを正規化し、item type keyを安全なEnumへ限定する。
 - Provider成功時だけ同じ使い捨てWorkspaceでPhase 2 Gateを実行する。Provider失敗、
-  Gate通常不合格、Harness障害を別taxonomyで保存する。
+  signal終了、Gate通常不合格、Harness障害を別taxonomyで保存する。Workspace状態は
+  `not_created`、`removed`、`cleanup_failed`で区別する。
 - Recording 1.1はredaction済み`run_started`と`run_completed`または`run_failed`の2件
-  だけを保存する。成功Recordingは外部呼出しなしでReplayでき、失敗RecordingはMetrics
-  欠損理由付きで拒否する。
+  だけを保存する。terminal eventにはGate件数、evaluation duration、diff、Workspace
+  lifecycleのredaction済みsummaryを含め、成功時はMetricsと照合する。成功Recordingは
+  外部呼出しなしでReplayでき、失敗RecordingはMetrics欠損理由付きで拒否する。
 - Live EvidenceはRecording SHA-256を一方向参照し、raw Prompt/JSONL/stderrを保存しない。
 
 ### 将来要件
@@ -162,4 +167,6 @@ Phase 3では以下を実装しない。
 - redaction済みLive Recording 1.1を再読込し、成功記録をoffline Replayできる。
 - Prompt、raw JSONL、stderr、thread/session ID、認証情報がArtifactに存在しない。
 - Provider失敗時はGateを実行せず、Provider/Gate/Harness failureを区別する。
+- 現行CLIのread-only preflightが成功しても、実Codex manual smokeが成功するまでは
+  Phase 3を完了扱いにしない。
 - manual Live smokeは実装レビュー後の明示承認まで未実行とする。

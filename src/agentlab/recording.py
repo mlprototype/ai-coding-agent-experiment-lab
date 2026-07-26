@@ -22,12 +22,14 @@ from agentlab.models import (
     CodexExecutionEvidence,
     ContractModel,
     ExecutionMode,
+    LiveEvaluationSummary,
     LiveFailureKind,
     Provider,
     ProviderExecutionStatus,
     ReasoningEffort,
     RunMetrics,
     Workflow,
+    WorkspaceLifecycle,
 )
 
 
@@ -128,6 +130,7 @@ class LiveRunCompletedEvent(ContractModel):
     occurred_at: datetime
     metrics: RunMetrics
     codex: CodexExecutionEvidence
+    evaluation: LiveEvaluationSummary
 
     @field_validator("occurred_at", mode="before")
     @classmethod
@@ -154,6 +157,42 @@ class LiveRunCompletedEvent(ContractModel):
             or self.metrics.usage_metrics != self.codex.usage_metrics
         ):
             raise ValueError("run_completed Metrics do not match Codex Evidence")
+        expected_counts = (
+            self.evaluation.acceptance.passed_count,
+            self.evaluation.acceptance.command_count,
+            self.evaluation.regression.failed_count,
+            self.evaluation.lint.failed_count,
+            self.evaluation.typecheck.failed_count,
+        )
+        actual_counts = (
+            self.metrics.acceptance_tests_passed,
+            self.metrics.acceptance_tests_total,
+            self.metrics.regression_failures,
+            self.metrics.lint_errors,
+            self.metrics.typecheck_errors,
+        )
+        quality_gate_pass = all(
+            summary.failed_count == 0
+            for summary in (
+                self.evaluation.acceptance,
+                self.evaluation.regression,
+                self.evaluation.lint,
+                self.evaluation.typecheck,
+            )
+        )
+        if (
+            not self.evaluation.all_commands_completed_normally
+            or not self.evaluation.diff_line_counts_complete
+            or self.evaluation.workspace_lifecycle is not WorkspaceLifecycle.REMOVED
+            or self.metrics.quality_gate_pass is not quality_gate_pass
+            or actual_counts != expected_counts
+            or self.metrics.evaluation_duration_ms
+            != self.evaluation.evaluation_duration_ms
+            or self.metrics.changed_files != self.evaluation.changed_files
+            or self.metrics.added_lines != self.evaluation.added_lines
+            or self.metrics.deleted_lines != self.evaluation.deleted_lines
+        ):
+            raise ValueError("run_completed Metrics do not match evaluation summary")
         return self
 
 
@@ -166,6 +205,7 @@ class LiveRunFailedEvent(ContractModel):
     occurred_at: datetime
     failure_kind: LiveFailureKind
     codex: CodexExecutionEvidence
+    evaluation: LiveEvaluationSummary
     metrics_included: StrictBool = False
 
     @field_validator("occurred_at", mode="before")
@@ -187,6 +227,7 @@ class LiveRunFailedEvent(ContractModel):
         provider_failures = {
             LiveFailureKind.PROVIDER_TURN_FAILED,
             LiveFailureKind.PROVIDER_CLI_NONZERO,
+            LiveFailureKind.PROVIDER_SIGNAL_TERMINATION,
             LiveFailureKind.PROVIDER_TIMEOUT,
             LiveFailureKind.PROVIDER_UNAVAILABLE,
             LiveFailureKind.PROVIDER_SPAWN_ERROR,
@@ -198,6 +239,15 @@ class LiveRunFailedEvent(ContractModel):
             LiveFailureKind.PROCESS_CLEANUP_ERROR,
             LiveFailureKind.UNSUPPORTED_PLATFORM,
         }
+        gate_command_count = sum(
+            summary.command_count
+            for summary in (
+                self.evaluation.acceptance,
+                self.evaluation.regression,
+                self.evaluation.lint,
+                self.evaluation.typecheck,
+            )
+        )
         if self.failure_kind in {
             LiveFailureKind.NONE,
             LiveFailureKind.QUALITY_GATE_FAILURE,
@@ -208,11 +258,20 @@ class LiveRunFailedEvent(ContractModel):
             or self.codex.failure_kind is not self.failure_kind
         ):
             raise ValueError("run_failed failure kind must match Codex Evidence")
+        if self.failure_kind in provider_failures | provider_harness_failures and (
+            gate_command_count != 0
+        ):
+            raise ValueError("Provider failure Recording must not contain Gate execution")
         if (
             self.failure_kind is LiveFailureKind.GATE_HARNESS_ERROR
             and self.codex.status is not ProviderExecutionStatus.SUCCEEDED
         ):
             raise ValueError("Gate Harness failure requires successful Codex Evidence")
+        if (
+            self.failure_kind is LiveFailureKind.GATE_HARNESS_ERROR
+            and self.evaluation.all_commands_completed_normally
+        ):
+            raise ValueError("Gate Harness failure requires abnormal Gate summary")
         return self
 
 

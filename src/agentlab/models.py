@@ -27,7 +27,6 @@ class ContractModel(BaseModel):
 
 
 CODEX_REQUIRED_EXEC_FLAGS = (
-    "--ask-for-approval",
     "--config",
     "--ephemeral",
     "--ignore-rules",
@@ -120,6 +119,46 @@ class ProviderExecutionStatus(StrEnum):
     FAILED = "failed"
 
 
+class CodexCliProfile(StrEnum):
+    """Versioned CLI contract selected by preflight."""
+
+    HEADLESS_EXEC_INTERNAL_NEVER_V1 = "headless_exec_internal_never_v1"
+
+
+class CodexApprovalBasis(StrEnum):
+    """Why the normalized approval policy is recorded as never."""
+
+    HEADLESS_EXEC_INTERNAL_NEVER = "headless_exec_internal_never"
+
+
+class CodexTerminalEvent(StrEnum):
+    NONE = "none"
+    TURN_COMPLETED = "turn_completed"
+    TURN_FAILED = "turn_failed"
+    ERROR = "error"
+
+
+class CodexItemType(StrEnum):
+    AGENT_MESSAGE = "agent_message"
+    COMMAND = "command"
+    COMMAND_EXECUTION = "command_execution"
+    ERROR = "error"
+    FILE = "file"
+    FILE_CHANGE = "file_change"
+    MCP_TOOL_CALL = "mcp_tool_call"
+    MESSAGE = "message"
+    REASONING = "reasoning"
+    TODO_LIST = "todo_list"
+    WEB_SEARCH = "web_search"
+    UNKNOWN = "unknown"
+
+
+class WorkspaceLifecycle(StrEnum):
+    NOT_CREATED = "not_created"
+    REMOVED = "removed"
+    CLEANUP_FAILED = "cleanup_failed"
+
+
 class LiveOverallStatus(StrEnum):
     PASSED = "passed"
     FAILED = "failed"
@@ -131,6 +170,7 @@ class LiveFailureKind(StrEnum):
     NONE = "none"
     PROVIDER_TURN_FAILED = "provider_turn_failed"
     PROVIDER_CLI_NONZERO = "provider_cli_nonzero"
+    PROVIDER_SIGNAL_TERMINATION = "provider_signal_termination"
     PROVIDER_TIMEOUT = "provider_timeout"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
     PROVIDER_SPAWN_ERROR = "provider_spawn_error"
@@ -724,21 +764,79 @@ class EvidenceArtifact(ContractModel):
         return self
 
 
+class GateKindSummary(ContractModel):
+    """Redacted count-only summary for one quality Gate kind."""
+
+    command_count: StrictInt = Field(ge=0)
+    passed_count: StrictInt = Field(ge=0)
+    failed_count: StrictInt = Field(ge=0)
+
+    @model_validator(mode="after")
+    def counts_must_fit_command_count(self) -> GateKindSummary:
+        if self.passed_count + self.failed_count > self.command_count:
+            raise ValueError("Gate passed/failed counts must not exceed command_count")
+        return self
+
+
+class LiveEvaluationSummary(ContractModel):
+    """Redacted Gate/diff/workspace facts retained by Recording 1.1."""
+
+    acceptance: GateKindSummary
+    regression: GateKindSummary
+    lint: GateKindSummary
+    typecheck: GateKindSummary
+    all_commands_completed_normally: StrictBool
+    evaluation_duration_ms: StrictInt = Field(ge=0)
+    changed_files: list[StrictStr]
+    added_lines: StrictInt | None = Field(default=None, ge=0)
+    deleted_lines: StrictInt | None = Field(default=None, ge=0)
+    diff_line_counts_complete: StrictBool
+    workspace_lifecycle: WorkspaceLifecycle
+
+    @model_validator(mode="after")
+    def summary_must_be_internally_consistent(self) -> LiveEvaluationSummary:
+        if self.changed_files != sorted(set(self.changed_files)):
+            raise ValueError("changed_files must be unique and sorted")
+        gate_summaries = (
+            self.acceptance,
+            self.regression,
+            self.lint,
+            self.typecheck,
+        )
+        counts_complete = all(
+            gate.command_count == gate.passed_count + gate.failed_count
+            for gate in gate_summaries
+        )
+        if self.all_commands_completed_normally is not counts_complete:
+            raise ValueError(
+                "all_commands_completed_normally must match Gate command counts"
+            )
+        if self.diff_line_counts_complete:
+            if self.added_lines is None or self.deleted_lines is None:
+                raise ValueError("complete diff summary requires line counts")
+        elif self.added_lines is not None or self.deleted_lines is not None:
+            raise ValueError("incomplete diff summary must omit line counts")
+        return self
+
+
 class CodexExecutionEvidence(ContractModel):
     """Redacted summary of one Codex CLI process; raw events are never persisted."""
 
     schema_version: Literal["1.0"]
     provider: Literal[Provider.CODEX]
     cli_version: StrictStr | None
+    cli_profile: Literal[CodexCliProfile.HEADLESS_EXEC_INTERNAL_NEVER_V1]
     preflight_checked_at: datetime
     verified_flags: list[StrictStr]
     requested_model: StrictStr
     requested_reasoning_effort: ReasoningEffort
     sandbox_mode: Literal["workspace-write"]
     approval_policy: Literal["never"]
+    approval_basis: Literal[CodexApprovalBasis.HEADLESS_EXEC_INTERNAL_NEVER]
     web_search_disabled: StrictBool
     command_network_disabled: StrictBool
     raw_stream_persisted: StrictBool
+    process_started: StrictBool
     status: ProviderExecutionStatus
     failure_kind: LiveFailureKind
     exit_code: StrictInt | None
@@ -747,7 +845,13 @@ class CodexExecutionEvidence(ContractModel):
     duration_ms: StrictInt = Field(ge=0)
     event_count: StrictInt = Field(ge=0)
     unknown_event_count: StrictInt = Field(ge=0)
-    item_type_counts: dict[StrictStr, StrictInt]
+    thread_started_count: StrictInt = Field(ge=0)
+    turn_started_count: StrictInt = Field(ge=0)
+    terminal_event: CodexTerminalEvent
+    turn_completed_count: StrictInt = Field(ge=0)
+    turn_failed_count: StrictInt = Field(ge=0)
+    error_event_count: StrictInt = Field(ge=0)
+    item_type_counts: dict[CodexItemType, StrictInt]
     usage_metrics: UsageMetrics
     stdout_bytes: StrictInt = Field(ge=0)
     stderr_bytes: StrictInt = Field(ge=0)
@@ -790,17 +894,41 @@ class CodexExecutionEvidence(ContractModel):
             raise ValueError("Codex completed_at must not precede started_at")
         if self.unknown_event_count > self.event_count:
             raise ValueError("unknown_event_count must not exceed event_count")
-        if sum(self.item_type_counts.values()) > self.event_count:
-            raise ValueError("item event counts must not exceed event_count")
+        core_event_count = (
+            self.thread_started_count
+            + self.turn_started_count
+            + self.turn_completed_count
+            + self.turn_failed_count
+            + self.error_event_count
+        )
+        if (
+            core_event_count
+            + sum(self.item_type_counts.values())
+            + self.unknown_event_count
+            != self.event_count
+        ):
+            raise ValueError("normalized Codex event counts must equal event_count")
         if self.verified_flags != sorted(set(self.verified_flags)):
             raise ValueError("verified_flags must be unique and sorted")
-        if any(
-            not item_type or count < 0
-            for item_type, count in self.item_type_counts.items()
+        terminal_counts = {
+            CodexTerminalEvent.NONE: (0, 0, 0),
+            CodexTerminalEvent.TURN_COMPLETED: (1, 0, 0),
+            CodexTerminalEvent.TURN_FAILED: (0, 1, 0),
+            CodexTerminalEvent.ERROR: (0, 0, 1),
+        }
+        if (
+            self.turn_completed_count,
+            self.turn_failed_count,
+            self.error_event_count,
+        ) != terminal_counts[self.terminal_event]:
+            raise ValueError("terminal_event must match normalized terminal counts")
+        if not self.process_started and (
+            self.exit_code is not None
+            or self.event_count != 0
+            or self.duration_ms != 0
+            or self.terminal_event is not CodexTerminalEvent.NONE
         ):
-            raise ValueError(
-                "item_type_counts must contain non-empty types and non-negative counts"
-            )
+            raise ValueError("a Provider process that was not started cannot have process Evidence")
         if self.usage_metrics.source not in {
             UsageMetricSource.PROVIDER_REPORTED,
             UsageMetricSource.NOT_AVAILABLE,
@@ -826,6 +954,7 @@ class CodexExecutionEvidence(ContractModel):
         allowed_failure_kinds = {
             LiveFailureKind.PROVIDER_TURN_FAILED,
             LiveFailureKind.PROVIDER_CLI_NONZERO,
+            LiveFailureKind.PROVIDER_SIGNAL_TERMINATION,
             LiveFailureKind.PROVIDER_TIMEOUT,
             LiveFailureKind.PROVIDER_UNAVAILABLE,
             LiveFailureKind.PROVIDER_SPAWN_ERROR,
@@ -841,6 +970,19 @@ class CodexExecutionEvidence(ContractModel):
                 raise ValueError("successful Codex Evidence requires failure_kind none and exit 0")
             if self.event_count < 3:
                 raise ValueError("successful Codex Evidence requires the core lifecycle events")
+            if (
+                self.thread_started_count,
+                self.turn_started_count,
+                self.terminal_event,
+                self.turn_completed_count,
+                self.turn_failed_count,
+                self.error_event_count,
+            ) != (1, 1, CodexTerminalEvent.TURN_COMPLETED, 1, 0, 0):
+                raise ValueError(
+                    "successful Codex Evidence requires one complete lifecycle"
+                )
+            if not self.process_started:
+                raise ValueError("successful Codex Evidence requires a started process")
             if not set(CODEX_REQUIRED_EXEC_FLAGS).issubset(self.verified_flags):
                 raise ValueError("successful Codex Evidence requires all preflight flags")
             if not self.termination.process_group_cleared:
@@ -858,9 +1000,9 @@ class CodexExecutionEvidence(ContractModel):
                 LiveFailureKind.PROVIDER_SPAWN_ERROR,
                 LiveFailureKind.UNSUPPORTED_PLATFORM,
             }
-            and self.exit_code is not None
+            and self.process_started
         ):
-            raise ValueError("pre-spawn Provider failures must not have an exit code")
+            raise ValueError("pre-spawn Provider failures must not start a process")
         if (
             self.failure_kind is LiveFailureKind.PROVIDER_TIMEOUT
             and self.termination.reason is not TerminationReason.TIMEOUT
@@ -868,9 +1010,20 @@ class CodexExecutionEvidence(ContractModel):
             raise ValueError("provider_timeout requires timeout termination Evidence")
         if (
             self.failure_kind is LiveFailureKind.PROVIDER_CLI_NONZERO
-            and (self.exit_code is None or self.exit_code == 0)
+            and (self.exit_code is None or self.exit_code <= 0)
         ):
-            raise ValueError("provider_cli_nonzero requires a non-zero exit code")
+            raise ValueError("provider_cli_nonzero requires a positive non-zero exit code")
+        if (
+            self.failure_kind is LiveFailureKind.PROVIDER_SIGNAL_TERMINATION
+            and (self.exit_code is None or self.exit_code >= 0)
+        ):
+            raise ValueError("provider_signal_termination requires a negative return code")
+        if (
+            self.failure_kind is LiveFailureKind.PROVIDER_TURN_FAILED
+            and self.terminal_event
+            not in {CodexTerminalEvent.TURN_FAILED, CodexTerminalEvent.ERROR}
+        ):
+            raise ValueError("provider_turn_failed requires a failed terminal event")
         if (
             self.failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
             and not self.stdout_limit_exceeded
@@ -909,7 +1062,7 @@ class LiveRunArtifact(ContractModel):
     gate_commands: list[CommandEvidence]
     diff: DiffEvidence
     metrics: RunMetrics | None
-    workspace_removed: StrictBool
+    workspace_lifecycle: WorkspaceLifecycle
     recording_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
     raw_provider_output_persisted: StrictBool
 
@@ -952,6 +1105,7 @@ class LiveRunArtifact(ContractModel):
         provider_failure_kinds = {
             LiveFailureKind.PROVIDER_TURN_FAILED,
             LiveFailureKind.PROVIDER_CLI_NONZERO,
+            LiveFailureKind.PROVIDER_SIGNAL_TERMINATION,
             LiveFailureKind.PROVIDER_TIMEOUT,
             LiveFailureKind.PROVIDER_UNAVAILABLE,
             LiveFailureKind.PROVIDER_SPAWN_ERROR,
@@ -988,6 +1142,18 @@ class LiveRunArtifact(ContractModel):
             and self.gate_commands
         ):
             raise ValueError("quality Gates must not run after failed Codex execution")
+        if (
+            self.workspace_lifecycle is WorkspaceLifecycle.NOT_CREATED
+            and (self.codex.process_started or self.gate_commands)
+        ):
+            raise ValueError(
+                "not_created Workspace cannot contain Provider or Gate execution"
+            )
+        if (
+            self.workspace_lifecycle is WorkspaceLifecycle.CLEANUP_FAILED
+            and self.overall_status is not LiveOverallStatus.HARNESS_ERROR
+        ):
+            raise ValueError("cleanup_failed Workspace requires a Harness error")
         if self.failure_kind in {
             LiveFailureKind.PROCESS_CLEANUP_ERROR,
             LiveFailureKind.UNSUPPORTED_PLATFORM,
@@ -1017,13 +1183,24 @@ class LiveRunArtifact(ContractModel):
             and command.termination.process_group_cleared
             for command in self.gate_commands
         )
+        if self.overall_status in {
+            LiveOverallStatus.PASSED,
+            LiveOverallStatus.FAILED,
+        } and (
+            not commands_completed_normally
+            or not self.diff.line_counts_complete
+            or self.workspace_lifecycle is not WorkspaceLifecycle.REMOVED
+        ):
+            raise ValueError(
+                "quality result requires complete Gate, diff, and Workspace Evidence"
+            )
         metrics_permitted = (
             self.codex.status is ProviderExecutionStatus.SUCCEEDED
             and commands_completed_normally
             and self.failure_kind
             in {LiveFailureKind.NONE, LiveFailureKind.QUALITY_GATE_FAILURE}
             and self.diff.line_counts_complete
-            and self.workspace_removed
+            and self.workspace_lifecycle is WorkspaceLifecycle.REMOVED
         )
         if metrics_permitted != (self.metrics is not None):
             raise ValueError("Live metrics presence is inconsistent with Evidence completeness")

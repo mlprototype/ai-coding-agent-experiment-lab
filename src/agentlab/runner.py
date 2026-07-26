@@ -432,12 +432,16 @@ class LocalCommandRunner:
         workspace: Path,
         environment_root: Path,
         temporary_root: Path,
+        parent_environment: Mapping[str, str] | None = None,
     ) -> CommandRunResult:
         ensure_runner_platform_supported()
         command = list(argv)
         started_at = datetime.now(UTC)
         started_monotonic = time.monotonic()
-        child_environment = build_child_environment(environment_root)
+        child_environment = build_child_environment(
+            environment_root,
+            parent_environment=parent_environment,
+        )
 
         try:
             process = subprocess.Popen(

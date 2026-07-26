@@ -21,7 +21,12 @@ from agentlab.live import (
     run_live_codex,
     write_live_outputs,
 )
-from agentlab.models import LiveFailureKind, LiveOverallStatus, LiveRunArtifact
+from agentlab.models import (
+    LiveFailureKind,
+    LiveOverallStatus,
+    LiveRunArtifact,
+    WorkspaceLifecycle,
+)
 from agentlab.recording import (
     LiveRunCompletedEvent,
     LiveRunFailedEvent,
@@ -30,6 +35,7 @@ from agentlab.recording import (
 )
 from agentlab.replay import ReplayError, run_replay
 from agentlab.specs import SpecLoadError
+from agentlab.workspace import WorkspaceError
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="Live Codex is POSIX-only")
 
@@ -209,7 +215,7 @@ def test_live_success_runs_provider_and_gates_in_same_workspace_and_replays(
     assert artifact == outcome.artifact
     assert artifact.overall_status is LiveOverallStatus.PASSED
     assert artifact.failure_kind is LiveFailureKind.NONE
-    assert artifact.workspace_removed is True
+    assert artifact.workspace_lifecycle is WorkspaceLifecycle.REMOVED
     assert artifact.metrics is not None
     assert artifact.metrics.quality_gate_pass is True
     assert artifact.metrics.agent_call_count == 1
@@ -345,8 +351,33 @@ def test_provider_timeout_skips_gates_and_removes_workspace(tmp_path: Path) -> N
     assert outcome.artifact.overall_status is LiveOverallStatus.PROVIDER_ERROR
     assert outcome.artifact.gate_commands == []
     assert outcome.artifact.metrics is None
-    assert outcome.artifact.workspace_removed is True
+    assert outcome.artifact.workspace_lifecycle is WorkspaceLifecycle.REMOVED
     assert isinstance(recording.failed, LiveRunFailedEvent)
+
+
+def test_provider_signal_termination_skips_gates_and_metrics(tmp_path: Path) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(
+        tmp_path,
+        live_code=(
+            "import signal\n"
+            "sys.stdin.read()\n"
+            "os.kill(os.getpid(),signal.SIGTERM)"
+        ),
+    )
+
+    outcome = _run(spec_path, output, environment)
+
+    assert (
+        outcome.artifact.failure_kind
+        is LiveFailureKind.PROVIDER_SIGNAL_TERMINATION
+    )
+    assert outcome.artifact.overall_status is LiveOverallStatus.PROVIDER_ERROR
+    assert outcome.artifact.codex.exit_code is not None
+    assert outcome.artifact.codex.exit_code < 0
+    assert outcome.artifact.gate_commands == []
+    assert outcome.artifact.metrics is None
+    assert outcome.artifact.workspace_lifecycle is WorkspaceLifecycle.REMOVED
 
 
 def test_internal_orchestration_exception_removes_workspace(
@@ -368,7 +399,54 @@ def test_internal_orchestration_exception_removes_workspace(
     assert outcome.artifact.failure_kind is LiveFailureKind.EVIDENCE_ERROR
     assert outcome.artifact.overall_status is LiveOverallStatus.HARNESS_ERROR
     assert outcome.artifact.metrics is None
-    assert outcome.artifact.workspace_removed is True
+    assert outcome.artifact.workspace_lifecycle is WorkspaceLifecycle.REMOVED
+
+
+def test_workspace_preparation_failure_is_persisted_with_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+
+    def fail_prepare(*_args: object, **_kwargs: object) -> NoReturn:
+        raise WorkspaceError(
+            "synthetic preparation failure",
+            lifecycle=WorkspaceLifecycle.REMOVED,
+        )
+
+    monkeypatch.setattr("agentlab.live.prepare_disposable_workspace", fail_prepare)
+    outcome = _run(spec_path, output, environment)
+    recording = load_replay_recording(outcome.recording_path)
+
+    assert outcome.artifact.overall_status is LiveOverallStatus.HARNESS_ERROR
+    assert outcome.artifact.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+    assert outcome.artifact.workspace_lifecycle is WorkspaceLifecycle.REMOVED
+    assert outcome.artifact.codex.process_started is False
+    assert outcome.artifact.metrics is None
+    assert isinstance(recording.failed, LiveRunFailedEvent)
+
+
+@pytest.mark.parametrize(
+    "configured_codex_home",
+    [None, "relative/codex-home", "/definitely/missing/agentlab-codex-home"],
+)
+def test_live_requires_explicit_existing_absolute_codex_home(
+    tmp_path: Path,
+    configured_codex_home: str | None,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+    if configured_codex_home is None:
+        environment.pop("CODEX_HOME")
+    else:
+        environment["CODEX_HOME"] = configured_codex_home
+
+    with pytest.raises(LiveCodexError, match="CODEX_HOME"):
+        _run(spec_path, output, environment)
+
+    assert not output.exists()
+    assert not (spec_path.parent / "recordings/live.jsonl").exists()
 
 
 def test_binary_provider_change_has_null_metrics(tmp_path: Path) -> None:
@@ -463,14 +541,20 @@ def test_usage_absence_is_not_coerced_to_zero(tmp_path: Path) -> None:
 
 def test_preflight_failure_is_saved_without_creating_workspace(tmp_path: Path) -> None:
     spec_path, _fixture, _prompt, output = _write_case(tmp_path)
-    environment = {"PATH": str(tmp_path / "empty-path"), "HOME": str(tmp_path / "home")}
+    codex_home = tmp_path / "managed-auth"
+    codex_home.mkdir()
+    environment = {
+        "PATH": str(tmp_path / "empty-path"),
+        "HOME": str(tmp_path / "home"),
+        "CODEX_HOME": str(codex_home),
+    }
 
     outcome = _run(spec_path, output, environment)
     recording = load_replay_recording(outcome.recording_path)
 
     assert outcome.artifact.overall_status is LiveOverallStatus.PROVIDER_ERROR
     assert outcome.artifact.failure_kind is LiveFailureKind.PROVIDER_UNAVAILABLE
-    assert outcome.artifact.workspace_removed is True
+    assert outcome.artifact.workspace_lifecycle is WorkspaceLifecycle.NOT_CREATED
     assert isinstance(recording.failed, LiveRunFailedEvent)
 
 
@@ -765,6 +849,39 @@ def test_live_recording_rejects_cross_event_provider_mismatch(tmp_path: Path) ->
         load_replay_recording(outcome.recording_path)
 
 
+@pytest.mark.parametrize(
+    ("field_path", "value"),
+    [
+        (("evaluation", "acceptance", "passed_count"), 0),
+        (("evaluation", "changed_files"), []),
+        (("evaluation", "evaluation_duration_ms"), 999_999),
+    ],
+)
+def test_live_recording_rejects_metrics_evaluation_summary_mismatch(
+    tmp_path: Path,
+    field_path: tuple[str, ...],
+    value: object,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+    outcome = _run(spec_path, output, environment)
+    events = [
+        json.loads(line)
+        for line in outcome.recording_path.read_text(encoding="utf-8").splitlines()
+    ]
+    target: Any = events[1]
+    for component in field_path[:-1]:
+        target = target[component]
+    target[field_path[-1]] = value
+    outcome.recording_path.write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RecordingLoadError, match="evaluation"):
+        load_replay_recording(outcome.recording_path)
+
+
 def test_failed_live_recording_rejects_non_failure_kind(tmp_path: Path) -> None:
     spec_path, _fixture, _prompt, output = _write_case(tmp_path)
     live_code = (
@@ -969,4 +1086,48 @@ def test_live_artifact_rejects_non_provider_codex_usage_source(
     payload["codex"]["usage_metrics"]["source"] = "estimated"
 
     with pytest.raises(ValidationError, match="Usage source"):
+        LiveRunArtifact.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("thread_started_count", 0),
+        ("turn_started_count", 0),
+        ("terminal_event", "turn_failed"),
+        ("turn_completed_count", 0),
+    ],
+)
+def test_live_artifact_rejects_forged_codex_lifecycle(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+    payload = _run(spec_path, output, environment).artifact.model_dump(mode="json")
+    payload["codex"][field] = value
+
+    with pytest.raises(ValidationError):
+        LiveRunArtifact.model_validate(payload)
+
+
+def test_live_artifact_rejects_unknown_item_type_key(tmp_path: Path) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+    payload = _run(spec_path, output, environment).artifact.model_dump(mode="json")
+    payload["codex"]["item_type_counts"] = {"secret_vendor_item": 1}
+
+    with pytest.raises(ValidationError, match="item_type_counts"):
+        LiveRunArtifact.model_validate(payload)
+
+
+def test_live_artifact_rejects_impossible_workspace_lifecycle(tmp_path: Path) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+    payload = _run(spec_path, output, environment).artifact.model_dump(mode="json")
+    payload["workspace_lifecycle"] = "not_created"
+    payload["metrics"] = None
+
+    with pytest.raises(ValidationError, match="not_created"):
         LiveRunArtifact.model_validate(payload)

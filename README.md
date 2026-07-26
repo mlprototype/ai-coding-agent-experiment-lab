@@ -23,7 +23,8 @@ Phase 0〜2を完了し、現在は
 - YAML Specの検証
 - Codex CLIとAntigravity CLIの読み取り専用能力確認
 - 実験設計、Provider境界、ロードマップの文書
-- `run_started`と`run_completed`だけを持つ厳密なJSONL Recording契約
+- Recording 1.0の`run_started`/`run_completed`契約と、Live 1.1の
+  `run_started`/`run_completed|run_failed`契約
 - 1件の保存済みRecordingから1件のRunResultを生成・保存するReplay CLI
 - 信頼済みFixtureの使い捨てコピーと、Specに列挙されたargvだけを実行するlocal Runner
 - timeout、process group停止、残存子process回収、環境変数allowlist
@@ -73,9 +74,12 @@ uv run agentlab live-codex experiments/examples/codex-live-smoke.yaml \
   --confirm-live-codex
 ```
 
-現在確認済みの`codex-cli 0.146.0-alpha.3.1`は`exec --help`に
-`--ask-for-approval`を表示しないため、上記実行はpreflightでfail closedします。
-互換CLIで必須flagを再確認するまでmanual smokeは実行しません。
+現在確認済みの`codex-cli 0.146.0-alpha.3.1`は
+`headless_exec_internal_never_v1` profileの必須flagを満たし、read-only preflightに
+成功します。このprofileはheadless `exec`内部のapproval policy `Never`を根拠とし、
+存在しない`--ask-for-approval`をargvへ追加しません。profile名、CLI version、根拠を
+Evidenceへ保存します。manual Live smoke自体はまだ実行しておらず、Phase 3完了条件には
+含まれたままです。
 
 `--confirm-live-codex`なしではversion/help preflightを含むsubprocessを起動しません。
 確認付き実行はCodex model APIへのPrompt送信とquota消費を伴います。Promptはargvへ
@@ -85,6 +89,8 @@ PromptはSHA-256とbyte数だけを保存します。
 
 Phase 3の認証対象は既存Codex CLIのChatGPT-managed authenticationだけです。
 `OPENAI_API_KEY`と`CODEX_API_KEY`はProvider processへ継承せず、API key方式は未対応です。
+Live実行前に`CODEX_HOME`が明示された絶対pathの既存directoryであることを要求し、
+`HOME/.codex`へ暗黙fallbackしません。
 Codex自身のmodel API通信は必要ですが、model-generated commandのnetwork accessと
 web searchを無効化します。OS-levelの完全なnetwork遮断ではありません。詳細は
 [docs/CODEX_PROVIDER.md](docs/CODEX_PROVIDER.md)を参照してください。

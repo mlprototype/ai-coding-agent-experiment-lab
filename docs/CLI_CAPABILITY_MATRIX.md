@@ -13,7 +13,7 @@
 | 指定help | `codex exec --help` 成功 | `not_verified` |
 | Non-interactive | verified: helpに「Run Codex non-interactively」 | `not_verified` |
 | Structured output | verified: `--json`でJSONL event出力 | `not_verified` |
-| Phase 3必須flag | `--ask-for-approval`だけ未検出、Live preflightはfail closed | `not_verified` |
+| Phase 3 CLI profile | `headless_exec_internal_never_v1`のread-only preflight成功 | `not_verified` |
 | Usage metrics | `not_verified`（指定helpに明示なし） | `not_verified` |
 | Live課題実行 | 未実施 | 未実施 |
 
@@ -27,8 +27,12 @@
   `--output-schema`を表示した。
 - Phase 3で必要な`--ephemeral`、`--sandbox`、`--skip-git-repo-check`、
   `--ignore-user-config`、`--ignore-rules`、`--strict-config`、`--model`、`--config`を
-  helpで確認した。`--ask-for-approval`はこのversionの`exec --help`に存在しなかった。
-  このため現在の実CLIに対するPhase 3 preflightはAI送信前に拒否する。
+  helpで確認した。`--ask-for-approval`はこのversionの`exec --help`に存在せず、
+  Phase 3の現profileも要求しない。
+- 上記version/flag集合で、boundedなread-only Phase 3 preflightが成功した。
+- [OpenAI Codex公式source](https://github.com/openai/codex/blob/main/codex-rs/exec/src/lib.rs)
+  ではheadless modeのapproval policyが既定で`Never`へ設定される。Evidenceはこの根拠を
+  profile名とCLI versionへ結び付ける。
 - 起動時にPATH aliasを作成できない旨のwarningがstderrへ出たが、version/help確認は
   成功した。
 

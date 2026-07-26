@@ -211,9 +211,12 @@ def live_codex_command(
         typer.echo(f"run: {run_id}")
         typer.echo(f"task: {task_id}")
         typer.echo(f"evidence output: {output_path}")
-        if isinstance(error, LiveCodexError) and error.workspace_removed is not None:
+        if (
+            isinstance(error, LiveCodexError)
+            and error.workspace_lifecycle is not None
+        ):
             typer.echo(
-                f"workspace removed: {'yes' if error.workspace_removed else 'no'}"
+                f"workspace lifecycle: {error.workspace_lifecycle.value}"
             )
         else:
             typer.echo("workspace removed: not_created")
@@ -229,7 +232,7 @@ def live_codex_command(
     typer.echo(f"failure kind: {artifact.failure_kind.value}")
     typer.echo(f"recording output: {outcome.recording_path}")
     typer.echo(f"evidence output: {outcome.output_path}")
-    typer.echo(f"workspace removed: {'yes' if artifact.workspace_removed else 'no'}")
+    typer.echo(f"workspace lifecycle: {artifact.workspace_lifecycle.value}")
     typer.echo("raw Prompt persisted: no")
     typer.echo("raw Codex JSONL persisted: no")
     if artifact.overall_status is LiveOverallStatus.FAILED:

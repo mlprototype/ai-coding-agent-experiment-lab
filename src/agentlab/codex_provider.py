@@ -9,17 +9,25 @@ import re
 import selectors
 import shutil
 import subprocess
+import tempfile
 import time
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any, NoReturn, cast
+from typing import IO, Any, Literal, NoReturn, cast
 
 from agentlab.models import (
     CODEX_REQUIRED_EXEC_FLAGS,
+    CodexApprovalBasis,
+    CodexCliProfile,
     CodexExecutionEvidence,
+    CodexItemType,
+    CodexTerminalEvent,
+    CommandStatus,
+    FailureKind,
+    GateKind,
     LiveFailureKind,
     LiveSettings,
     Provider,
@@ -32,6 +40,7 @@ from agentlab.models import (
     UsageMetricSource,
 )
 from agentlab.runner import (
+    LocalCommandRunner,
     UnsupportedRunnerPlatformError,
     ensure_runner_platform_supported,
     merge_termination_error,
@@ -39,8 +48,11 @@ from agentlab.runner import (
     terminate_process_group,
     termination_without_signal,
 )
+from agentlab.workspace import remove_temporary_root
 
 PREFLIGHT_TIMEOUT_SECONDS = 5.0
+PREFLIGHT_MAX_OUTPUT_BYTES = 64 * 1024
+PREFLIGHT_TERMINATION_GRACE_MS = 100
 _READ_CHUNK_BYTES = 64 * 1024
 _POLL_INTERVAL_SECONDS = 0.01
 _PROVIDER_ENV_ALLOWLIST = (
@@ -53,19 +65,9 @@ _PROVIDER_ENV_ALLOWLIST = (
 )
 REQUIRED_CODEX_EXEC_FLAGS = CODEX_REQUIRED_EXEC_FLAGS
 _SAFE_ITEM_TYPES = frozenset(
-    {
-        "agent_message",
-        "command",
-        "command_execution",
-        "error",
-        "file",
-        "file_change",
-        "mcp_tool_call",
-        "message",
-        "reasoning",
-        "todo_list",
-        "web_search",
-    }
+    item_type.value
+    for item_type in CodexItemType
+    if item_type is not CodexItemType.UNKNOWN
 )
 
 
@@ -96,10 +98,15 @@ class CodexProtocolError(ValueError):
         self.failure_kind = failure_kind
 
 
+class _PreflightHarnessError(subprocess.SubprocessError):
+    """A read-only probe hit an Evidence/process-cleanup Harness failure."""
+
+
 @dataclass(frozen=True)
 class CodexPreflight:
     executable: str
     cli_version: str
+    cli_profile: Literal[CodexCliProfile.HEADLESS_EXEC_INTERNAL_NEVER_V1]
     checked_at: datetime
     verified_flags: tuple[str, ...]
 
@@ -108,7 +115,13 @@ class CodexPreflight:
 class CodexParseSummary:
     event_count: int
     unknown_event_count: int
-    item_type_counts: dict[str, int]
+    thread_started_count: int
+    turn_started_count: int
+    terminal_event: CodexTerminalEvent
+    turn_completed_count: int
+    turn_failed_count: int
+    error_event_count: int
+    item_type_counts: dict[CodexItemType, int]
     usage_metrics: UsageMetrics
     turn_failed: bool
 
@@ -156,12 +169,18 @@ class CodexJsonlParser:
         self.total_bytes = 0
         self.event_count = 0
         self.unknown_event_count = 0
-        self.item_type_counts: dict[str, int] = {}
+        self.item_type_counts: dict[CodexItemType, int] = {}
         self.usage_metrics = _not_available_usage()
         self._thread_started = False
         self._turn_started = False
         self._terminal_seen = False
         self._turn_failed = False
+        self.thread_started_count = 0
+        self.turn_started_count = 0
+        self.terminal_event = CodexTerminalEvent.NONE
+        self.turn_completed_count = 0
+        self.turn_failed_count = 0
+        self.error_event_count = 0
 
     def feed(self, chunk: bytes) -> None:
         self.total_bytes += len(chunk)
@@ -204,6 +223,12 @@ class CodexJsonlParser:
         return CodexParseSummary(
             event_count=self.event_count,
             unknown_event_count=self.unknown_event_count,
+            thread_started_count=self.thread_started_count,
+            turn_started_count=self.turn_started_count,
+            terminal_event=self.terminal_event,
+            turn_completed_count=self.turn_completed_count,
+            turn_failed_count=self.turn_failed_count,
+            error_event_count=self.error_event_count,
             item_type_counts=dict(sorted(self.item_type_counts.items())),
             usage_metrics=self.usage_metrics,
             turn_failed=self._turn_failed,
@@ -274,32 +299,40 @@ class CodexJsonlParser:
             if self._thread_started or self._turn_started:
                 self._invalid_order("thread.started")
             self._thread_started = True
+            self.thread_started_count += 1
         elif event_type == "turn.started":
             if not self._thread_started or self._turn_started:
                 self._invalid_order("turn.started")
             self._turn_started = True
+            self.turn_started_count += 1
         elif event_type == "turn.completed":
             if not self._thread_started or not self._turn_started:
                 self._invalid_order("turn.completed")
             self._terminal_seen = True
+            self.terminal_event = CodexTerminalEvent.TURN_COMPLETED
+            self.turn_completed_count += 1
             self.usage_metrics = self._parse_usage(raw.get("usage"))
         elif event_type == "turn.failed":
             if not self._thread_started or not self._turn_started:
                 self._invalid_order("turn.failed")
             self._terminal_seen = True
             self._turn_failed = True
+            self.terminal_event = CodexTerminalEvent.TURN_FAILED
+            self.turn_failed_count += 1
         elif event_type == "error":
             self._terminal_seen = True
             self._turn_failed = True
+            self.terminal_event = CodexTerminalEvent.ERROR
+            self.error_event_count += 1
         elif event_type in {"item.started", "item.updated", "item.completed"}:
             if not self._thread_started or not self._turn_started:
                 self._invalid_order(event_type)
             item = raw.get("item")
             item_type = item.get("type") if isinstance(item, dict) else None
-            safe_item_type = (
+            safe_item_type = CodexItemType(
                 item_type
                 if isinstance(item_type, str) and item_type in _SAFE_ITEM_TYPES
-                else "unknown"
+                else CodexItemType.UNKNOWN
             )
             self.item_type_counts[safe_item_type] = (
                 self.item_type_counts.get(safe_item_type, 0) + 1
@@ -359,23 +392,63 @@ def _run_preflight_command(
     args: list[str],
     *,
     environment: Mapping[str, str],
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [executable, *args],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="strict",
-        stdin=subprocess.DEVNULL,
-        shell=False,
-        timeout=PREFLIGHT_TIMEOUT_SECONDS,
-        env=dict(environment),
-    )
+) -> tuple[str, str]:
+    """Run one bounded read-only probe with the Safe Runner process policy."""
+    temporary_root = Path(tempfile.mkdtemp(prefix="agentlab-codex-preflight-")).resolve()
+    try:
+        workspace = temporary_root / "workspace"
+        environment_root = temporary_root / "environment"
+        workspace.mkdir()
+        for name in ("home", "tmp", "cache"):
+            (environment_root / name).mkdir(parents=True, exist_ok=True)
+        result = LocalCommandRunner(
+            RunnerSettings(
+                fixture_path="preflight",
+                command_timeout_ms=int(PREFLIGHT_TIMEOUT_SECONDS * 1000),
+                termination_grace_ms=PREFLIGHT_TERMINATION_GRACE_MS,
+                max_output_bytes=PREFLIGHT_MAX_OUTPUT_BYTES,
+                max_diff_bytes=1,
+            )
+        ).run(
+            gate=GateKind.ACCEPTANCE,
+            command_index=0,
+            argv=[executable, *args],
+            workspace=workspace,
+            environment_root=environment_root,
+            temporary_root=temporary_root,
+            parent_environment=environment,
+        )
+        evidence = result.evidence
+        if result.harness_failure in {
+            FailureKind.PROCESS_CLEANUP_ERROR,
+            FailureKind.EVIDENCE_ERROR,
+        }:
+            raise _PreflightHarnessError(
+                f"bounded preflight Harness failure: {result.harness_failure.value}"
+            )
+        if (
+            result.harness_failure is not None
+            or evidence.status is not CommandStatus.PASSED
+            or evidence.stdout_truncated
+            or evidence.stderr_truncated
+            or evidence.stdout_decode_replaced
+            or evidence.stderr_decode_replaced
+            or not evidence.termination.process_group_cleared
+        ):
+            raise subprocess.SubprocessError(
+                f"bounded preflight command failed: {evidence.status.value}"
+            )
+        return evidence.stdout, evidence.stderr
+    finally:
+        cleanup_succeeded, cleanup_error = remove_temporary_root(temporary_root)
+        if not cleanup_succeeded:
+            raise subprocess.SubprocessError(
+                cleanup_error or "preflight temporary cleanup failed"
+            )
 
 
-def _first_nonempty_line(result: subprocess.CompletedProcess[str]) -> str | None:
-    for output in (result.stdout, result.stderr):
+def _first_nonempty_line(stdout: str, stderr: str) -> str | None:
+    for output in (stdout, stderr):
         for line in output.splitlines():
             if line.strip():
                 return line.strip()
@@ -389,6 +462,14 @@ def preflight_codex(
     """Run only version/help commands and fail closed on an incompatible CLI."""
     checked_at = datetime.now(UTC)
     parent = os.environ if parent_environment is None else parent_environment
+    try:
+        ensure_runner_platform_supported()
+    except UnsupportedRunnerPlatformError as error:
+        raise CodexPreflightError(
+            LiveFailureKind.UNSUPPORTED_PLATFORM,
+            "Codex preflight requires POSIX process-group support",
+            checked_at=checked_at,
+        ) from error
     executable = shutil.which("codex", path=parent.get("PATH"))
     if executable is None:
         raise CodexPreflightError(
@@ -398,23 +479,25 @@ def preflight_codex(
         )
     environment = _probe_environment(parent)
     try:
-        version_result = _run_preflight_command(
+        version_stdout, version_stderr = _run_preflight_command(
             executable,
             ["--version"],
             environment=environment,
         )
+    except _PreflightHarnessError as error:
+        raise CodexPreflightError(
+            LiveFailureKind.EVIDENCE_ERROR,
+            "codex version preflight Harness failed",
+            checked_at=checked_at,
+        ) from error
     except (OSError, UnicodeError, subprocess.SubprocessError) as error:
         raise CodexPreflightError(
             LiveFailureKind.PROVIDER_UNAVAILABLE,
             f"codex version preflight failed: {type(error).__name__}",
             checked_at=checked_at,
         ) from error
-    version = _first_nonempty_line(version_result)
-    if (
-        version_result.returncode != 0
-        or version is None
-        or len(version.encode("utf-8")) > 256
-    ):
+    version = _first_nonempty_line(version_stdout, version_stderr)
+    if version is None or len(version.encode("utf-8")) > 256:
         raise CodexPreflightError(
             LiveFailureKind.PROVIDER_UNAVAILABLE,
             "codex --version did not succeed",
@@ -422,11 +505,18 @@ def preflight_codex(
         )
 
     try:
-        help_result = _run_preflight_command(
+        help_stdout, help_stderr = _run_preflight_command(
             executable,
             ["exec", "--help"],
             environment=environment,
         )
+    except _PreflightHarnessError as error:
+        raise CodexPreflightError(
+            LiveFailureKind.EVIDENCE_ERROR,
+            "codex exec help preflight Harness failed",
+            checked_at=checked_at,
+            cli_version=version,
+        ) from error
     except (OSError, UnicodeError, subprocess.SubprocessError) as error:
         raise CodexPreflightError(
             LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
@@ -434,14 +524,7 @@ def preflight_codex(
             checked_at=checked_at,
             cli_version=version,
         ) from error
-    if help_result.returncode != 0:
-        raise CodexPreflightError(
-            LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
-            "codex exec --help did not succeed",
-            checked_at=checked_at,
-            cli_version=version,
-        )
-    help_text = f"{help_result.stdout}\n{help_result.stderr}"
+    help_text = f"{help_stdout}\n{help_stderr}"
     verified_flags = tuple(
         sorted(
             flag
@@ -464,6 +547,7 @@ def preflight_codex(
     return CodexPreflight(
         executable=executable,
         cli_version=version,
+        cli_profile=CodexCliProfile.HEADLESS_EXEC_INTERNAL_NEVER_V1,
         checked_at=checked_at,
         verified_flags=verified_flags,
     )
@@ -483,8 +567,6 @@ def build_codex_argv(
         "--ephemeral",
         "--sandbox",
         "workspace-write",
-        "--ask-for-approval",
-        "never",
         "--skip-git-repo-check",
         "--ignore-user-config",
         "--ignore-rules",
@@ -517,12 +599,27 @@ def build_codex_environment(
             "PYTHONDONTWRITEBYTECODE": "1",
         }
     )
-    codex_home = parent.get("CODEX_HOME")
-    if not codex_home and parent.get("HOME"):
-        codex_home = str(Path(parent["HOME"]) / ".codex")
-    if codex_home:
-        environment["CODEX_HOME"] = codex_home
+    environment["CODEX_HOME"] = str(resolve_codex_home(parent))
     return environment
+
+
+def resolve_codex_home(parent_environment: Mapping[str, str]) -> Path:
+    """Require an explicit existing absolute managed-auth directory."""
+    configured = parent_environment.get("CODEX_HOME")
+    if not configured:
+        raise ValueError("CODEX_HOME must be explicitly configured for Live Codex")
+    path = Path(configured)
+    if not path.is_absolute():
+        raise ValueError("CODEX_HOME must be an absolute path")
+    try:
+        path.stat()
+    except OSError as error:
+        raise ValueError(
+            f"CODEX_HOME is unavailable: {type(error).__name__}"
+        ) from error
+    if not path.is_dir():
+        raise ValueError("CODEX_HOME must be an existing directory")
+    return path
 
 
 def _preflight_failure_evidence(
@@ -537,15 +634,18 @@ def _preflight_failure_evidence(
         schema_version="1.0",
         provider=Provider.CODEX,
         cli_version=error.cli_version,
+        cli_profile=CodexCliProfile.HEADLESS_EXEC_INTERNAL_NEVER_V1,
         preflight_checked_at=error.checked_at,
         verified_flags=sorted(error.verified_flags),
         requested_model=live.model,
         requested_reasoning_effort=live.reasoning_effort,
         sandbox_mode="workspace-write",
         approval_policy="never",
+        approval_basis=CodexApprovalBasis.HEADLESS_EXEC_INTERNAL_NEVER,
         web_search_disabled=True,
         command_network_disabled=True,
         raw_stream_persisted=False,
+        process_started=False,
         status=ProviderExecutionStatus.FAILED,
         failure_kind=error.failure_kind,
         exit_code=None,
@@ -554,6 +654,12 @@ def _preflight_failure_evidence(
         duration_ms=0,
         event_count=0,
         unknown_event_count=0,
+        thread_started_count=0,
+        turn_started_count=0,
+        terminal_event=CodexTerminalEvent.NONE,
+        turn_completed_count=0,
+        turn_failed_count=0,
+        error_event_count=0,
         item_type_counts={},
         usage_metrics=_not_available_usage(),
         stdout_bytes=0,
@@ -635,6 +741,7 @@ class CodexProcessRunner:
                     started_monotonic=started_monotonic,
                     status=ProviderExecutionStatus.FAILED,
                     failure_kind=failure,
+                    process_started=False,
                     exit_code=None,
                     parser=parser,
                     stderr_bytes=0,
@@ -846,6 +953,8 @@ class CodexProcessRunner:
             final_failure = LiveFailureKind.PROVIDER_TIMEOUT
         elif failure_kind is not None:
             final_failure = failure_kind
+        elif return_code is not None and return_code < 0:
+            final_failure = LiveFailureKind.PROVIDER_SIGNAL_TERMINATION
         elif summary.turn_failed:
             final_failure = LiveFailureKind.PROVIDER_TURN_FAILED
         elif return_code != 0:
@@ -902,6 +1011,7 @@ class CodexProcessRunner:
         stderr_bytes: int,
         stderr_truncated: bool,
         termination: TerminationEvidence,
+        process_started: bool = True,
         stdout_limit_exceeded: bool = False,
         summary: CodexParseSummary | None = None,
     ) -> CodexExecutionEvidence:
@@ -912,23 +1022,36 @@ class CodexProcessRunner:
             schema_version="1.0",
             provider=Provider.CODEX,
             cli_version=preflight.cli_version,
+            cli_profile=preflight.cli_profile,
             preflight_checked_at=preflight.checked_at,
             verified_flags=sorted(preflight.verified_flags),
             requested_model=self._live.model,
             requested_reasoning_effort=self._live.reasoning_effort,
             sandbox_mode="workspace-write",
             approval_policy="never",
+            approval_basis=CodexApprovalBasis.HEADLESS_EXEC_INTERNAL_NEVER,
             web_search_disabled=True,
             command_network_disabled=True,
             raw_stream_persisted=False,
+            process_started=process_started,
             status=status,
             failure_kind=failure_kind,
             exit_code=exit_code,
             started_at=started_at,
             completed_at=datetime.now(UTC),
-            duration_ms=max(0, int((time.monotonic() - started_monotonic) * 1000)),
+            duration_ms=(
+                max(0, int((time.monotonic() - started_monotonic) * 1000))
+                if process_started
+                else 0
+            ),
             event_count=parsed.event_count,
             unknown_event_count=parsed.unknown_event_count,
+            thread_started_count=parsed.thread_started_count,
+            turn_started_count=parsed.turn_started_count,
+            terminal_event=parsed.terminal_event,
+            turn_completed_count=parsed.turn_completed_count,
+            turn_failed_count=parsed.turn_failed_count,
+            error_event_count=parsed.error_event_count,
             item_type_counts=parsed.item_type_counts,
             usage_metrics=parsed.usage_metrics,
             stdout_bytes=parser.total_bytes,
@@ -953,15 +1076,18 @@ def unsupported_platform_evidence(
         schema_version="1.0",
         provider=Provider.CODEX,
         cli_version=preflight.cli_version,
+        cli_profile=preflight.cli_profile,
         preflight_checked_at=preflight.checked_at,
         verified_flags=sorted(preflight.verified_flags),
         requested_model=live.model,
         requested_reasoning_effort=live.reasoning_effort,
         sandbox_mode="workspace-write",
         approval_policy="never",
+        approval_basis=CodexApprovalBasis.HEADLESS_EXEC_INTERNAL_NEVER,
         web_search_disabled=True,
         command_network_disabled=True,
         raw_stream_persisted=False,
+        process_started=False,
         status=ProviderExecutionStatus.FAILED,
         failure_kind=LiveFailureKind.UNSUPPORTED_PLATFORM,
         exit_code=None,
@@ -970,6 +1096,12 @@ def unsupported_platform_evidence(
         duration_ms=0,
         event_count=0,
         unknown_event_count=0,
+        thread_started_count=0,
+        turn_started_count=0,
+        terminal_event=CodexTerminalEvent.NONE,
+        turn_completed_count=0,
+        turn_failed_count=0,
+        error_event_count=0,
         item_type_counts={},
         usage_metrics=_not_available_usage(),
         stdout_bytes=0,
