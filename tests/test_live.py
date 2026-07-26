@@ -22,6 +22,8 @@ from agentlab.live import (
     write_live_outputs,
 )
 from agentlab.models import (
+    CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS,
+    CodexCliProfile,
     LiveFailureKind,
     LiveOverallStatus,
     LiveRunArtifact,
@@ -39,6 +41,8 @@ from agentlab.workspace import WorkspaceError
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="Live Codex is POSIX-only")
 
+_SUPPORTED_CODEX_VERSION = next(iter(CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS))
+
 
 def _fake_codex(
     tmp_path: Path,
@@ -53,7 +57,7 @@ def _fake_codex(
         "import json,os,pathlib,sys\n"
         f"inspection=pathlib.Path({str(inspection)!r})\n"
         "if sys.argv[1:] == ['--version']:\n"
-        "    print('codex-cli fake-live-1.0')\n"
+        f"    print({_SUPPORTED_CODEX_VERSION!r})\n"
         "elif sys.argv[1:] == ['exec','--help']:\n"
         f"    print({' '.join(REQUIRED_CODEX_EXEC_FLAGS)!r})\n"
         "else:\n"
@@ -555,6 +559,9 @@ def test_preflight_failure_is_saved_without_creating_workspace(tmp_path: Path) -
     assert outcome.artifact.overall_status is LiveOverallStatus.PROVIDER_ERROR
     assert outcome.artifact.failure_kind is LiveFailureKind.PROVIDER_UNAVAILABLE
     assert outcome.artifact.workspace_lifecycle is WorkspaceLifecycle.NOT_CREATED
+    assert outcome.artifact.codex.cli_profile is CodexCliProfile.NOT_SELECTED
+    assert outcome.artifact.codex.approval_policy is None
+    assert outcome.artifact.codex.approval_basis is None
     assert isinstance(recording.failed, LiveRunFailedEvent)
 
 
@@ -882,6 +889,33 @@ def test_live_recording_rejects_metrics_evaluation_summary_mismatch(
         load_replay_recording(outcome.recording_path)
 
 
+def test_live_recording_rejects_success_without_acceptance_gate(
+    tmp_path: Path,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+    outcome = _run(spec_path, output, environment)
+    events = [
+        json.loads(line)
+        for line in outcome.recording_path.read_text(encoding="utf-8").splitlines()
+    ]
+    terminal = events[1]
+    terminal["evaluation"]["acceptance"] = {
+        "command_count": 0,
+        "passed_count": 0,
+        "failed_count": 0,
+    }
+    terminal["metrics"]["acceptance_tests_passed"] = 0
+    terminal["metrics"]["acceptance_tests_total"] = 0
+    outcome.recording_path.write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RecordingLoadError, match="acceptance Gate"):
+        load_replay_recording(outcome.recording_path)
+
+
 def test_failed_live_recording_rejects_non_failure_kind(tmp_path: Path) -> None:
     spec_path, _fixture, _prompt, output = _write_case(tmp_path)
     live_code = (
@@ -1119,6 +1153,28 @@ def test_live_artifact_rejects_unknown_item_type_key(tmp_path: Path) -> None:
     payload["codex"]["item_type_counts"] = {"secret_vendor_item": 1}
 
     with pytest.raises(ValidationError, match="item_type_counts"):
+        LiveRunArtifact.model_validate(payload)
+
+
+def test_live_artifact_rejects_negative_item_type_count(tmp_path: Path) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+    payload = _run(spec_path, output, environment).artifact.model_dump(mode="json")
+    payload["codex"]["item_type_counts"] = {"message": -1, "command": 2}
+
+    with pytest.raises(ValidationError, match="greater than or equal"):
+        LiveRunArtifact.model_validate(payload)
+
+
+def test_live_artifact_rejects_profile_with_unallowlisted_cli_version(
+    tmp_path: Path,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+    payload = _run(spec_path, output, environment).artifact.model_dump(mode="json")
+    payload["codex"]["cli_version"] = "codex-cli 999.0.0"
+
+    with pytest.raises(ValidationError, match="allowlisted CLI version"):
         LiveRunArtifact.model_validate(payload)
 
 

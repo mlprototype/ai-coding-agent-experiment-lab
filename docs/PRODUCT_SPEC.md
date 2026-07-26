@@ -94,7 +94,7 @@ Phase 3ではSpec検証、ローカルCLI能力確認、保存済みRecordingの
   UTF-8不正、timeout、残存processはfail closedする。
 - PromptはSpec基準の通常UTF-8 fileから上限付きで一度読み、stdinだけで渡す。本文を
   argv、Recording、Evidenceへ保存せず、SHA-256、byte数、redacted flagだけを保存する。
-- Codex processはworkspace-write、headless exec内部のapproval never、ephemeral、JSONL、
+- Codex processはworkspace-write、明示configによるapproval never、ephemeral、JSONL、
   user config/rules無視、strict configで起動し、web searchとmodel-generated command
   networkを無効にする。CLI profile、version、approval根拠をEvidenceへ保存する。
 - ChatGPT-managed CLI authだけを対象とし、API key、auth file copy/parseを実装しない。

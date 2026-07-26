@@ -75,11 +75,13 @@ uv run agentlab live-codex experiments/examples/codex-live-smoke.yaml \
 ```
 
 現在確認済みの`codex-cli 0.146.0-alpha.3.1`は
-`headless_exec_internal_never_v1` profileの必須flagを満たし、read-only preflightに
-成功します。このprofileはheadless `exec`内部のapproval policy `Never`を根拠とし、
-存在しない`--ask-for-approval`をargvへ追加しません。profile名、CLI version、根拠を
-Evidenceへ保存します。manual Live smoke自体はまだ実行しておらず、Phase 3完了条件には
-含まれたままです。
+`headless_exec_explicit_never_v2` profileのversion allowlistと必須flagを満たし、
+read-only preflightに成功します。このprofileは
+`--config approval_policy="never"`をargvで明示し、存在しない
+`--ask-for-approval`には依存しません。profile名、CLI version、明示設定の根拠を
+Evidenceへ保存します。preflightを完了できない場合はprofileを`not_selected`とし、
+approval policyを適用済みとは記録しません。manual Live smoke自体はまだ実行しておらず、
+Phase 3完了条件には含まれたままです。
 
 `--confirm-live-codex`なしではversion/help preflightを含むsubprocessを起動しません。
 確認付き実行はCodex model APIへのPrompt送信とquota消費を伴います。Promptはargvへ

@@ -148,6 +148,10 @@ class LiveRunCompletedEvent(ContractModel):
     def metrics_must_match_codex_summary(self) -> LiveRunCompletedEvent:
         if self.codex.status is not ProviderExecutionStatus.SUCCEEDED:
             raise ValueError("run_completed requires successful Codex Evidence")
+        if self.evaluation.acceptance.command_count < 1:
+            raise ValueError(
+                "run_completed requires at least one acceptance Gate command"
+            )
         if (
             self.metrics.agent_duration_ms != self.codex.duration_ms
             or self.metrics.total_duration_ms

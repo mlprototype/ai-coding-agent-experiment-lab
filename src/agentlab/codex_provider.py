@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import IO, Any, Literal, NoReturn, cast
 
 from agentlab.models import (
+    CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS,
     CODEX_REQUIRED_EXEC_FLAGS,
     CodexApprovalBasis,
     CodexCliProfile,
@@ -106,7 +107,7 @@ class _PreflightHarnessError(subprocess.SubprocessError):
 class CodexPreflight:
     executable: str
     cli_version: str
-    cli_profile: Literal[CodexCliProfile.HEADLESS_EXEC_INTERNAL_NEVER_V1]
+    cli_profile: Literal[CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2]
     checked_at: datetime
     verified_flags: tuple[str, ...]
 
@@ -503,6 +504,13 @@ def preflight_codex(
             "codex --version did not succeed",
             checked_at=checked_at,
         )
+    if version not in CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS:
+        raise CodexPreflightError(
+            LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+            f"Codex CLI version is not allowlisted for the explicit-never profile: {version}",
+            checked_at=checked_at,
+            cli_version=version,
+        )
 
     try:
         help_stdout, help_stderr = _run_preflight_command(
@@ -547,7 +555,7 @@ def preflight_codex(
     return CodexPreflight(
         executable=executable,
         cli_version=version,
-        cli_profile=CodexCliProfile.HEADLESS_EXEC_INTERNAL_NEVER_V1,
+        cli_profile=CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2,
         checked_at=checked_at,
         verified_flags=verified_flags,
     )
@@ -573,6 +581,8 @@ def build_codex_argv(
         "--strict-config",
         "--model",
         model,
+        "--config",
+        'approval_policy="never"',
         "--config",
         f'model_reasoning_effort="{reasoning_effort.value}"',
         "--config",
@@ -634,14 +644,14 @@ def _preflight_failure_evidence(
         schema_version="1.0",
         provider=Provider.CODEX,
         cli_version=error.cli_version,
-        cli_profile=CodexCliProfile.HEADLESS_EXEC_INTERNAL_NEVER_V1,
+        cli_profile=CodexCliProfile.NOT_SELECTED,
         preflight_checked_at=error.checked_at,
         verified_flags=sorted(error.verified_flags),
         requested_model=live.model,
         requested_reasoning_effort=live.reasoning_effort,
         sandbox_mode="workspace-write",
-        approval_policy="never",
-        approval_basis=CodexApprovalBasis.HEADLESS_EXEC_INTERNAL_NEVER,
+        approval_policy=None,
+        approval_basis=None,
         web_search_disabled=True,
         command_network_disabled=True,
         raw_stream_persisted=False,
@@ -1029,7 +1039,7 @@ class CodexProcessRunner:
             requested_reasoning_effort=self._live.reasoning_effort,
             sandbox_mode="workspace-write",
             approval_policy="never",
-            approval_basis=CodexApprovalBasis.HEADLESS_EXEC_INTERNAL_NEVER,
+            approval_basis=CodexApprovalBasis.EXPLICIT_CONFIG_NEVER,
             web_search_disabled=True,
             command_network_disabled=True,
             raw_stream_persisted=False,
@@ -1083,7 +1093,7 @@ def unsupported_platform_evidence(
         requested_reasoning_effort=live.reasoning_effort,
         sandbox_mode="workspace-write",
         approval_policy="never",
-        approval_basis=CodexApprovalBasis.HEADLESS_EXEC_INTERNAL_NEVER,
+        approval_basis=CodexApprovalBasis.EXPLICIT_CONFIG_NEVER,
         web_search_disabled=True,
         command_network_disabled=True,
         raw_stream_persisted=False,

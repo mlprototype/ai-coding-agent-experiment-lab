@@ -19,6 +19,7 @@ from agentlab.codex_provider import (
     resolve_codex_home,
 )
 from agentlab.models import (
+    CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS,
     CodexCliProfile,
     CodexItemType,
     CodexTerminalEvent,
@@ -30,6 +31,8 @@ from agentlab.models import (
 )
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="Codex Provider runner is POSIX-only")
+
+_SUPPORTED_CODEX_VERSION = next(iter(CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS))
 
 
 def _live_settings(**updates: object) -> LiveSettings:
@@ -64,7 +67,7 @@ def _fake_codex(
     tmp_path: Path,
     *,
     live_code: str = "raise SystemExit(99)",
-    version_code: str = "print('codex-cli fake-1.0')",
+    version_code: str = f"print({_SUPPORTED_CODEX_VERSION!r})",
     help_code: str | None = None,
 ) -> tuple[dict[str, str], Path]:
     fake_directory = tmp_path / "fake-bin"
@@ -118,8 +121,8 @@ def test_preflight_uses_only_version_and_help(tmp_path: Path) -> None:
 
     result = preflight_codex(parent_environment=environment)
 
-    assert result.cli_version == "codex-cli fake-1.0"
-    assert result.cli_profile is CodexCliProfile.HEADLESS_EXEC_INTERNAL_NEVER_V1
+    assert result.cli_version == _SUPPORTED_CODEX_VERSION
+    assert result.cli_profile is CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2
     assert result.verified_flags == tuple(sorted(REQUIRED_CODEX_EXEC_FLAGS))
     assert "--ask-for-approval" not in result.verified_flags
     assert not inspection.exists()
@@ -130,6 +133,21 @@ def test_preflight_rejects_missing_command(tmp_path: Path) -> None:
         preflight_codex(parent_environment={"PATH": str(tmp_path)})
 
     assert error.value.failure_kind is LiveFailureKind.PROVIDER_UNAVAILABLE
+
+
+def test_preflight_rejects_unallowlisted_version_before_help(tmp_path: Path) -> None:
+    environment, inspection = _fake_codex(
+        tmp_path,
+        version_code="print('codex-cli 999.0.0')",
+        help_code="inspection.write_text('help-called',encoding='utf-8')",
+    )
+
+    with pytest.raises(CodexPreflightError, match="not allowlisted") as error:
+        preflight_codex(parent_environment=environment)
+
+    assert error.value.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
+    assert error.value.cli_version == "codex-cli 999.0.0"
+    assert not inspection.exists()
 
 
 def test_codex_home_must_be_an_existing_absolute_directory(tmp_path: Path) -> None:
@@ -165,12 +183,12 @@ def test_preflight_does_not_accept_required_flag_as_a_longer_name(
             LiveFailureKind.PROVIDER_UNAVAILABLE,
         ),
         (
-            "print('codex-cli fake-1.0')",
+            f"print({_SUPPORTED_CODEX_VERSION!r})",
             "raise SystemExit(4)",
             LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
         ),
         (
-            "print('codex-cli fake-1.0')",
+            f"print({_SUPPORTED_CODEX_VERSION!r})",
             "print('--json --ephemeral')",
             LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
         ),
@@ -180,7 +198,7 @@ def test_preflight_does_not_accept_required_flag_as_a_longer_name(
             LiveFailureKind.PROVIDER_UNAVAILABLE,
         ),
         (
-            "print('codex-cli fake-1.0')",
+            f"print({_SUPPORTED_CODEX_VERSION!r})",
             "os.write(1,b'\\xff')",
             LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
         ),
@@ -208,9 +226,9 @@ def test_preflight_fails_closed(
     ("version_code", "help_code"),
     [
         ("os.write(1,b'x'*70000)", None),
-        ("os.write(2,b'x'*70000); print('codex-cli fake-1.0')", None),
-        ("print('codex-cli fake-1.0')", "os.write(1,b'x'*70000)"),
-        ("print('codex-cli fake-1.0')", "os.write(2,b'x'*70000)"),
+        (f"os.write(2,b'x'*70000); print({_SUPPORTED_CODEX_VERSION!r})", None),
+        (f"print({_SUPPORTED_CODEX_VERSION!r})", "os.write(1,b'x'*70000)"),
+        (f"print({_SUPPORTED_CODEX_VERSION!r})", "os.write(2,b'x'*70000)"),
     ],
 )
 def test_preflight_rejects_bounded_output_overflow(
@@ -483,7 +501,13 @@ def test_process_runner_uses_safe_argv_stdin_and_separate_environment(
     assert argv[argv.index("--sandbox") + 1] == "workspace-write"
     assert "--ask-for-approval" not in argv
     assert result.evidence.approval_policy == "never"
-    assert result.evidence.approval_basis == "headless_exec_internal_never"
+    assert result.evidence.approval_basis == "explicit_config_never"
+    config_values = [
+        argv[index + 1]
+        for index, argument in enumerate(argv)
+        if argument == "--config"
+    ]
+    assert 'approval_policy="never"' in config_values
     assert "sandbox_workspace_write.network_access=false" in argv
     assert 'web_search="disabled"' in argv
     assert "--dangerously-bypass-approvals-and-sandbox" not in argv
@@ -491,6 +515,48 @@ def test_process_runner_uses_safe_argv_stdin_and_separate_environment(
     persisted = result.evidence.model_dump_json()
     for secret in (prompt_secret, event_secret, stderr_secret):
         assert secret not in persisted
+
+
+def test_explicit_never_is_passed_with_auto_review_managed_config(
+    tmp_path: Path,
+) -> None:
+    live_code = (
+        "managed=(pathlib.Path(os.environ['CODEX_HOME'])/'config.toml').read_text()\n"
+        "configs=[sys.argv[index+1] for index,value in enumerate(sys.argv) "
+        "if value=='--config']\n"
+        "if 'approvals_reviewer = \"auto_review\"' not in managed "
+        "or 'approval_policy=\"never\"' not in configs:\n"
+        "    raise SystemExit(97)\n"
+        "sys.stdin.read()\n"
+        "print(json.dumps({'type':'thread.started'}),flush=True)\n"
+        "print(json.dumps({'type':'turn.started'}),flush=True)\n"
+        "print(json.dumps({'type':'turn.completed'}),flush=True)"
+    )
+    environment, _inspection = _fake_codex(tmp_path, live_code=live_code)
+    (Path(environment["CODEX_HOME"]) / "config.toml").write_text(
+        'approvals_reviewer = "auto_review"\n',
+        encoding="utf-8",
+    )
+    preflight = preflight_codex(parent_environment=environment)
+    workspace, environment_root = _workspace(tmp_path)
+
+    result = CodexProcessRunner(
+        live=_live_settings(),
+        runner=_runner_settings(),
+    ).run(
+        preflight=preflight,
+        prompt=b"safe prompt",
+        workspace=workspace,
+        environment_root=environment_root,
+        parent_environment=environment,
+    )
+
+    assert result.evidence.status is ProviderExecutionStatus.SUCCEEDED
+    assert (
+        result.evidence.cli_profile
+        is CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2
+    )
+    assert result.evidence.approval_basis == "explicit_config_never"
 
 
 def test_process_runner_timeout_stops_parent_and_child(tmp_path: Path) -> None:

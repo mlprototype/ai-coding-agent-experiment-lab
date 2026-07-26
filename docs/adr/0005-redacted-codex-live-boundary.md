@@ -26,10 +26,13 @@ Phase 2 allowlist環境と別の一時HOME/TMP/cacheで起動する。
 実Codex smokeは通常テスト/CIから分離し、レビュー後の明示確認で1回だけ行う。通常テスト
 はfake executableだけを使う。
 
-現行の`codex exec`には`--ask-for-approval`がなく、headless実装がapproval policyを
-`Never`へ設定する。この契約を`headless_exec_internal_never_v1` profileとして固定し、
-Evidenceへprofile、CLI version、approval根拠を保存する。将来別の明示flagを持つCLIへ
-対応する場合は新しいprofileを追加し、既存profileの意味を変更しない。
+現行の`codex exec`には`--ask-for-approval`がない。headless実装の初期`Never`は、解決後の
+`approvals_reviewer`に応じたconfig再構築で維持されない場合があるため、内部既定へ依存
+しない。`--config approval_policy="never"`を明示する契約を
+`headless_exec_explicit_never_v2` profileとして固定し、対応CLI versionをallowlistする。
+Evidenceへprofile、CLI version、`explicit_config_never`のapproval根拠を保存する。
+preflight未完了時はprofileを`not_selected`とし、policy/basisをnullにする。将来別の設定
+方法やCLI versionへ対応する場合は新しいprofileを追加し、既存profileの意味を変更しない。
 
 ## Consequences
 

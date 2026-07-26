@@ -17,12 +17,17 @@ AI Prompt、Login、auth file読取り、network refreshは行わない。
 helpには`--json`、`--ephemeral`、`--sandbox`、
 `--skip-git-repo-check`、`--ignore-user-config`、`--ignore-rules`、`--strict-config`、
 `--model`、`--config`がすべて必要である。不足時は互換性を推測せずfail closedする。
-現在のprofileは`headless_exec_internal_never_v1`である。
-[OpenAI Codexのheadless `exec`実装](https://github.com/openai/codex/blob/main/codex-rs/exec/src/lib.rs)
-がapproval policyを`Never`にする契約を根拠とし、CLIに存在しない
-`--ask-for-approval`は要求しない。永続化するpreflight metadataはprofile、CLI version、
-確認時刻、flag名、approval根拠で、実行pathは保存しない。将来明示flagを持つCLIへ対応
-する場合は、同じprofileを書き換えず別profileとして追加する。
+現在のprofileは`headless_exec_explicit_never_v2`で、対応versionを
+`codex-cli 0.146.0-alpha.3.1`へallowlistする。flag集合が同じでもallowlist外のversionは
+model呼出し前にfail closedする。
+[OpenAI Codexの固定commitにあるheadless `exec`実装](https://github.com/openai/codex/blob/bb6a127bca6c9e190cc9285c4d7bd22c1dff5acb/codex-rs/exec/src/lib.rs)
+では初期値の`Never`が解決後の`approvals_reviewer`に応じて再構築されうるため、内部既定や
+`--ignore-user-config`だけを根拠にしない。profileはCLIに存在しない
+`--ask-for-approval`を要求せず、`--config approval_policy="never"`を明示する。
+永続化するpreflight metadataはprofile、CLI version、確認時刻、flag名、明示approval
+設定の根拠で、実行pathは保存しない。preflight未完了時はprofileを`not_selected`、
+approval policy/basisをnullにする。対応versionや設定方法を変える場合は、同じprofileを
+書き換えず別profileとして追加する。
 
 ## Fixed invocation and Prompt
 
@@ -38,6 +43,7 @@ codex exec
   --ignore-rules
   --strict-config
   --model <Spec model>
+  --config approval_policy="never"
   --config model_reasoning_effort="<Spec effort>"
   --config sandbox_workspace_write.network_access=false
   --config web_search="disabled"
@@ -53,9 +59,9 @@ UTF-8、NUL、空白のみ、上限超過を拒否する。SHA-256、byte数、r
 
 ## Sandbox, network, and authentication
 
-Codexが生成するcommandはworkspace-write sandbox、approval neverで動く。workspace-write
-network accessをfalse、web searchをdisabledにする。Codex自身のmodel API通信は必要で、
-Phase 3はfirewall、VM、containerによる完全なnetwork遮断を保証しない。
+Codexが生成するcommandはworkspace-write sandboxとargvで明示したapproval neverで動く。
+workspace-write network accessをfalse、web searchをdisabledにする。Codex自身のmodel
+API通信は必要で、Phase 3はfirewall、VM、containerによる完全なnetwork遮断を保証しない。
 
 認証は既存CLIのChatGPT-managed authだけを対象にする。`OPENAI_API_KEY`、
 `CODEX_API_KEY`、親の任意secretを継承しない。auth fileをcopy、read、parseせず、
@@ -130,7 +136,7 @@ strict UTF-8 JSONL、key sort、finite number、末尾newline、atomic公開を�
 terminal eventはCodex summaryに加え、Gate種別ごとのcommand/pass/fail件数、全command
 通常完了flag、evaluation duration、changed files/line counts/diff completeness、
 Workspace lifecycleを保存する。`run_completed`ではこのsummaryとMetricsを照合し、
-矛盾をloaderで拒否する。
+acceptance Gateが1件以上あることを要求して、矛盾をloaderで拒否する。
 
 EvidenceはRecording bytesのSHA-256を一方向参照する。成功Recording 1.1は外部CLI、
 subprocess、network、GateなしでReplay Resultへ変換できる。失敗RecordingはMetricsが
@@ -155,5 +161,5 @@ CLI helpが必須flagをすべて持ち、ChatGPT-managed auth、model/quota、�
 READMEの`live-codex ... --confirm-live-codex`を1回だけ手動実行する。
 
 現在確認した`codex-cli 0.146.0-alpha.3.1`は
-`headless_exec_internal_never_v1`のread-only preflightに成功した。manual Live smokeは
-未実施であり、Phase 3は完了していない。
+`headless_exec_explicit_never_v2`のversion allowlistとread-only preflightに成功した。
+manual Live smokeは未実施であり、Phase 3は完了していない。

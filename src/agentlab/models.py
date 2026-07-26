@@ -6,7 +6,7 @@ import re
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import PurePosixPath, PureWindowsPath
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -37,6 +37,14 @@ CODEX_REQUIRED_EXEC_FLAGS = (
     "--skip-git-repo-check",
     "--strict-config",
 )
+
+CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS = frozenset(
+    {
+        "codex-cli 0.146.0-alpha.3.1",
+    }
+)
+
+NonNegativeStrictInt = Annotated[StrictInt, Field(ge=0)]
 
 
 class ComparisonAxis(StrEnum):
@@ -122,13 +130,14 @@ class ProviderExecutionStatus(StrEnum):
 class CodexCliProfile(StrEnum):
     """Versioned CLI contract selected by preflight."""
 
-    HEADLESS_EXEC_INTERNAL_NEVER_V1 = "headless_exec_internal_never_v1"
+    NOT_SELECTED = "not_selected"
+    HEADLESS_EXEC_EXPLICIT_NEVER_V2 = "headless_exec_explicit_never_v2"
 
 
 class CodexApprovalBasis(StrEnum):
     """Why the normalized approval policy is recorded as never."""
 
-    HEADLESS_EXEC_INTERNAL_NEVER = "headless_exec_internal_never"
+    EXPLICIT_CONFIG_NEVER = "explicit_config_never"
 
 
 class CodexTerminalEvent(StrEnum):
@@ -825,14 +834,14 @@ class CodexExecutionEvidence(ContractModel):
     schema_version: Literal["1.0"]
     provider: Literal[Provider.CODEX]
     cli_version: StrictStr | None
-    cli_profile: Literal[CodexCliProfile.HEADLESS_EXEC_INTERNAL_NEVER_V1]
+    cli_profile: CodexCliProfile
     preflight_checked_at: datetime
     verified_flags: list[StrictStr]
     requested_model: StrictStr
     requested_reasoning_effort: ReasoningEffort
     sandbox_mode: Literal["workspace-write"]
-    approval_policy: Literal["never"]
-    approval_basis: Literal[CodexApprovalBasis.HEADLESS_EXEC_INTERNAL_NEVER]
+    approval_policy: Literal["never"] | None
+    approval_basis: Literal[CodexApprovalBasis.EXPLICIT_CONFIG_NEVER] | None
     web_search_disabled: StrictBool
     command_network_disabled: StrictBool
     raw_stream_persisted: StrictBool
@@ -851,7 +860,7 @@ class CodexExecutionEvidence(ContractModel):
     turn_completed_count: StrictInt = Field(ge=0)
     turn_failed_count: StrictInt = Field(ge=0)
     error_event_count: StrictInt = Field(ge=0)
-    item_type_counts: dict[CodexItemType, StrictInt]
+    item_type_counts: dict[CodexItemType, NonNegativeStrictInt]
     usage_metrics: UsageMetrics
     stdout_bytes: StrictInt = Field(ge=0)
     stderr_bytes: StrictInt = Field(ge=0)
@@ -882,6 +891,27 @@ class CodexExecutionEvidence(ContractModel):
 
     @model_validator(mode="after")
     def codex_summary_must_be_semantically_consistent(self) -> CodexExecutionEvidence:
+        if self.cli_profile is CodexCliProfile.NOT_SELECTED:
+            if (
+                self.process_started
+                or self.approval_policy is not None
+                or self.approval_basis is not None
+            ):
+                raise ValueError(
+                    "an unselected Codex profile cannot have execution policy Evidence"
+                )
+        elif self.cli_profile is CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2:
+            if self.cli_version not in CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS:
+                raise ValueError(
+                    "explicit-never Codex profile requires an allowlisted CLI version"
+                )
+            if (
+                self.approval_policy != "never"
+                or self.approval_basis is not CodexApprovalBasis.EXPLICIT_CONFIG_NEVER
+            ):
+                raise ValueError(
+                    "explicit-never Codex profile requires its explicit approval policy"
+                )
         if (
             not self.web_search_disabled
             or not self.command_network_disabled
