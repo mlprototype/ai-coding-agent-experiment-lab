@@ -12,7 +12,9 @@ vertical sliceである。scheduler、staged Workflow、比較実験、自動ret
 `codex --version`、`codex exec --help`だけを固定上限、短いtimeout、分離stdout/stderr、
 strict UTF-8、`shell=False`で確認する。各probeも新規POSIX session/process groupで
 起動し、timeout、正常終了後の残存子process、SIGTERM無視時のSIGKILLをboundedに扱う。
-一時directoryのcleanup失敗はProvider能力エラーへ変換せず`evidence_error`とする。
+selector生成や収集loopの未知例外でもprocess groupを緊急回収する。一時directoryの
+cleanup失敗はProvider能力エラーへ変換せず`evidence_error`とするが、process group回収も
+失敗した場合は`process_cleanup_error`を優先する。
 AI Prompt、Login、auth file読取り、network refreshは行わない。
 
 helpには`--json`、`--ephemeral`、`--sandbox`、
@@ -132,6 +134,9 @@ Provider: `provider_turn_failed`、`provider_cli_nonzero`、
 
 品質: `quality_gate_failure`。Harness: `process_cleanup_error`、
 `gate_harness_error`、`evidence_error`、`unsupported_platform`。
+Provider process cleanupとWorkspace cleanupが同時に失敗した場合は、Codex Evidenceと
+top-level failure kindの両方で`process_cleanup_error`を保持し、Workspace側は
+`workspace_lifecycle=cleanup_failed`で併記する。
 
 Provider成功、全Gate通常完了、完全なtext diff、Workspace cleanupが揃う場合だけMetricsを
 生成する。Gate不合格でもMetricsを生成する。agent durationはCodex wall clock、evaluation

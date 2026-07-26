@@ -9,6 +9,7 @@ from typing import NoReturn
 import pytest
 
 import agentlab.codex_provider as codex_provider_module
+import agentlab.runner as runner_module
 from agentlab.codex_provider import (
     REQUIRED_CODEX_EXEC_FLAGS,
     CodexJsonlParser,
@@ -158,6 +159,99 @@ def test_preflight_cleanup_failure_is_a_harness_error(
         preflight_codex(parent_environment=environment)
 
     assert error.value.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+
+
+def test_preflight_unexpected_collection_error_cleans_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment, _inspection = _fake_codex(
+        tmp_path,
+        version_code="signal.pause()",
+    )
+    spawned_pids: list[int] = []
+    popen = runner_module.subprocess.Popen
+
+    def track_spawn(*args: object, **kwargs: object):
+        process = popen(*args, **kwargs)
+        spawned_pids.append(process.pid)
+        return process
+
+    def fail_selector_creation() -> NoReturn:
+        raise RuntimeError("synthetic unexpected preflight collection failure")
+
+    monkeypatch.setattr("agentlab.runner.subprocess.Popen", track_spawn)
+    monkeypatch.setattr(
+        "agentlab.runner.selectors.DefaultSelector",
+        fail_selector_creation,
+    )
+
+    with pytest.raises(CodexPreflightError) as error:
+        preflight_codex(parent_environment=environment)
+
+    assert error.value.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+    assert len(spawned_pids) == 1
+    with pytest.raises(ProcessLookupError):
+        os.kill(spawned_pids[0], 0)
+
+
+def test_preflight_preserves_process_cleanup_failure_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment, _inspection = _fake_codex(
+        tmp_path,
+        version_code="signal.pause()",
+    )
+    spawned_pids: list[int] = []
+    popen = runner_module.subprocess.Popen
+    terminate_process_group = runner_module._terminate_process_group
+    remove_temporary_root = codex_provider_module.remove_temporary_root
+
+    def track_spawn(*args: object, **kwargs: object):
+        process = popen(*args, **kwargs)
+        spawned_pids.append(process.pid)
+        return process
+
+    def fail_selector_creation() -> NoReturn:
+        raise RuntimeError("synthetic unexpected preflight collection failure")
+
+    def report_cleanup_failure(*args: object, **kwargs: object):
+        termination = terminate_process_group(*args, **kwargs)
+        assert termination.process_group_cleared
+        return termination.model_copy(
+            update={
+                "process_group_cleared": False,
+                "error": "synthetic preflight process cleanup failure",
+            }
+        )
+
+    def report_temporary_cleanup_failure(path: Path) -> tuple[bool, str]:
+        cleanup_succeeded, _cleanup_error = remove_temporary_root(path)
+        assert cleanup_succeeded
+        return False, "synthetic preflight temporary cleanup failure"
+
+    monkeypatch.setattr("agentlab.runner.subprocess.Popen", track_spawn)
+    monkeypatch.setattr(
+        "agentlab.runner.selectors.DefaultSelector",
+        fail_selector_creation,
+    )
+    monkeypatch.setattr(
+        "agentlab.runner._terminate_process_group",
+        report_cleanup_failure,
+    )
+    monkeypatch.setattr(
+        "agentlab.codex_provider.remove_temporary_root",
+        report_temporary_cleanup_failure,
+    )
+
+    with pytest.raises(CodexPreflightError) as error:
+        preflight_codex(parent_environment=environment)
+
+    assert error.value.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+    assert len(spawned_pids) == 1
+    with pytest.raises(ProcessLookupError):
+        os.kill(spawned_pids[0], 0)
 
 
 def test_preflight_rejects_unallowlisted_version_before_help(tmp_path: Path) -> None:

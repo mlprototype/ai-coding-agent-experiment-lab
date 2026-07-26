@@ -13,6 +13,8 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+import agentlab.codex_provider as codex_provider_module
+import agentlab.live as live_module
 from agentlab.codex_provider import REQUIRED_CODEX_EXEC_FLAGS
 from agentlab.live import (
     LiveArtifactLoadError,
@@ -358,6 +360,66 @@ def test_provider_timeout_skips_gates_and_removes_workspace(tmp_path: Path) -> N
     assert outcome.artifact.metrics is None
     assert outcome.artifact.workspace_lifecycle is WorkspaceLifecycle.REMOVED
     assert isinstance(recording.failed, LiveRunFailedEvent)
+
+
+def test_provider_process_cleanup_failure_survives_workspace_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    spec = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
+    spec["live"]["provider_timeout_ms"] = 100
+    spec["runner"]["termination_grace_ms"] = 50
+    spec_path.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
+    environment, _inspection = _fake_codex(
+        tmp_path,
+        live_code="import signal\nsignal.pause()",
+    )
+    terminate_process_group = codex_provider_module.terminate_process_group
+    remove_disposable_workspace = live_module.remove_disposable_workspace
+
+    def report_process_cleanup_failure(*args: object, **kwargs: object):
+        termination = terminate_process_group(*args, **kwargs)
+        assert termination.process_group_cleared
+        return termination.model_copy(
+            update={
+                "process_group_cleared": False,
+                "error": "synthetic Provider process cleanup failure",
+            }
+        )
+
+    def report_workspace_cleanup_failure(workspace: object) -> tuple[bool, str]:
+        cleanup_succeeded, _cleanup_error = remove_disposable_workspace(workspace)
+        assert cleanup_succeeded
+        return False, "synthetic Workspace cleanup failure"
+
+    monkeypatch.setattr(
+        "agentlab.codex_provider.terminate_process_group",
+        report_process_cleanup_failure,
+    )
+    monkeypatch.setattr(
+        "agentlab.live.remove_disposable_workspace",
+        report_workspace_cleanup_failure,
+    )
+
+    outcome = _run(spec_path, output, environment)
+    recording = load_replay_recording(outcome.recording_path)
+
+    assert outcome.artifact.overall_status is LiveOverallStatus.HARNESS_ERROR
+    assert outcome.artifact.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+    assert (
+        outcome.artifact.codex.failure_kind
+        is LiveFailureKind.PROCESS_CLEANUP_ERROR
+    )
+    assert (
+        outcome.artifact.workspace_lifecycle
+        is WorkspaceLifecycle.CLEANUP_FAILED
+    )
+    assert isinstance(recording.failed, LiveRunFailedEvent)
+    assert (
+        recording.failed.failure_kind
+        is LiveFailureKind.PROCESS_CLEANUP_ERROR
+    )
 
 
 def test_provider_signal_termination_skips_gates_and_metrics(tmp_path: Path) -> None:

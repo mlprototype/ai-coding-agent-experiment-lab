@@ -918,10 +918,15 @@ def run_live_codex(
                 else WorkspaceLifecycle.CLEANUP_FAILED
             )
 
-    if workspace_lifecycle is WorkspaceLifecycle.CLEANUP_FAILED:
-        failure_kind = LiveFailureKind.EVIDENCE_ERROR
     assert codex is not None
-    if codex.status is ProviderExecutionStatus.FAILED and failure_kind is None:
+    provider_cleanup_failed = (
+        codex.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+    )
+    if provider_cleanup_failed:
+        failure_kind = LiveFailureKind.PROCESS_CLEANUP_ERROR
+    elif workspace_lifecycle is WorkspaceLifecycle.CLEANUP_FAILED:
+        failure_kind = LiveFailureKind.EVIDENCE_ERROR
+    elif codex.status is ProviderExecutionStatus.FAILED and failure_kind is None:
         failure_kind = codex.failure_kind
     if (
         gate_result is not None
@@ -934,10 +939,14 @@ def run_live_codex(
 
     try:
         source_after = snapshot_directory(source)
-        if source_after.sha256 != source_snapshot.sha256:
+        if (
+            source_after.sha256 != source_snapshot.sha256
+            and not provider_cleanup_failed
+        ):
             failure_kind = LiveFailureKind.EVIDENCE_ERROR
     except SnapshotError:
-        failure_kind = LiveFailureKind.EVIDENCE_ERROR
+        if not provider_cleanup_failed:
+            failure_kind = LiveFailureKind.EVIDENCE_ERROR
     if (
         failure_kind is None
         and codex.status is ProviderExecutionStatus.SUCCEEDED

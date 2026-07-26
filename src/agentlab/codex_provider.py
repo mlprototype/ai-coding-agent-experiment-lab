@@ -103,6 +103,10 @@ class CodexProtocolError(ValueError):
 class _PreflightHarnessError(subprocess.SubprocessError):
     """A read-only probe hit an Evidence/process-cleanup Harness failure."""
 
+    def __init__(self, failure_kind: LiveFailureKind, message: str) -> None:
+        super().__init__(message)
+        self.failure_kind = failure_kind
+
 
 @dataclass(frozen=True)
 class CodexPreflight:
@@ -397,6 +401,7 @@ def _run_preflight_command(
 ) -> tuple[str, str]:
     """Run one bounded read-only probe with the Safe Runner process policy."""
     temporary_root = Path(tempfile.mkdtemp(prefix="agentlab-codex-preflight-")).resolve()
+    harness_error: _PreflightHarnessError | None = None
     try:
         workspace = temporary_root / "workspace"
         environment_root = temporary_root / "environment"
@@ -426,6 +431,11 @@ def _run_preflight_command(
             FailureKind.EVIDENCE_ERROR,
         }:
             raise _PreflightHarnessError(
+                (
+                    LiveFailureKind.PROCESS_CLEANUP_ERROR
+                    if result.harness_failure is FailureKind.PROCESS_CLEANUP_ERROR
+                    else LiveFailureKind.EVIDENCE_ERROR
+                ),
                 f"bounded preflight Harness failure: {result.harness_failure.value}"
             )
         if (
@@ -441,10 +451,18 @@ def _run_preflight_command(
                 f"bounded preflight command failed: {evidence.status.value}"
             )
         return evidence.stdout, evidence.stderr
+    except _PreflightHarnessError as error:
+        harness_error = error
+        raise
     finally:
         cleanup_succeeded, cleanup_error = remove_temporary_root(temporary_root)
-        if not cleanup_succeeded:
+        if not cleanup_succeeded and (
+            harness_error is None
+            or harness_error.failure_kind
+            is not LiveFailureKind.PROCESS_CLEANUP_ERROR
+        ):
             raise _PreflightHarnessError(
+                LiveFailureKind.EVIDENCE_ERROR,
                 cleanup_error or "preflight temporary cleanup failed"
             )
 
@@ -488,7 +506,7 @@ def preflight_codex(
         )
     except _PreflightHarnessError as error:
         raise CodexPreflightError(
-            LiveFailureKind.EVIDENCE_ERROR,
+            error.failure_kind,
             "codex version preflight Harness failed",
             checked_at=checked_at,
         ) from error
@@ -521,7 +539,7 @@ def preflight_codex(
         )
     except _PreflightHarnessError as error:
         raise CodexPreflightError(
-            LiveFailureKind.EVIDENCE_ERROR,
+            error.failure_kind,
             "codex exec help preflight Harness failed",
             checked_at=checked_at,
             cli_version=version,
