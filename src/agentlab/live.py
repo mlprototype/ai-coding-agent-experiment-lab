@@ -29,7 +29,11 @@ from agentlab.codex_provider import (
     resolve_codex_home,
     unsupported_platform_evidence,
 )
-from agentlab.gates import GateExecutionResult, execute_quality_gates_in_workspace
+from agentlab.gates import (
+    GateExecutionResult,
+    GateExecutionTracker,
+    execute_quality_gates_in_workspace,
+)
 from agentlab.models import (
     CodexExecutionEvidence,
     CodexFailureStage,
@@ -1119,6 +1123,7 @@ def run_live_codex(
 
     lifecycle = CodexLifecycleTracker()
     lifecycle.failure_stage = CodexFailureStage.PREFLIGHT
+    gate_tracker = GateExecutionTracker()
     started_at = datetime.now(UTC)
     try:
         preflight_result = preflight(parent_environment=parent_environment)
@@ -1143,7 +1148,7 @@ def run_live_codex(
                 diagnostic_code=failure.diagnostic_code,
                 lifecycle=failure.lifecycle,
                 workspace_lifecycle=WorkspaceLifecycle.NOT_CREATED,
-                gate_executed=False,
+                gate_executed=gate_tracker.gate_executed,
             )
         diff = _empty_diff(
             source_snapshot,
@@ -1190,7 +1195,7 @@ def run_live_codex(
                 diagnostic_code=failure.diagnostic_code,
                 lifecycle=failure.lifecycle,
                 workspace_lifecycle=WorkspaceLifecycle.NOT_CREATED,
-                gate_executed=False,
+                gate_executed=gate_tracker.gate_executed,
             )
         protect_live_inputs(
             spec_path=spec_path,
@@ -1222,7 +1227,7 @@ def run_live_codex(
                 ),
                 lifecycle=lifecycle,
                 workspace_lifecycle=WorkspaceLifecycle.NOT_CREATED,
-                gate_executed=False,
+                gate_executed=gate_tracker.gate_executed,
             )
         return LiveCodexOutcome(artifact, recording_path, output_path)
 
@@ -1320,6 +1325,7 @@ def run_live_codex(
                 workspace=workspace.workspace,
                 environment_root=gate_environment_root,
                 temporary_root=workspace.temporary_root,
+                execution_tracker=gate_tracker,
             )
             commands = gate_result.commands
             evaluation_duration_ms = gate_result.evaluation_duration_ms
@@ -1385,7 +1391,7 @@ def run_live_codex(
             diagnostic_code=diagnostic_failure.diagnostic_code,
             lifecycle=diagnostic_failure.lifecycle,
             workspace_lifecycle=workspace_lifecycle,
-            gate_executed=gate_result is not None,
+            gate_executed=gate_tracker.gate_executed,
         )
 
     assert codex is not None
@@ -1486,7 +1492,7 @@ def run_live_codex(
             diagnostic_code=construction_error.diagnostic_code,
             lifecycle=construction_error.lifecycle,
             workspace_lifecycle=workspace_lifecycle,
-            gate_executed=gate_result is not None,
+            gate_executed=gate_tracker.gate_executed,
         )
     protect_live_inputs(
         spec_path=spec_path,
@@ -1516,6 +1522,6 @@ def run_live_codex(
             diagnostic_code=LiveDiagnosticCode.PAIRED_OUTPUT_PUBLICATION_FAILED,
             lifecycle=lifecycle,
             workspace_lifecycle=workspace_lifecycle,
-            gate_executed=gate_result is not None,
+            gate_executed=gate_tracker.gate_executed,
         )
     return LiveCodexOutcome(artifact, recording_path, output_path)

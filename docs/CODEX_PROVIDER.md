@@ -125,6 +125,9 @@ Diagnosticはrun／experiment／taskの識別子、Harness failure kind、固定
 保持し、`false`や未起動へ丸めない。Provider活動を判定するための観測が不足すれば
 `provider_activity_determined=unknown`とし、Diagnosticの存在からProvider未起動、
 Prompt未送信、API未到達、quota未消費を推論しない。
+`gate_executed=true`は、少なくとも1件のGate command invocationを試行したことを意味する。
+共有in-memory trackerを各command起動試行の直前に単方向で更新するため、その後Gate executor
+から例外が漏れて戻り値を得られなくても`false`へ戻さない。
 
 `diagnostic_code`はCodex Evidence validation、lifecycle fallback Evidence validation、
 Recording構築、Live Artifact構築、paired output公開を区別する。Diagnostic自体の公開失敗

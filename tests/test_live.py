@@ -1657,6 +1657,165 @@ def test_strict_paired_construction_faults_have_distinct_diagnostic_codes(
     assert str(tmp_path).encode() not in persisted
 
 
+@pytest.mark.parametrize(
+    ("fault_target", "expected_code"),
+    [
+        (
+            "recording",
+            LiveDiagnosticCode.RECORDING_CONSTRUCTION_FAILED,
+        ),
+        (
+            "artifact",
+            LiveDiagnosticCode.LIVE_ARTIFACT_CONSTRUCTION_FAILED,
+        ),
+    ],
+)
+def test_post_gate_paired_construction_failure_records_gate_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_target: str,
+    expected_code: LiveDiagnosticCode,
+) -> None:
+    spec_path, _fixture, prompt_path, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+    preflight_result = codex_provider_module.preflight_codex(
+        parent_environment=environment
+    )
+    prepare_workspace = live_module.prepare_disposable_workspace
+    temporary_roots: list[Path] = []
+
+    def track_workspace(*args: object, **kwargs: object):
+        workspace = prepare_workspace(*args, **kwargs)
+        temporary_roots.append(workspace.temporary_root)
+        return workspace
+
+    def fail_construction(*_args: object, **_kwargs: object) -> NoReturn:
+        raise RuntimeError("synthetic post-Gate construction exception secret")
+
+    monkeypatch.setattr(
+        "agentlab.live.prepare_disposable_workspace",
+        track_workspace,
+    )
+    if fault_target == "recording":
+        monkeypatch.setattr(
+            "agentlab.live.live_recording_jsonl_bytes",
+            fail_construction,
+        )
+    else:
+        monkeypatch.setattr("agentlab.live.LiveRunArtifact", fail_construction)
+
+    with pytest.raises(LiveDiagnosticCreatedError):
+        run_live_codex(
+            spec_path,
+            task_id="task-1",
+            repetition_index=0,
+            run_id=f"offline-post-gate-{fault_target}",
+            output_path=output,
+            confirm_live_codex=True,
+            parent_environment=environment,
+            preflight=lambda **_kwargs: preflight_result,
+        )
+
+    diagnostic_path = _diagnostic_path(output)
+    diagnostic = load_failure_diagnostic(diagnostic_path)
+    assert diagnostic.diagnostic_code is expected_code
+    assert diagnostic.gate_executed is True
+    assert diagnostic.paired_artifacts_published is False
+    assert diagnostic.workspace_lifecycle is WorkspaceLifecycle.REMOVED
+    assert not output.exists()
+    assert not (spec_path.parent / "recordings" / "live.jsonl").exists()
+    assert len(temporary_roots) == 1
+    assert not temporary_roots[0].exists()
+    persisted = diagnostic_path.read_bytes()
+    forbidden = [
+        prompt_path.read_bytes(),
+        b"synthetic post-Gate construction exception secret",
+        environment["CODEX_HOME"].encode(),
+        environment["OPENAI_API_KEY"].encode(),
+        environment["CODEX_API_KEY"].encode(),
+        environment["AGENTLAB_PARENT_SECRET"].encode(),
+        b"raw-event-secret",
+        b"raw-stderr-secret",
+        str(tmp_path).encode(),
+    ]
+    assert all(value not in persisted for value in forbidden)
+
+
+def test_gate_invocation_exception_does_not_reset_diagnostic_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture, prompt_path, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+    preflight_result = codex_provider_module.preflight_codex(
+        parent_environment=environment
+    )
+    prepare_workspace = live_module.prepare_disposable_workspace
+    temporary_roots: list[Path] = []
+
+    def track_workspace(*args: object, **kwargs: object):
+        workspace = prepare_workspace(*args, **kwargs)
+        temporary_roots.append(workspace.temporary_root)
+        return workspace
+
+    def fail_gate_invocation(*_args: object, **_kwargs: object) -> NoReturn:
+        raise RuntimeError("synthetic Gate invocation exception secret")
+
+    def fail_recording(*_args: object, **_kwargs: object) -> NoReturn:
+        raise RuntimeError("synthetic paired construction exception secret")
+
+    monkeypatch.setattr(
+        "agentlab.live.prepare_disposable_workspace",
+        track_workspace,
+    )
+    monkeypatch.setattr(
+        "agentlab.gates.LocalCommandRunner.run",
+        fail_gate_invocation,
+    )
+    monkeypatch.setattr(
+        "agentlab.live.live_recording_jsonl_bytes",
+        fail_recording,
+    )
+
+    with pytest.raises(LiveDiagnosticCreatedError):
+        run_live_codex(
+            spec_path,
+            task_id="task-1",
+            repetition_index=0,
+            run_id="offline-gate-invocation-exception",
+            output_path=output,
+            confirm_live_codex=True,
+            parent_environment=environment,
+            preflight=lambda **_kwargs: preflight_result,
+        )
+
+    diagnostic_path = _diagnostic_path(output)
+    diagnostic = load_failure_diagnostic(diagnostic_path)
+    assert (
+        diagnostic.diagnostic_code
+        is LiveDiagnosticCode.RECORDING_CONSTRUCTION_FAILED
+    )
+    assert diagnostic.gate_executed is True
+    assert diagnostic.paired_artifacts_published is False
+    assert diagnostic.workspace_lifecycle is WorkspaceLifecycle.REMOVED
+    assert not output.exists()
+    assert not (spec_path.parent / "recordings" / "live.jsonl").exists()
+    assert len(temporary_roots) == 1
+    assert not temporary_roots[0].exists()
+    persisted = diagnostic_path.read_bytes()
+    forbidden = [
+        prompt_path.read_bytes(),
+        b"synthetic Gate invocation exception secret",
+        b"synthetic paired construction exception secret",
+        environment["CODEX_HOME"].encode(),
+        environment["OPENAI_API_KEY"].encode(),
+        environment["CODEX_API_KEY"].encode(),
+        environment["AGENTLAB_PARENT_SECRET"].encode(),
+        str(tmp_path).encode(),
+    ]
+    assert all(value not in persisted for value in forbidden)
+
+
 def test_paired_publication_failure_creates_standalone_diagnostic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

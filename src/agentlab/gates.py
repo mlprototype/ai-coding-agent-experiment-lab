@@ -72,6 +72,16 @@ class GateExecutionResult:
     harness_detail: str | None
 
 
+@dataclass
+class GateExecutionTracker:
+    """Monotonic observation of whether any Gate command invocation was attempted."""
+
+    gate_executed: bool = False
+
+    def mark_command_invocation_attempted(self) -> None:
+        self.gate_executed = True
+
+
 class _DuplicateEvidenceKeyError(ValueError):
     pass
 
@@ -234,11 +244,17 @@ def execute_quality_gates_in_workspace(
     workspace: Path,
     environment_root: Path,
     temporary_root: Path,
+    execution_tracker: GateExecutionTracker | None = None,
 ) -> GateExecutionResult:
     """Run only Phase 2 Gate argv inside an already-prepared disposable Workspace."""
     assert spec.runner is not None
     ensure_runner_platform_supported()
     local_runner = LocalCommandRunner(spec.runner)
+    tracker = (
+        GateExecutionTracker()
+        if execution_tracker is None
+        else execution_tracker
+    )
     commands: list[CommandEvidence] = []
     harness_failure: FailureKind | None = None
     harness_detail: str | None = None
@@ -247,6 +263,7 @@ def execute_quality_gates_in_workspace(
         should_stop = False
         for gate, configured_commands in _command_groups(spec):
             for command_index, argv in enumerate(configured_commands):
+                tracker.mark_command_invocation_attempted()
                 result = local_runner.run(
                     gate=gate,
                     command_index=command_index,
