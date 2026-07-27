@@ -38,14 +38,16 @@ Phase 0〜2を完了し、現在は
 
 Replayは引き続きRecording内の保存済みMetricsだけを再構成し、外部処理を呼びません。
 通常テストは短時間のfake Codex executableだけを使い、実Codex、外部AI、network、
-quotaを呼びません。Phase 3のmanual Live smokeは累計4回実行し、4回とも成功受入に
-達していないため、Phase 3は引き続きCurrentです。003ではstrict lifecycle Evidenceを
-構築できず、004はSpec予約commit
-`b54ab576d352553227877c8d59d4af611e79b884`に対する1回の実行でCodex Evidence
-validationに失敗しました。004はFailure Diagnostic 1.0だけを作成し、
-Evidence／Recording、Gate、Replayはありません。Provider process開始とcleanup成功は
-観測済みですが、Prompt送信、model API到達、quota消費、実際のJSONL event列は確定不能です。
-003／004は再実行せず、次回Liveには修正commitのレビューと別の明示承認が必要です。
+quotaを呼びません。Phase 3のmanual Live smokeは累計5回実行し、5回とも成功受入に
+達していないため、Phase 3は引き続きCurrentです。005はSpec予約commit
+`b63024ab2214611b059fb75da0444d200d3d32d9`（修正実装は親commit
+`2cb4eadfbfdc54e3d71f1d6a1a070bd3e53a3566`）に対して1回だけ実行し、
+`provider_turn_failed`／exit 1になりました。Evidence 1.4とRecording 1.1はstrict
+再読込でき、Workspaceとprocess groupの回収、Recording SHA-256、redactionも確認済みです。
+一方、Gateは0件、Metricsはnull、Replayは未実行で、Diagnosticは作成されていません。
+raw turn errorを保存していないため根本原因は復元不能であり、Promptのstdin書込み完了、
+model API到達、quota消費も確定不能です。003〜005は再実行せず、次回Liveには診断修正commit
+のレビュー、新しいSpec／run-id／出力先、別の明示承認が必要です。
 scheduler、staged Workflow、Workflow A/B、Antigravity、Provider比較、比較レポートは
 未実装です。
 
@@ -72,8 +74,9 @@ uv run mypy src
 ```
 
 次はPhase 3で使用したmanual smokeのCLI形式です。実Codexを使うため、通常テストやCIでは
-実行しません。承認済みmanual smokeは累計4回で、003／004は再実行しません。新しい実行は
-レビュー済みの別commitと個別の明示承認なしには行いません。
+実行しません。承認済みmanual smokeは累計5回で、003〜005は再実行しません。新しい実行は
+レビュー済みの診断修正commit、新しいSpec／run-id／出力先、個別の明示承認なしには
+行いません。
 
 ```console
 uv run agentlab live-codex experiments/examples/codex-live-smoke.yaml \
@@ -93,8 +96,11 @@ Evidenceへ保存します。preflightを完了できない場合はprofileを`n
 approval policyを適用済みとは記録しません。preflight完了後もProvider起動前なら、選択済み
 profileと確認済みflagを保持しつつ、approval policyはnullのままです。Codex Evidence 1.3は
 runner、Popen試行、process生成、process group回収の観測状態を固定Enumで保持し、新規
-Evidence 1.4はtop-level `error`をturn terminalと分離して数えます。1.1〜1.3は従来の
-制約のままstrict loadできます。固定CLI sourceで到達可能なpre-turn warningと
+Evidence 1.4はtop-level `error`をturn terminalと分離して数えます。Evidence 1.5は
+PromptのOS stdin pipe書込みを`not_started`／`partial`／`complete`／`unknown`で観測し、
+free-formなProvider失敗messageを保存せず固定Enumのadvisory hintへ分類します。このhintは
+`failure_kind`や根本原因の代替ではありません。1.1〜1.4は従来の制約のままstrict load
+できます。固定CLI sourceで到達可能なpre-turn warningと
 `error`→`turn.failed`へparserをオフラインで合わせましたが、004の実際のevent列は
 復元できず、この欠陥が004の直接原因だったとは断定しません。Failure Diagnosticは、
 strict paired成果物を構築できない場合だけ固定Enumの観測値をatomic・上書き禁止で保存し、
@@ -105,6 +111,8 @@ Evidence／Recordingの代替でもReplay入力でもありません。
 含めずstdinから渡し、Prompt本文、raw Codex JSONL、raw stderr、agent message、
 reasoning、command output、thread/session IDをRecordingやEvidenceへ保存しません。
 PromptはSHA-256とbyte数だけを保存します。
+Evidence 1.5のstdin状態はHarnessがOS pipeへ書いたbyte数だけを表し、CodexがPromptを
+読んだこと、model APIへ送ったこと、quotaを消費したことを証明しません。
 
 Phase 3の認証対象は既存Codex CLIのChatGPT-managed authenticationだけです。
 `OPENAI_API_KEY`と`CODEX_API_KEY`はProvider processへ継承せず、API key方式は未対応です。
@@ -148,7 +156,7 @@ macOSはlocal process-tree testで検証済みです。Linux実装経路は有�
 - Phase 0: Foundation and Capability Spike（完了）
 - Phase 1: Replay Vertical Slice（完了）
 - Phase 2: Safe Runner, Evidence and Quality Gate（完了）
-- Phase 3: Codex CLI Provider（現在、manual Live smokeのoffline修正・再レビュー中）
+- Phase 3: Codex CLI Provider（現在、成功経路受入用diagnosticsのoffline修正・再レビュー中）
 - Phase 4: Workflow A/B Experiment
 - Phase 5: Antigravity CLI Provider
 - Phase 6: Multi-language Fixtures and Public Report

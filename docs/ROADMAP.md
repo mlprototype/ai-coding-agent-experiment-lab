@@ -61,19 +61,21 @@ JSONL parser、Provider process tree停止、正規化Codex Evidence、redaction
 
 **受入条件:** 手動の隔離環境で一つのfixtureを実行・Recordでき、その記録をReplayして
 同じ正規化eventを得る。認証情報や機密Promptを成果物へ保存しない。通常CIは呼ばない。
-実Codexによるmanual Live smokeは累計4回実行し、4回とも成功受入に達していない。003は
-strict lifecycle Evidenceを構築できず、Provider活動は確定不能である。004は予約commit
-`b54ab576d352553227877c8d59d4af611e79b884`に対して1回だけ実行し、Codex Evidence
-validation失敗となった。004はFailure Diagnostic 1.0だけを作成し、Evidence／Recording、
-Gate、Replayはない。Provider process開始とcleanup成功は観測済みだが、Prompt送信、
-model API到達、quota消費、実際のJSONL event列は確定不能である。
+実Codexによるmanual Live smokeは累計5回実行し、5回とも成功受入に達していない。005は
+予約commit `b63024ab2214611b059fb75da0444d200d3d32d9`（親の修正実装commit
+`2cb4eadfbfdc54e3d71f1d6a1a070bd3e53a3566`）に対して1回だけ実行し、
+`provider_turn_failed`／exit 1になった。Evidence 1.4とRecording 1.1はstrict再読込、
+SHA-256照合、redaction、Workspace／process group回収に成功したが、Gateは0件、Metricsは
+null、Replayは未実行でDiagnosticもない。raw turn errorは保存されず根本原因を復元できない。
+Prompt書込み完了、model API到達、quota消費も確定不能であり、原因を推測しない。
 
 固定CLI sourceとparserの間にあるpre-turn warning、top-level `error`→`turn.failed`、
 拒否eventの部分的な件数更新という互換性欠陥をオフライン修正する。Codex Evidence 1.4で
-top-level error件数とturn terminalを分離し、1.1〜1.3のstrict契約を維持する。ただし、この
-欠陥が004で実際に発生したevent列だったとは断定しない。001〜004の失敗履歴とGit管理外
-成果物を保持し、003／004は再実行しない。次回Liveには修正commitのレビューと別の明示承認
-を必要とする。Phase 3はCurrentのままとし、Completeへ変更しない。
+top-level error件数とturn terminalを分離した。Evidence 1.5ではOS stdin pipe書込み状態と、
+free-form messageを破棄して得る固定Enumのadvisory failure hintを追加し、1.1〜1.4のstrict
+契約を維持する。001〜005の全履歴とGit管理外成果物を保持し、003〜005は再実行しない。
+次回Liveにはdiagnostics commitのレビュー、新しいSpec／run-id／出力先、別の明示承認を
+必要とする。Phase 3はCurrentのままとし、Completeへ変更しない。Phase 4は未着手である。
 
 ## Phase 4: Workflow A/B Experiment
 

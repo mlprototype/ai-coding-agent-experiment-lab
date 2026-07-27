@@ -4,9 +4,9 @@
 
 Phase 3は、1 task・1 Codex Provider・1 repetition・`one_shot`を人間が手動実行する最小
 vertical sliceである。scheduler、staged Workflow、比較実験、自動retryはPhase 4以降で
-あり、実装していない。通常テストはfake Codexだけを使う。manual Live smokeは累計4回
-実行し、4回とも成功受入に達していない。003／004は再実行せず、次回Liveには新しい
-修正commitのレビューと別の明示承認が必要である。
+あり、実装していない。通常テストはfake Codexだけを使う。manual Live smokeは累計5回
+実行し、5回とも成功受入に達していない。003〜005は再実行せず、次回Liveには診断修正
+commitのレビュー、新しいSpec／run-id／出力先、別の明示承認が必要である。
 
 ## Read-only preflight
 
@@ -66,6 +66,10 @@ codex exec
 最後の`-`によりPromptをstdinから渡す。Prompt本文はargv、process list、Recording、
 Evidenceへ入れない。Prompt pathはSpec基準の相対pathで、symlink、通常file以外、不正
 UTF-8、NUL、空白のみ、上限超過を拒否する。SHA-256、byte数、redacted=trueだけを保存する。
+Evidence 1.5ではOS pipeへの書込みだけを`not_started`、`partial`、`complete`、`unknown`
+の固定Enumと書込み済みbyte数で観測する。`complete`はHarnessが全Prompt bytesをpipeへ
+書いたことだけを意味し、Codexによる読取り、Prompt送信、model API到達、quota消費を
+証明しない。観測を失った場合はbyte数を合成せず`unknown`とする。
 
 `--skip-git-repo-check`は検証済みFixtureの使い捨てコピーだけに使用する。一般repositoryを
 対象にするCLI機能ではない。danger-full-access、full-auto、yolo、resumeは使わない。
@@ -104,6 +108,15 @@ top-level `error`は独立した観測件数として保持し、直ちにtermin
 状態を一括反映するため、拒否したeventはevent数、lifecycle、item数、Usage、terminalを
 部分更新しない。受信byte数だけは実際のstdout観測値として維持する。
 
+top-level `error.message`、`turn.failed.error.message`、存在する場合のerror item
+`message`はstringだけを受理する。固定CLI sourceではこれらがfree-form messageであり、
+安定したerror codeは確認できない。Evidence 1.5は最大4096 bytesのmessageをmemory内でだけ
+狭いallowlistへ照合し、`authentication`、`model_access`、`quota_or_rate_limit`、
+`connectivity`、`service`、`policy_or_entitlement`、`unknown`、`conflicting`の固定Enum
+だけをadvisory hintとして保存する。同じ分類の複数sourceは一つへ集約し、異なる分類は
+`conflicting`とする。成功時は`not_applicable`である。raw message、substring、正規化文字列、
+hash、正規表現結果は保存せず、hintは`failure_kind`や根本原因を変更しない。
+
 item payloadは保存せずitem type件数だけを数え、認識していないitem type文字列は本文を
 保持せず`unknown`へ集約する。未知eventはraw payloadを破棄してunknown件数へ加算し、
 core lifecycleが正しければ許容する。Evidenceにはthread/turn開始数、turn terminal種別、
@@ -123,7 +136,8 @@ Provider環境構築、process起動試行、pipe/selector初期化、process収
 `runner_state`、`invocation_state`、`cleanup_state`を固定Enumで保存し、runner未開始、
 Popen未試行、Popen試行済みでprocess未生成、process生成済み、回収済み、回収失敗を
 表現する。1.4はこのlifecycle契約を継承し、top-level `error`件数とturn terminalを
-独立して表現する。新規実行だけを1.4で生成し、1.3のterminal/error対応は変更しない。
+独立して表現する。1.5はstdin write観測とadvisory Provider failure hintを追加する。
+新規実行だけを1.5で生成し、1.1〜1.4の既存fieldとterminal/error対応は変更しない。
 `Popen`を呼んだ時点から`provider_invocation_attempted`とapproval
 `never`/`explicit_config_never`を記録し、spawn失敗では`process_started=false`を保つ。
 それ以前は`preflight_completed`、`process_started=false`、approval policy/basis null
@@ -157,8 +171,8 @@ traceback、filesystem pathはDiagnosticへ保存しない。任意の例外clas
 固定Enum以外の失敗理由を永続化しない。
 
 既存CodexExecutionEvidence 1.1は`failure_stage`なし、1.2は1.3以降のlifecycle fieldなしで
-引き続きstrict loaderが受理する。1.1／1.2／1.3のvalidatorを緩めず、新規Evidenceだけを
-1.4で保存する。保存済みCodex Evidence 1.1〜1.3、Recording 1.1、Live Artifact 1.0、
+引き続きstrict loaderが受理する。1.1〜1.4のvalidatorを緩めず、新規Evidenceだけを
+1.5で保存する。保存済みCodex Evidence 1.1〜1.4、Recording 1.1、Live Artifact 1.0、
 Failure Diagnostic 1.0を変換・上書きせず後方互換で読み込める。旧1.2の
 `provider_orchestration` fallbackはrunner内部の観測状態を保持しなかったため、そこから
 Provider起動、Prompt送信、model API到達、quota消費、process group回収の有無を確定しては
@@ -171,7 +185,8 @@ CLI profile/version、execution stage、時刻/duration、process開始有無、
 thread/turn/terminal/event/unknown/item件数、Usage、stdout/stderr byte数と上限状態、
 process termination、safe failure kind、1.2以降のsafe failure stageを保存する。
 1.3以降はrunner／invocation／cleanupの固定状態も保存し、1.4ではtop-level errorを
-turn terminalと分離して保存する。
+turn terminalと分離して保存する。1.5ではstdin write状態／byte数とadvisory Provider
+failure hintを保存する。
 
 Prompt本文、agent最終回答、reasoning、command本文/output、file content、raw JSONL、
 raw stderr、thread/session ID、executable path、HOME/CODEX_HOME、認証情報は保存しない。
@@ -254,7 +269,7 @@ READMEの`live-codex ... --confirm-live-codex`を明示承認の範囲で手動�
 
 現在確認した`codex-cli 0.146.0-alpha.3.1`は
 `headless_exec_explicit_never_v2`のversion allowlistとread-only preflightに成功した。
-manual Live smokeは累計4回実行し、4回とも成功受入に達していない。2回目は
+manual Live smokeは累計5回実行し、5回とも成功受入に達していない。2回目は
 `overall_status=harness_error`、`failure_kind=evidence_error`、
 `failure_stage=provider_orchestration`だったが、旧1.2 fallbackが起動・回収状態を
 ゼロ値で合成しうる欠陥があった。この成果物だけからProvider起動、Prompt送信、model API
@@ -276,6 +291,22 @@ process開始とprocess group cleanup成功を観測したが、Prompt送信、m
 消費、実際のJSONL event列は確定不能である。固定CLI sourceとの比較で、pre-turn warningと
 top-level `error`→`turn.failed`を拒むparser互換性欠陥、および拒否eventが件数を部分更新する
 欠陥は確定したためオフライン修正した。ただし004のevent列は復元できず、この欠陥が004の
-直接原因だったとは断定しない。004は再実行しない。Phase 3はCurrentのままであり、次回
-Liveは新しい修正commitのレビューと別の明示承認がある場合だけ、新しいSpecとrun-idで
-1回実行する。
+直接原因だったとは断定しない。004は再実行していない。
+
+005はSpec予約commit `b63024ab2214611b059fb75da0444d200d3d32d9`で、修正実装commit
+`2cb4eadfbfdc54e3d71f1d6a1a070bd3e53a3566`を親に持つ状態に対して1回だけ実行した。
+`overall_status=provider_error`、`failure_kind=provider_turn_failed`、exit 1で、
+event 5件（thread開始1、turn開始1、top-level error 1、error item 1、turn.failed 1）を
+Evidence 1.4へ保存した。Evidence 1.4とRecording 1.1はstrict再読込でき、Recording
+SHA-256一致、Workspace `removed`、process group回収、redactionを確認した。Gateは0件、
+Metricsはnull、Replayは未実行で、Failure Diagnosticは作成されていない。raw turn errorを
+保存しない契約のため根本原因は復元不能であり、Evidence 1.4にはstdin write観測がないため
+Prompt書込み完了、model API到達、quota消費も確定不能である。認証、model access、quota、
+network、serviceのいずれかを原因と推測しない。課題は1行の`TODO`を`COMPLETE`へ変える合成
+fixtureであり、複雑さを失敗理由とはしない。001／002成果物4件、004 Diagnostic、005
+Evidence／RecordingはGit管理外で保持し、005は再実行しない。
+
+この履歴を補完せず、commit `a5193e3693afe380bddc181895c1e29b8624c24c`でEvidence 1.5の
+stdin write観測とadvisory failure hintをoffline追加した。次回Liveはこのdiagnostics
+commitのレビュー、新しいSpec／run-id／Evidence／Recording／Diagnostic出力先、別の
+明示承認が揃う場合だけ1回実行する。Phase 3はCurrentのままで、Phase 4は未着手である。
