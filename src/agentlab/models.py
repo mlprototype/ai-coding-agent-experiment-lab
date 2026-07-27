@@ -271,6 +271,29 @@ class CodexTerminalEvent(StrEnum):
     ERROR = "error"
 
 
+class CodexStdinWriteState(StrEnum):
+    """Observed OS-pipe write progress for the redacted Prompt bytes."""
+
+    NOT_STARTED = "not_started"
+    PARTIAL = "partial"
+    COMPLETE = "complete"
+    UNKNOWN = "unknown"
+
+
+class CodexProviderFailureHint(StrEnum):
+    """Advisory classification derived from bounded, discarded CLI messages."""
+
+    NOT_APPLICABLE = "not_applicable"
+    AUTHENTICATION = "authentication"
+    MODEL_ACCESS = "model_access"
+    QUOTA_OR_RATE_LIMIT = "quota_or_rate_limit"
+    CONNECTIVITY = "connectivity"
+    SERVICE = "service"
+    POLICY_OR_ENTITLEMENT = "policy_or_entitlement"
+    UNKNOWN = "unknown"
+    CONFLICTING = "conflicting"
+
+
 class CodexItemType(StrEnum):
     AGENT_MESSAGE = "agent_message"
     COMMAND = "command"
@@ -961,7 +984,7 @@ class LiveEvaluationSummary(ContractModel):
 class CodexExecutionEvidence(ContractModel):
     """Redacted summary of one Codex CLI process; raw events are never persisted."""
 
-    schema_version: Literal["1.1", "1.2", "1.3", "1.4"]
+    schema_version: Literal["1.1", "1.2", "1.3", "1.4", "1.5"]
     provider: Literal[Provider.CODEX]
     cli_version: StrictStr | None
     cli_profile: CodexCliProfile
@@ -981,6 +1004,10 @@ class CodexExecutionEvidence(ContractModel):
     command_network_disabled: StrictBool
     raw_stream_persisted: StrictBool
     process_started: StrictBool
+    stdin_write_state: CodexStdinWriteState | None = None
+    stdin_bytes_written: StrictInt | None = Field(default=None, ge=0)
+    stdin_bytes_total: StrictInt | None = Field(default=None, gt=0)
+    provider_failure_hint: CodexProviderFailureHint | None = None
     status: ProviderExecutionStatus
     failure_kind: LiveFailureKind
     exit_code: StrictInt | None
@@ -1026,6 +1053,61 @@ class CodexExecutionEvidence(ContractModel):
 
     @model_validator(mode="after")
     def codex_summary_must_be_semantically_consistent(self) -> CodexExecutionEvidence:
+        diagnostic_values = (
+            self.stdin_write_state,
+            self.stdin_bytes_written,
+            self.stdin_bytes_total,
+            self.provider_failure_hint,
+        )
+        if self.schema_version in {"1.1", "1.2", "1.3", "1.4"}:
+            if any(value is not None for value in diagnostic_values):
+                raise ValueError(
+                    "Codex Evidence 1.1-1.4 must not contain 1.5 diagnostics"
+                )
+        else:
+            if self.stdin_write_state is None or self.provider_failure_hint is None:
+                raise ValueError(
+                    "Codex Evidence 1.5 requires stdin state and Provider failure hint"
+                )
+            if self.stdin_write_state is CodexStdinWriteState.NOT_STARTED:
+                if self.stdin_bytes_written != 0:
+                    raise ValueError("not_started stdin requires zero written bytes")
+            elif self.stdin_write_state is CodexStdinWriteState.PARTIAL:
+                if (
+                    self.stdin_bytes_written is None
+                    or self.stdin_bytes_total is None
+                    or not 0 < self.stdin_bytes_written < self.stdin_bytes_total
+                ):
+                    raise ValueError(
+                        "partial stdin requires written bytes below the known total"
+                    )
+            elif self.stdin_write_state is CodexStdinWriteState.COMPLETE:
+                if (
+                    self.stdin_bytes_written is None
+                    or self.stdin_bytes_total is None
+                    or self.stdin_bytes_written != self.stdin_bytes_total
+                ):
+                    raise ValueError(
+                        "complete stdin requires written bytes equal to the known total"
+                    )
+            elif self.stdin_bytes_written is not None:
+                raise ValueError("unknown stdin state must not claim a written byte count")
+            if (
+                not self.process_started
+                and self.stdin_write_state is not CodexStdinWriteState.NOT_STARTED
+            ):
+                raise ValueError(
+                    "a Provider process that was not started cannot write Prompt bytes"
+                )
+            if (
+                not self.process_started
+                and self.provider_failure_hint
+                is not CodexProviderFailureHint.NOT_APPLICABLE
+            ):
+                raise ValueError(
+                    "pre-spawn Evidence cannot contain a Provider message hint"
+                )
+
         if self.schema_version == "1.1":
             if self.failure_stage is not None:
                 raise ValueError("Codex Evidence 1.1 must not contain failure_stage")
@@ -1198,7 +1280,7 @@ class CodexExecutionEvidence(ContractModel):
             )
         if (
             self.failure_stage in lifecycle_dependent_failure_stages
-            and self.schema_version not in {"1.3", "1.4"}
+            and self.schema_version not in {"1.3", "1.4", "1.5"}
         ):
             raise ValueError(
                 "runner handoff failure stages require Codex Evidence 1.3+"
@@ -1353,7 +1435,7 @@ class CodexExecutionEvidence(ContractModel):
             raise ValueError("normalized Codex event counts must equal event_count")
         if self.verified_flags != sorted(set(self.verified_flags)):
             raise ValueError("verified_flags must be unique and sorted")
-        if self.schema_version == "1.4":
+        if self.schema_version in {"1.4", "1.5"}:
             if self.terminal_event is CodexTerminalEvent.NONE:
                 terminal_counts_match = (
                     self.turn_completed_count,
@@ -1374,7 +1456,7 @@ class CodexExecutionEvidence(ContractModel):
                 terminal_counts_match = False
             if not terminal_counts_match:
                 raise ValueError(
-                    "Codex Evidence 1.4 terminal_event must match turn terminal "
+                    "Codex Evidence 1.4+ terminal_event must match turn terminal "
                     "counts; top-level errors are independent observations"
                 )
         else:
@@ -1457,6 +1539,15 @@ class CodexExecutionEvidence(ContractModel):
                 raise ValueError("successful Codex Evidence requires process cleanup")
             if self.stdout_limit_exceeded:
                 raise ValueError("successful Codex Evidence cannot exceed stdout limit")
+            if self.schema_version == "1.5" and (
+                self.stdin_write_state is not CodexStdinWriteState.COMPLETE
+                or self.provider_failure_hint
+                is not CodexProviderFailureHint.NOT_APPLICABLE
+            ):
+                raise ValueError(
+                    "successful Codex Evidence 1.5 requires complete stdin and no "
+                    "Provider failure hint"
+                )
         elif self.failure_kind is LiveFailureKind.NONE:
             raise ValueError("failed Codex Evidence requires a failure kind")
         elif self.failure_kind not in allowed_failure_kinds:
@@ -1492,6 +1583,15 @@ class CodexExecutionEvidence(ContractModel):
             not in {CodexTerminalEvent.TURN_FAILED, CodexTerminalEvent.ERROR}
         ):
             raise ValueError("provider_turn_failed requires a failed terminal event")
+        if (
+            self.schema_version == "1.5"
+            and self.failure_kind is LiveFailureKind.PROVIDER_TURN_FAILED
+            and self.provider_failure_hint
+            is CodexProviderFailureHint.NOT_APPLICABLE
+        ):
+            raise ValueError(
+                "provider_turn_failed requires an advisory failure hint"
+            )
         if (
             self.failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
             and not self.stdout_limit_exceeded
@@ -1667,6 +1767,14 @@ class LiveRunArtifact(ContractModel):
     def live_status_metrics_and_evidence_must_match(self) -> LiveRunArtifact:
         if not self.prompt_redacted or self.raw_provider_output_persisted:
             raise ValueError("Live Prompt/provider redaction flags must use required values")
+        if (
+            self.codex.schema_version == "1.5"
+            and self.codex.stdin_bytes_total is not None
+            and self.codex.stdin_bytes_total != self.prompt_bytes
+        ):
+            raise ValueError(
+                "Codex stdin byte total must match the redacted Prompt byte count"
+            )
         if self.completed_at < self.started_at:
             raise ValueError("Live completed_at must not precede started_at")
         expected_failure = {

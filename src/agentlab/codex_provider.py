@@ -29,7 +29,9 @@ from agentlab.models import (
     CodexFailureStage,
     CodexInvocationState,
     CodexItemType,
+    CodexProviderFailureHint,
     CodexRunnerState,
+    CodexStdinWriteState,
     CodexTerminalEvent,
     CommandStatus,
     FailureKind,
@@ -70,12 +72,127 @@ _PROVIDER_ENV_ALLOWLIST = (
     "PATHEXT",
 )
 REQUIRED_CODEX_EXEC_FLAGS = CODEX_REQUIRED_EXEC_FLAGS
-CODEX_EVIDENCE_SCHEMA_VERSION: Literal["1.4"] = "1.4"
+CODEX_EVIDENCE_SCHEMA_VERSION: Literal["1.5"] = "1.5"
+_MAX_FAILURE_MESSAGE_BYTES = 4096
 _SAFE_ITEM_TYPES = frozenset(
     item_type.value
     for item_type in CodexItemType
     if item_type is not CodexItemType.UNKNOWN
 )
+_FAILURE_HINT_PATTERNS: tuple[
+    tuple[CodexProviderFailureHint, tuple[re.Pattern[str], ...]], ...
+] = (
+    (
+        CodexProviderFailureHint.AUTHENTICATION,
+        tuple(
+            re.compile(pattern)
+            for pattern in (
+                r"\bauthentication\b",
+                r"\bunauthori[sz]ed\b",
+                r"\bnot (?:logged|signed) in\b",
+                r"\b(?:login|sign[- ]in) required\b",
+                r"\binvalid (?:api )?key\b",
+            )
+        ),
+    ),
+    (
+        CodexProviderFailureHint.MODEL_ACCESS,
+        tuple(
+            re.compile(pattern)
+            for pattern in (
+                r"\bmodel\b.{0,80}\b(?:not found|not available|unsupported)\b",
+                r"\b(?:no|without|denied) access\b.{0,80}\bmodel\b",
+                r"\bmodel\b.{0,80}\baccess denied\b",
+            )
+        ),
+    ),
+    (
+        CodexProviderFailureHint.QUOTA_OR_RATE_LIMIT,
+        tuple(
+            re.compile(pattern)
+            for pattern in (
+                r"\brate limit(?:ed|ing)?\b",
+                r"\bquota\b",
+                r"\btoo many requests\b",
+                r"\bresource exhausted\b",
+                r"\busage limit\b",
+            )
+        ),
+    ),
+    (
+        CodexProviderFailureHint.CONNECTIVITY,
+        tuple(
+            re.compile(pattern)
+            for pattern in (
+                r"\bnetwork (?:error|failure|unreachable)\b",
+                r"\bconnection (?:error|failed|failure|refused|reset)\b",
+                r"\bdns (?:error|failure|resolution)\b",
+                r"\bhost (?:is )?unreachable\b",
+            )
+        ),
+    ),
+    (
+        CodexProviderFailureHint.SERVICE,
+        tuple(
+            re.compile(pattern)
+            for pattern in (
+                r"\bservice unavailable\b",
+                r"\binternal server error\b",
+                r"\bserver error\b",
+                r"\btemporarily unavailable\b",
+                r"\boverloaded\b",
+            )
+        ),
+    ),
+    (
+        CodexProviderFailureHint.POLICY_OR_ENTITLEMENT,
+        tuple(
+            re.compile(pattern)
+            for pattern in (
+                r"\bpolicy (?:denied|restriction|violation)\b",
+                r"\bentitlement\b",
+                r"\bpermission denied\b",
+                r"\bforbidden\b",
+                r"\borganization (?:restriction|policy)\b",
+            )
+        ),
+    ),
+)
+
+
+def _classify_failure_message(message: str) -> CodexProviderFailureHint:
+    try:
+        encoded = message.encode("utf-8")
+    except UnicodeEncodeError:
+        return CodexProviderFailureHint.UNKNOWN
+    if not encoded or len(encoded) > _MAX_FAILURE_MESSAGE_BYTES:
+        return CodexProviderFailureHint.UNKNOWN
+    normalized = message.casefold()
+    matches = {
+        hint
+        for hint, patterns in _FAILURE_HINT_PATTERNS
+        if any(pattern.search(normalized) for pattern in patterns)
+    }
+    if len(matches) > 1:
+        return CodexProviderFailureHint.CONFLICTING
+    if not matches:
+        return CodexProviderFailureHint.UNKNOWN
+    return next(iter(matches))
+
+
+def _merge_failure_hints(
+    hints: set[CodexProviderFailureHint],
+) -> CodexProviderFailureHint:
+    if not hints:
+        return CodexProviderFailureHint.NOT_APPLICABLE
+    if CodexProviderFailureHint.CONFLICTING in hints:
+        return CodexProviderFailureHint.CONFLICTING
+    classified = hints - {CodexProviderFailureHint.UNKNOWN}
+    if len(classified) > 1:
+        return CodexProviderFailureHint.CONFLICTING
+    if classified:
+        return next(iter(classified))
+    return CodexProviderFailureHint.UNKNOWN
 
 
 class CodexPreflightError(ValueError):
@@ -168,6 +285,7 @@ class CodexParseSummary:
     item_type_counts: dict[CodexItemType, int]
     usage_metrics: UsageMetrics
     turn_failed: bool
+    provider_failure_hint: CodexProviderFailureHint
 
 
 @dataclass(frozen=True)
@@ -192,10 +310,35 @@ class CodexLifecycleTracker:
     stderr_bytes: int = 0
     stderr_truncated: bool = False
     stdout_limit_exceeded: bool = False
+    stdin_write_state: CodexStdinWriteState = CodexStdinWriteState.NOT_STARTED
+    stdin_bytes_written: int | None = 0
+    stdin_bytes_total: int | None = None
 
     def mark_runner_started(self) -> None:
         self.runner_state = CodexRunnerState.STARTED
         self.failure_stage = CodexFailureStage.PROVIDER_RUNNER_ENTRY
+
+    def begin_stdin_observation(self, total_bytes: int) -> None:
+        if total_bytes <= 0:
+            raise ValueError("Prompt byte total must be positive")
+        self.stdin_write_state = CodexStdinWriteState.NOT_STARTED
+        self.stdin_bytes_written = 0
+        self.stdin_bytes_total = total_bytes
+
+    def observe_stdin_write(self, written_bytes: int) -> None:
+        total_bytes = self.stdin_bytes_total
+        if total_bytes is None or not 0 < written_bytes <= total_bytes:
+            raise ValueError("observed stdin byte count is outside the Prompt bounds")
+        self.stdin_bytes_written = written_bytes
+        self.stdin_write_state = (
+            CodexStdinWriteState.COMPLETE
+            if written_bytes == total_bytes
+            else CodexStdinWriteState.PARTIAL
+        )
+
+    def mark_stdin_observation_unknown(self) -> None:
+        self.stdin_write_state = CodexStdinWriteState.UNKNOWN
+        self.stdin_bytes_written = None
 
     def mark_spawn_attempted(self) -> None:
         self.invocation_state = CodexInvocationState.SPAWN_ATTEMPTED
@@ -272,6 +415,7 @@ class CodexJsonlParser:
         self.turn_completed_count = 0
         self.turn_failed_count = 0
         self.error_event_count = 0
+        self._failure_hints: set[CodexProviderFailureHint] = set()
 
     def feed(self, chunk: bytes) -> None:
         self.total_bytes += len(chunk)
@@ -314,6 +458,11 @@ class CodexJsonlParser:
 
     def summary(self) -> CodexParseSummary:
         self._assert_normalized_event_count()
+        provider_failure_hint = (
+            CodexProviderFailureHint.NOT_APPLICABLE
+            if self.terminal_event is CodexTerminalEvent.TURN_COMPLETED
+            else _merge_failure_hints(self._failure_hints)
+        )
         return CodexParseSummary(
             event_count=self.event_count,
             unknown_event_count=self.unknown_event_count,
@@ -326,6 +475,7 @@ class CodexJsonlParser:
             item_type_counts=dict(sorted(self.item_type_counts.items())),
             usage_metrics=self.usage_metrics,
             turn_failed=self._turn_failed,
+            provider_failure_hint=provider_failure_hint,
         )
 
     def _append_line_bytes(self, value: bytes) -> None:
@@ -390,6 +540,7 @@ class CodexJsonlParser:
 
         safe_item_type: CodexItemType | None = None
         parsed_usage: UsageMetrics | None = None
+        failure_hint: CodexProviderFailureHint | None = None
         if event_type == "thread.started":
             if self._thread_started or self._turn_started:
                 self._invalid_order("thread.started")
@@ -407,9 +558,29 @@ class CodexJsonlParser:
         elif event_type == "turn.failed":
             if not self._thread_started or not self._turn_started:
                 self._invalid_order("turn.failed")
+            failure_object = raw.get("error")
+            if not isinstance(failure_object, dict):
+                raise CodexProtocolError(
+                    LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+                    "turn.failed error must be an object",
+                )
+            message = failure_object.get("message")
+            if not isinstance(message, str):
+                raise CodexProtocolError(
+                    LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+                    "turn.failed error.message must be a string",
+                )
+            failure_hint = _classify_failure_message(message)
         elif event_type == "error":
             if not self._thread_started or not self._turn_started:
                 self._invalid_order("error")
+            message = raw.get("message")
+            if not isinstance(message, str):
+                raise CodexProtocolError(
+                    LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+                    "top-level error.message must be a string",
+                )
+            failure_hint = _classify_failure_message(message)
         elif event_type in {"item.started", "item.updated", "item.completed"}:
             item = raw.get("item")
             item_type = item.get("type") if isinstance(item, dict) else None
@@ -428,6 +599,18 @@ class CodexJsonlParser:
                 not self._turn_started and not pre_turn_warning
             ):
                 self._invalid_order(event_type)
+            if (
+                safe_item_type is CodexItemType.ERROR
+                and isinstance(item, dict)
+                and "message" in item
+            ):
+                message = item["message"]
+                if not isinstance(message, str):
+                    raise CodexProtocolError(
+                        LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
+                        "error item message must be a string",
+                    )
+                failure_hint = _classify_failure_message(message)
 
         # Apply the fully validated event as one state transition. No validation
         # below this point may fail, so a rejected event cannot partially mutate
@@ -459,6 +642,8 @@ class CodexJsonlParser:
             )
         else:
             self.unknown_event_count += 1
+        if failure_hint is not None:
+            self._failure_hints.add(failure_hint)
         self._assert_normalized_event_count()
 
     def _assert_normalized_event_count(self) -> None:
@@ -527,6 +712,7 @@ def _parser_snapshot(parser: CodexJsonlParser | None) -> CodexParseSummary:
             item_type_counts={},
             usage_metrics=_not_available_usage(),
             turn_failed=False,
+            provider_failure_hint=CodexProviderFailureHint.NOT_APPLICABLE,
         )
     return CodexParseSummary(
         event_count=parser.event_count,
@@ -541,6 +727,11 @@ def _parser_snapshot(parser: CodexJsonlParser | None) -> CodexParseSummary:
         usage_metrics=parser.usage_metrics,
         turn_failed=parser.terminal_event
         in {CodexTerminalEvent.TURN_FAILED, CodexTerminalEvent.ERROR},
+        provider_failure_hint=(
+            CodexProviderFailureHint.NOT_APPLICABLE
+            if parser.terminal_event is CodexTerminalEvent.TURN_COMPLETED
+            else _merge_failure_hints(parser._failure_hints)
+        ),
     )
 
 
@@ -854,6 +1045,10 @@ def _preflight_failure_evidence(
         command_network_disabled=True,
         raw_stream_persisted=False,
         process_started=False,
+        stdin_write_state=CodexStdinWriteState.NOT_STARTED,
+        stdin_bytes_written=0,
+        stdin_bytes_total=None,
+        provider_failure_hint=CodexProviderFailureHint.NOT_APPLICABLE,
         status=ProviderExecutionStatus.FAILED,
         failure_kind=error.failure_kind,
         exit_code=None,
@@ -893,6 +1088,7 @@ def post_preflight_failure_evidence(
     failure_kind: LiveFailureKind = LiveFailureKind.EVIDENCE_ERROR,
     failure_stage: CodexFailureStage,
     runner_state: CodexRunnerState = CodexRunnerState.NOT_STARTED,
+    stdin_bytes_total: int | None = None,
 ) -> CodexExecutionEvidence:
     """Record selected compatibility metadata before any Provider invocation."""
     assert live.model is not None
@@ -919,6 +1115,10 @@ def post_preflight_failure_evidence(
         command_network_disabled=True,
         raw_stream_persisted=False,
         process_started=False,
+        stdin_write_state=CodexStdinWriteState.NOT_STARTED,
+        stdin_bytes_written=0,
+        stdin_bytes_total=stdin_bytes_total,
+        provider_failure_hint=CodexProviderFailureHint.NOT_APPLICABLE,
         status=ProviderExecutionStatus.FAILED,
         failure_kind=failure_kind,
         exit_code=None,
@@ -1002,6 +1202,10 @@ def lifecycle_failure_evidence(
         command_network_disabled=True,
         raw_stream_persisted=False,
         process_started=process_started,
+        stdin_write_state=lifecycle.stdin_write_state,
+        stdin_bytes_written=lifecycle.stdin_bytes_written,
+        stdin_bytes_total=lifecycle.stdin_bytes_total,
+        provider_failure_hint=parsed.provider_failure_hint,
         status=ProviderExecutionStatus.FAILED,
         failure_kind=failure_kind,
         exit_code=lifecycle.return_code if process_started else None,
@@ -1051,6 +1255,7 @@ class CodexProcessRunner:
     ) -> CodexRunResult:
         self.lifecycle.mark_runner_started()
         try:
+            self.lifecycle.begin_stdin_observation(len(prompt))
             return self._run(
                 preflight=preflight,
                 prompt=prompt,
@@ -1102,6 +1307,7 @@ class CodexProcessRunner:
                     live=live,
                     failure_stage=CodexFailureStage.JSONL_PARSER_INITIALIZATION,
                     runner_state=CodexRunnerState.STARTED,
+                    stdin_bytes_total=len(prompt),
                 )
             )
         self.lifecycle.parser = parser
@@ -1119,6 +1325,7 @@ class CodexProcessRunner:
                     live=live,
                     failure_stage=CodexFailureStage.PROVIDER_ARGV_CONSTRUCTION,
                     runner_state=CodexRunnerState.STARTED,
+                    stdin_bytes_total=len(prompt),
                 )
             )
         self.lifecycle.failure_stage = CodexFailureStage.PROVIDER_ENVIRONMENT_CONSTRUCTION
@@ -1134,6 +1341,7 @@ class CodexProcessRunner:
                     live=live,
                     failure_stage=CodexFailureStage.PROVIDER_ENVIRONMENT_CONSTRUCTION,
                     runner_state=CodexRunnerState.STARTED,
+                    stdin_bytes_total=len(prompt),
                 )
             )
         self.lifecycle.mark_spawn_attempted()
@@ -1316,7 +1524,19 @@ class CodexProcessRunner:
                         failure_kind = LiveFailureKind.PROVIDER_INPUT_ERROR
                         close_stream("stdin")
                         continue
+                    except Exception:
+                        self.lifecycle.mark_stdin_observation_unknown()
+                        raise
+                    if (
+                        isinstance(written, bool)
+                        or not isinstance(written, int)
+                        or written <= 0
+                        or prompt_offset + written > len(prompt)
+                    ):
+                        self.lifecycle.mark_stdin_observation_unknown()
+                        raise RuntimeError("Provider stdin write observation is invalid")
                     prompt_offset += written
+                    self.lifecycle.observe_stdin_write(prompt_offset)
                     if prompt_offset == len(prompt):
                         close_stream("stdin")
                     continue
@@ -1600,6 +1820,10 @@ class CodexProcessRunner:
             command_network_disabled=True,
             raw_stream_persisted=False,
             process_started=process_started,
+            stdin_write_state=self.lifecycle.stdin_write_state,
+            stdin_bytes_written=self.lifecycle.stdin_bytes_written,
+            stdin_bytes_total=self.lifecycle.stdin_bytes_total,
+            provider_failure_hint=parsed.provider_failure_hint,
             status=status,
             failure_kind=failure_kind,
             exit_code=exit_code,
@@ -1659,6 +1883,10 @@ def unsupported_platform_evidence(
         command_network_disabled=True,
         raw_stream_persisted=False,
         process_started=False,
+        stdin_write_state=CodexStdinWriteState.NOT_STARTED,
+        stdin_bytes_written=0,
+        stdin_bytes_total=None,
+        provider_failure_hint=CodexProviderFailureHint.NOT_APPLICABLE,
         status=ProviderExecutionStatus.FAILED,
         failure_kind=LiveFailureKind.UNSUPPORTED_PLATFORM,
         exit_code=None,

@@ -230,6 +230,10 @@ def live_codex_command(
     typer.echo(f"task: {artifact.task_id}")
     typer.echo(f"status: {artifact.overall_status.value}")
     typer.echo(f"failure kind: {artifact.failure_kind.value}")
+    if artifact.codex.provider_failure_hint is not None:
+        typer.echo(
+            f"provider failure hint: {artifact.codex.provider_failure_hint.value}"
+        )
     typer.echo(f"recording output: {outcome.recording_path}")
     typer.echo(f"evidence output: {outcome.output_path}")
     typer.echo(f"workspace lifecycle: {artifact.workspace_lifecycle.value}")

@@ -462,6 +462,14 @@ def _validate_recording(path: Path, events: list[RecordingEvent]) -> ReplayRecor
             raise RecordingLoadError(
                 f"{path}: CLI version mismatch between Live recording events"
             )
+        if (
+            codex.schema_version == "1.5"
+            and codex.stdin_bytes_total is not None
+            and started.prompt_bytes != codex.stdin_bytes_total
+        ):
+            raise RecordingLoadError(
+                f"{path}: Prompt byte count mismatch between Live recording events"
+            )
         if codex.started_at < started.occurred_at:
             raise RecordingLoadError(
                 f"{path}: Codex process started before the Live run"

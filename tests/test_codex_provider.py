@@ -28,7 +28,9 @@ from agentlab.models import (
     CodexFailureStage,
     CodexInvocationState,
     CodexItemType,
+    CodexProviderFailureHint,
     CodexRunnerState,
+    CodexStdinWriteState,
     CodexTerminalEvent,
     LiveFailureKind,
     LiveSettings,
@@ -477,7 +479,7 @@ def test_preflight_timeout_removes_background_child(
         "signal.pause()"
     )
     environment, inspection = _fake_codex(tmp_path, version_code=version_code)
-    monkeypatch.setattr("agentlab.codex_provider.PREFLIGHT_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr("agentlab.codex_provider.PREFLIGHT_TIMEOUT_SECONDS", 1.0)
     monkeypatch.setattr("agentlab.codex_provider.PREFLIGHT_TERMINATION_GRACE_MS", 50)
 
     with pytest.raises(CodexPreflightError):
@@ -498,7 +500,7 @@ def test_preflight_timeout_escalates_past_ignored_sigterm(
         "signal.pause()"
     )
     environment, inspection = _fake_codex(tmp_path, version_code=version_code)
-    monkeypatch.setattr("agentlab.codex_provider.PREFLIGHT_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr("agentlab.codex_provider.PREFLIGHT_TIMEOUT_SECONDS", 1.0)
     monkeypatch.setattr("agentlab.codex_provider.PREFLIGHT_TERMINATION_GRACE_MS", 50)
 
     with pytest.raises(CodexPreflightError):
@@ -696,7 +698,7 @@ def test_jsonl_parser_rejects_invalid_lifecycle(events: list[dict[str, str]]) ->
             [
                 {"type": "thread.started"},
                 {"type": "turn.started"},
-                {"type": "error"},
+                {"type": "error", "message": "synthetic service unavailable"},
             ],
             {"type": "turn.completed"},
         ),
@@ -755,11 +757,142 @@ def test_jsonl_parser_classifies_turn_failed() -> None:
     for event in (
         {"type": "thread.started"},
         {"type": "turn.started"},
-        {"type": "turn.failed", "error": "raw-secret"},
+        {
+            "type": "turn.failed",
+            "error": {"message": "synthetic authentication failure"},
+        },
     ):
         parser.feed(_json_line(event))
 
-    assert parser.finish().turn_failed is True
+    summary = parser.finish()
+
+    assert summary.turn_failed is True
+    assert (
+        summary.provider_failure_hint
+        is CodexProviderFailureHint.AUTHENTICATION
+    )
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("authentication required", CodexProviderFailureHint.AUTHENTICATION),
+        ("model is not available", CodexProviderFailureHint.MODEL_ACCESS),
+        ("quota exceeded", CodexProviderFailureHint.QUOTA_OR_RATE_LIMIT),
+        ("connection refused", CodexProviderFailureHint.CONNECTIVITY),
+        ("service unavailable", CodexProviderFailureHint.SERVICE),
+        ("policy restriction", CodexProviderFailureHint.POLICY_OR_ENTITLEMENT),
+        ("synthetic unclassified condition", CodexProviderFailureHint.UNKNOWN),
+        ("\ud800", CodexProviderFailureHint.UNKNOWN),
+    ],
+)
+def test_jsonl_parser_derives_only_fixed_provider_failure_hints(
+    message: str,
+    expected: CodexProviderFailureHint,
+) -> None:
+    parser = CodexJsonlParser(max_line_bytes=8192, max_total_bytes=32768)
+    for event in (
+        {"type": "thread.started"},
+        {"type": "turn.started"},
+        {"type": "error", "message": message},
+        {"type": "turn.failed", "error": {"message": message}},
+    ):
+        parser.feed(_json_line(event))
+
+    summary = parser.finish()
+
+    assert summary.provider_failure_hint is expected
+    assert message not in repr(summary)
+
+
+def test_jsonl_parser_marks_conflicting_failure_sources() -> None:
+    parser = CodexJsonlParser(max_line_bytes=4096, max_total_bytes=16384)
+    for event in (
+        {"type": "thread.started"},
+        {"type": "turn.started"},
+        {"type": "error", "message": "authentication required"},
+        {"type": "turn.failed", "error": {"message": "quota exceeded"}},
+    ):
+        parser.feed(_json_line(event))
+
+    assert (
+        parser.finish().provider_failure_hint
+        is CodexProviderFailureHint.CONFLICTING
+    )
+
+
+def test_jsonl_parser_classifies_error_item_without_retaining_message() -> None:
+    parser = CodexJsonlParser(max_line_bytes=8192, max_total_bytes=32768)
+    raw_message = "authentication required synthetic-secret-suffix"
+    for event in (
+        {"type": "thread.started"},
+        {
+            "type": "item.completed",
+            "item": {"type": "error", "message": raw_message},
+        },
+        {"type": "turn.started"},
+        {
+            "type": "turn.failed",
+            "error": {"message": "authentication required"},
+        },
+    ):
+        parser.feed(_json_line(event))
+
+    summary = parser.finish()
+
+    assert (
+        summary.provider_failure_hint
+        is CodexProviderFailureHint.AUTHENTICATION
+    )
+    assert raw_message not in repr(summary)
+
+
+def test_jsonl_parser_bounds_failure_message_classification() -> None:
+    parser = CodexJsonlParser(max_line_bytes=8192, max_total_bytes=32768)
+    oversized_message = "quota " + ("x" * 4096)
+    for event in (
+        {"type": "thread.started"},
+        {"type": "turn.started"},
+        {
+            "type": "turn.failed",
+            "error": {"message": oversized_message},
+        },
+    ):
+        parser.feed(_json_line(event))
+
+    summary = parser.finish()
+
+    assert summary.provider_failure_hint is CodexProviderFailureHint.UNKNOWN
+    assert oversized_message not in repr(summary)
+
+
+@pytest.mark.parametrize(
+    "invalid_event",
+    [
+        {"type": "error"},
+        {"type": "error", "message": 1},
+        {"type": "turn.failed"},
+        {"type": "turn.failed", "error": "not-an-object"},
+        {"type": "turn.failed", "error": {}},
+        {"type": "turn.failed", "error": {"message": False}},
+        {
+            "type": "item.completed",
+            "item": {"type": "error", "message": 1},
+        },
+    ],
+)
+def test_jsonl_parser_rejects_invalid_failure_message_structures_atomically(
+    invalid_event: dict[str, object],
+) -> None:
+    parser = CodexJsonlParser(max_line_bytes=4096, max_total_bytes=16384)
+    parser.feed(_json_line({"type": "thread.started"}))
+    parser.feed(_json_line({"type": "turn.started"}))
+    before = parser.summary()
+
+    with pytest.raises(CodexProtocolError):
+        parser.feed(_json_line(invalid_event))
+
+    assert parser.summary() == before
 
 
 def test_jsonl_parser_records_top_level_error_before_turn_failed() -> None:
@@ -768,7 +901,10 @@ def test_jsonl_parser_records_top_level_error_before_turn_failed() -> None:
         {"type": "thread.started"},
         {"type": "turn.started"},
         {"type": "error", "message": "raw-top-level-error-secret"},
-        {"type": "turn.failed", "error": "raw-turn-failure-secret"},
+        {
+            "type": "turn.failed",
+            "error": {"message": "raw-turn-failure-secret"},
+        },
     ):
         parser.feed(_json_line(event))
 
@@ -787,8 +923,11 @@ def test_jsonl_parser_accepts_pre_turn_warning_before_failed_turn() -> None:
         {"type": "thread.started"},
         {"type": "item.completed", "item": {"type": "error"}},
         {"type": "turn.started"},
-        {"type": "error"},
-        {"type": "turn.failed"},
+        {"type": "error", "message": "synthetic service unavailable"},
+        {
+            "type": "turn.failed",
+            "error": {"message": "synthetic service unavailable"},
+        },
     ):
         parser.feed(_json_line(event))
 
@@ -852,13 +991,22 @@ def test_process_runner_uses_safe_argv_stdin_and_separate_environment(
     argv = observed["argv"]
 
     assert result.evidence.status is ProviderExecutionStatus.SUCCEEDED
-    assert result.evidence.schema_version == "1.4"
+    assert result.evidence.schema_version == "1.5"
     assert result.evidence.runner_state is CodexRunnerState.STARTED
     assert (
         result.evidence.invocation_state
         is CodexInvocationState.PROCESS_STARTED
     )
     assert result.evidence.cleanup_state is CodexCleanupState.CLEARED
+    assert (
+        result.evidence.stdin_write_state is CodexStdinWriteState.COMPLETE
+    )
+    assert result.evidence.stdin_bytes_written == len(prompt_secret.encode())
+    assert result.evidence.stdin_bytes_total == len(prompt_secret.encode())
+    assert (
+        result.evidence.provider_failure_hint
+        is CodexProviderFailureHint.NOT_APPLICABLE
+    )
     assert observed["prompt"] == prompt_secret
     assert prompt_secret not in argv
     assert observed["cwd"] == str(workspace)
@@ -946,7 +1094,7 @@ def test_process_runner_timeout_stops_parent_and_child(tmp_path: Path) -> None:
     workspace, environment_root = _workspace(tmp_path)
 
     result = CodexProcessRunner(
-        live=_live_settings(provider_timeout_ms=150),
+        live=_live_settings(provider_timeout_ms=500),
         runner=_runner_settings(termination_grace_ms=50),
     ).run(
         preflight=preflight,
@@ -1008,7 +1156,7 @@ def test_process_runner_preserves_pre_turn_warning_and_official_failed_turn(
         f"print(json.dumps({{'type':'item.completed','item':{{'type':'error','message':{raw_secret!r}}}}}),flush=True)\n"
         "print(json.dumps({'type':'turn.started'}),flush=True)\n"
         f"print(json.dumps({{'type':'error','message':{raw_secret!r}}}),flush=True)\n"
-        f"print(json.dumps({{'type':'turn.failed','error':{raw_secret!r}}}),flush=True)"
+        f"print(json.dumps({{'type':'turn.failed','error':{{'message':{raw_secret!r}}}}}),flush=True)"
     )
     environment, _inspection = _fake_codex(tmp_path, live_code=live_code)
     preflight = preflight_codex(parent_environment=environment)
@@ -1026,7 +1174,7 @@ def test_process_runner_preserves_pre_turn_warning_and_official_failed_turn(
     )
     evidence = result.evidence
 
-    assert evidence.schema_version == "1.4"
+    assert evidence.schema_version == "1.5"
     assert evidence.failure_kind is LiveFailureKind.PROVIDER_TURN_FAILED
     assert evidence.terminal_event is CodexTerminalEvent.TURN_FAILED
     assert evidence.error_event_count == 1
@@ -1034,6 +1182,8 @@ def test_process_runner_preserves_pre_turn_warning_and_official_failed_turn(
     assert evidence.item_type_counts == {CodexItemType.ERROR: 1}
     assert evidence.event_count == 5
     assert evidence.termination.process_group_cleared is True
+    assert evidence.stdin_write_state is CodexStdinWriteState.COMPLETE
+    assert evidence.provider_failure_hint is CodexProviderFailureHint.UNKNOWN
     assert raw_secret not in evidence.model_dump_json()
 
 
@@ -1063,7 +1213,7 @@ def test_process_runner_protocol_error_keeps_only_accepted_event_counts(
     )
     evidence = result.evidence
 
-    assert evidence.schema_version == "1.4"
+    assert evidence.schema_version == "1.5"
     assert evidence.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
     assert evidence.process_started is True
     assert evidence.cleanup_state is CodexCleanupState.CLEARED
@@ -1137,6 +1287,8 @@ def test_process_runner_classifies_spawn_failure(
     )
     assert result.evidence.cleanup_state is CodexCleanupState.NOT_APPLICABLE
     assert result.evidence.exit_code is None
+    assert result.evidence.stdin_write_state is CodexStdinWriteState.NOT_STARTED
+    assert result.evidence.stdin_bytes_written == 0
 
 
 def test_process_runner_classifies_prompt_stdin_failure(
@@ -1164,6 +1316,84 @@ def test_process_runner_classifies_prompt_stdin_failure(
     )
 
     assert result.evidence.failure_kind is LiveFailureKind.PROVIDER_INPUT_ERROR
+    assert result.evidence.termination.process_group_cleared is True
+    assert result.evidence.stdin_write_state is CodexStdinWriteState.NOT_STARTED
+    assert result.evidence.stdin_bytes_written == 0
+
+
+def test_process_runner_records_partial_prompt_write_before_broken_pipe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment, _inspection = _fake_codex(
+        tmp_path,
+        live_code="import signal; signal.pause()",
+    )
+    preflight = preflight_codex(parent_environment=environment)
+    workspace, environment_root = _workspace(tmp_path)
+    os_write = codex_provider_module.os.write
+    write_count = 0
+
+    def write_then_break(file_descriptor: int, content: bytes) -> int:
+        nonlocal write_count
+        write_count += 1
+        if write_count == 1:
+            return os_write(file_descriptor, content[:3])
+        raise BrokenPipeError("synthetic stdin boundary")
+
+    monkeypatch.setattr("agentlab.codex_provider.os.write", write_then_break)
+    result = CodexProcessRunner(
+        live=_live_settings(),
+        runner=_runner_settings(),
+    ).run(
+        preflight=preflight,
+        prompt=b"safe prompt",
+        workspace=workspace,
+        environment_root=environment_root,
+        parent_environment=environment,
+    )
+
+    assert result.evidence.failure_kind is LiveFailureKind.PROVIDER_INPUT_ERROR
+    assert result.evidence.stdin_write_state is CodexStdinWriteState.PARTIAL
+    assert result.evidence.stdin_bytes_written == 3
+    assert result.evidence.stdin_bytes_total == len(b"safe prompt")
+
+
+def test_process_runner_marks_lost_prompt_write_observation_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment, _inspection = _fake_codex(
+        tmp_path,
+        live_code="import signal; signal.pause()",
+    )
+    preflight = preflight_codex(parent_environment=environment)
+    workspace, environment_root = _workspace(tmp_path)
+
+    def lose_write_observation(
+        _file_descriptor: int,
+        _content: bytes,
+    ) -> NoReturn:
+        raise RuntimeError("synthetic unobservable stdin boundary")
+
+    monkeypatch.setattr(
+        "agentlab.codex_provider.os.write",
+        lose_write_observation,
+    )
+    result = CodexProcessRunner(
+        live=_live_settings(),
+        runner=_runner_settings(),
+    ).run(
+        preflight=preflight,
+        prompt=b"safe prompt",
+        workspace=workspace,
+        environment_root=environment_root,
+        parent_environment=environment,
+    )
+
+    assert result.evidence.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+    assert result.evidence.stdin_write_state is CodexStdinWriteState.UNKNOWN
+    assert result.evidence.stdin_bytes_written is None
     assert result.evidence.termination.process_group_cleared is True
 
 
@@ -1425,7 +1655,7 @@ def test_process_runner_escalates_to_sigkill(tmp_path: Path) -> None:
     workspace, environment_root = _workspace(tmp_path)
 
     result = CodexProcessRunner(
-        live=_live_settings(provider_timeout_ms=150),
+        live=_live_settings(provider_timeout_ms=500),
         runner=_runner_settings(termination_grace_ms=50),
     ).run(
         preflight=preflight,
