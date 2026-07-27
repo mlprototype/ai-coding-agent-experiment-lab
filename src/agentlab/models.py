@@ -961,7 +961,7 @@ class LiveEvaluationSummary(ContractModel):
 class CodexExecutionEvidence(ContractModel):
     """Redacted summary of one Codex CLI process; raw events are never persisted."""
 
-    schema_version: Literal["1.1", "1.2", "1.3"]
+    schema_version: Literal["1.1", "1.2", "1.3", "1.4"]
     provider: Literal[Provider.CODEX]
     cli_version: StrictStr | None
     cli_profile: CodexCliProfile
@@ -1048,7 +1048,7 @@ class CodexExecutionEvidence(ContractModel):
         else:
             if any(value is None for value in lifecycle_values):
                 raise ValueError(
-                    "Codex Evidence 1.3 requires complete lifecycle state"
+                    "Codex Evidence 1.3+ requires complete lifecycle state"
                 )
             assert self.runner_state is not None
             assert self.invocation_state is not None
@@ -1198,10 +1198,10 @@ class CodexExecutionEvidence(ContractModel):
             )
         if (
             self.failure_stage in lifecycle_dependent_failure_stages
-            and self.schema_version != "1.3"
+            and self.schema_version not in {"1.3", "1.4"}
         ):
             raise ValueError(
-                "runner handoff failure stages require Codex Evidence 1.3"
+                "runner handoff failure stages require Codex Evidence 1.3+"
             )
         if self.failure_stage in {
             CodexFailureStage.PROVIDER_PROCESS_SPAWN,
@@ -1353,18 +1353,45 @@ class CodexExecutionEvidence(ContractModel):
             raise ValueError("normalized Codex event counts must equal event_count")
         if self.verified_flags != sorted(set(self.verified_flags)):
             raise ValueError("verified_flags must be unique and sorted")
-        terminal_counts = {
-            CodexTerminalEvent.NONE: (0, 0, 0),
-            CodexTerminalEvent.TURN_COMPLETED: (1, 0, 0),
-            CodexTerminalEvent.TURN_FAILED: (0, 1, 0),
-            CodexTerminalEvent.ERROR: (0, 0, 1),
-        }
-        if (
-            self.turn_completed_count,
-            self.turn_failed_count,
-            self.error_event_count,
-        ) != terminal_counts[self.terminal_event]:
-            raise ValueError("terminal_event must match normalized terminal counts")
+        if self.schema_version == "1.4":
+            if self.terminal_event is CodexTerminalEvent.NONE:
+                terminal_counts_match = (
+                    self.turn_completed_count,
+                    self.turn_failed_count,
+                ) == (0, 0)
+            elif self.terminal_event is CodexTerminalEvent.TURN_COMPLETED:
+                terminal_counts_match = (
+                    self.turn_completed_count,
+                    self.turn_failed_count,
+                    self.error_event_count,
+                ) == (1, 0, 0)
+            elif self.terminal_event is CodexTerminalEvent.TURN_FAILED:
+                terminal_counts_match = (
+                    self.turn_completed_count,
+                    self.turn_failed_count,
+                ) == (0, 1)
+            else:
+                terminal_counts_match = False
+            if not terminal_counts_match:
+                raise ValueError(
+                    "Codex Evidence 1.4 terminal_event must match turn terminal "
+                    "counts; top-level errors are independent observations"
+                )
+        else:
+            terminal_counts = {
+                CodexTerminalEvent.NONE: (0, 0, 0),
+                CodexTerminalEvent.TURN_COMPLETED: (1, 0, 0),
+                CodexTerminalEvent.TURN_FAILED: (0, 1, 0),
+                CodexTerminalEvent.ERROR: (0, 0, 1),
+            }
+            if (
+                self.turn_completed_count,
+                self.turn_failed_count,
+                self.error_event_count,
+            ) != terminal_counts[self.terminal_event]:
+                raise ValueError(
+                    "terminal_event must match normalized terminal counts"
+                )
         if not self.process_started and (
             self.exit_code is not None
             or self.event_count != 0

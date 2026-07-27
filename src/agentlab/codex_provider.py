@@ -70,6 +70,7 @@ _PROVIDER_ENV_ALLOWLIST = (
     "PATHEXT",
 )
 REQUIRED_CODEX_EXEC_FLAGS = CODEX_REQUIRED_EXEC_FLAGS
+CODEX_EVIDENCE_SCHEMA_VERSION: Literal["1.4"] = "1.4"
 _SAFE_ITEM_TYPES = frozenset(
     item_type.value
     for item_type in CodexItemType
@@ -287,14 +288,16 @@ class CodexJsonlParser:
                 self._append_line_bytes(remaining)
                 break
             self._append_line_bytes(remaining[:newline_index])
-            self._consume_line(bytes(self._buffer))
+            encoded_line = bytes(self._buffer)
             self._buffer.clear()
+            self._consume_line(encoded_line)
             remaining = remaining[newline_index + 1 :]
 
     def finish(self) -> CodexParseSummary:
         if self._buffer:
-            self._consume_line(bytes(self._buffer))
+            encoded_line = bytes(self._buffer)
             self._buffer.clear()
+            self._consume_line(encoded_line)
         if not self._terminal_seen:
             raise CodexProtocolError(
                 LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
@@ -310,6 +313,7 @@ class CodexJsonlParser:
         return self.summary()
 
     def summary(self) -> CodexParseSummary:
+        self._assert_normalized_event_count()
         return CodexParseSummary(
             event_count=self.event_count,
             unknown_event_count=self.unknown_event_count,
@@ -384,39 +388,29 @@ class CodexJsonlParser:
                 "Codex JSONL contains an event after its terminal event",
             )
 
-        self.event_count += 1
+        safe_item_type: CodexItemType | None = None
+        parsed_usage: UsageMetrics | None = None
         if event_type == "thread.started":
             if self._thread_started or self._turn_started:
                 self._invalid_order("thread.started")
-            self._thread_started = True
-            self.thread_started_count += 1
         elif event_type == "turn.started":
             if not self._thread_started or self._turn_started:
                 self._invalid_order("turn.started")
-            self._turn_started = True
-            self.turn_started_count += 1
         elif event_type == "turn.completed":
-            if not self._thread_started or not self._turn_started:
+            if (
+                not self._thread_started
+                or not self._turn_started
+                or self.error_event_count > 0
+            ):
                 self._invalid_order("turn.completed")
-            self._terminal_seen = True
-            self.terminal_event = CodexTerminalEvent.TURN_COMPLETED
-            self.turn_completed_count += 1
-            self.usage_metrics = self._parse_usage(raw.get("usage"))
+            parsed_usage = self._parse_usage(raw.get("usage"))
         elif event_type == "turn.failed":
             if not self._thread_started or not self._turn_started:
                 self._invalid_order("turn.failed")
-            self._terminal_seen = True
-            self._turn_failed = True
-            self.terminal_event = CodexTerminalEvent.TURN_FAILED
-            self.turn_failed_count += 1
         elif event_type == "error":
-            self._terminal_seen = True
-            self._turn_failed = True
-            self.terminal_event = CodexTerminalEvent.ERROR
-            self.error_event_count += 1
-        elif event_type in {"item.started", "item.updated", "item.completed"}:
             if not self._thread_started or not self._turn_started:
-                self._invalid_order(event_type)
+                self._invalid_order("error")
+        elif event_type in {"item.started", "item.updated", "item.completed"}:
             item = raw.get("item")
             item_type = item.get("type") if isinstance(item, dict) else None
             safe_item_type = CodexItemType(
@@ -424,11 +418,61 @@ class CodexJsonlParser:
                 if isinstance(item_type, str) and item_type in _SAFE_ITEM_TYPES
                 else CodexItemType.UNKNOWN
             )
+            pre_turn_warning = (
+                self._thread_started
+                and not self._turn_started
+                and event_type == "item.completed"
+                and safe_item_type is CodexItemType.ERROR
+            )
+            if not self._thread_started or (
+                not self._turn_started and not pre_turn_warning
+            ):
+                self._invalid_order(event_type)
+
+        # Apply the fully validated event as one state transition. No validation
+        # below this point may fail, so a rejected event cannot partially mutate
+        # normalized lifecycle, item, Usage, or terminal state.
+        self.event_count += 1
+        if event_type == "thread.started":
+            self._thread_started = True
+            self.thread_started_count += 1
+        elif event_type == "turn.started":
+            self._turn_started = True
+            self.turn_started_count += 1
+        elif event_type == "turn.completed":
+            assert parsed_usage is not None
+            self._terminal_seen = True
+            self.terminal_event = CodexTerminalEvent.TURN_COMPLETED
+            self.turn_completed_count += 1
+            self.usage_metrics = parsed_usage
+        elif event_type == "turn.failed":
+            self._terminal_seen = True
+            self._turn_failed = True
+            self.terminal_event = CodexTerminalEvent.TURN_FAILED
+            self.turn_failed_count += 1
+        elif event_type == "error":
+            self.error_event_count += 1
+        elif event_type in {"item.started", "item.updated", "item.completed"}:
+            assert safe_item_type is not None
             self.item_type_counts[safe_item_type] = (
                 self.item_type_counts.get(safe_item_type, 0) + 1
             )
         else:
             self.unknown_event_count += 1
+        self._assert_normalized_event_count()
+
+    def _assert_normalized_event_count(self) -> None:
+        normalized_count = (
+            self.thread_started_count
+            + self.turn_started_count
+            + self.turn_completed_count
+            + self.turn_failed_count
+            + self.error_event_count
+            + sum(self.item_type_counts.values())
+            + self.unknown_event_count
+        )
+        if normalized_count != self.event_count:
+            raise RuntimeError("Codex parser normalized event count invariant failed")
 
     def _invalid_order(self, event_type: str) -> NoReturn:
         raise CodexProtocolError(
@@ -790,7 +834,7 @@ def _preflight_failure_evidence(
     assert live.reasoning_effort is not None
     now = datetime.now(UTC)
     return CodexExecutionEvidence(
-        schema_version="1.3",
+        schema_version=CODEX_EVIDENCE_SCHEMA_VERSION,
         provider=Provider.CODEX,
         cli_version=error.cli_version,
         cli_profile=CodexCliProfile.NOT_SELECTED,
@@ -855,7 +899,7 @@ def post_preflight_failure_evidence(
     assert live.reasoning_effort is not None
     now = datetime.now(UTC)
     return CodexExecutionEvidence(
-        schema_version="1.3",
+        schema_version=CODEX_EVIDENCE_SCHEMA_VERSION,
         provider=Provider.CODEX,
         cli_version=preflight.cli_version,
         cli_profile=preflight.cli_profile,
@@ -930,7 +974,7 @@ def lifecycle_failure_evidence(
             int((time.monotonic() - lifecycle.started_monotonic) * 1000),
         )
     return CodexExecutionEvidence(
-        schema_version="1.3",
+        schema_version=CODEX_EVIDENCE_SCHEMA_VERSION,
         provider=Provider.CODEX,
         cli_version=preflight.cli_version,
         cli_profile=preflight.cli_profile,
@@ -1531,7 +1575,7 @@ class CodexProcessRunner:
         assert self._live.reasoning_effort is not None
         parsed = parser.summary() if summary is None else summary
         return CodexExecutionEvidence(
-            schema_version="1.3",
+            schema_version=CODEX_EVIDENCE_SCHEMA_VERSION,
             provider=Provider.CODEX,
             cli_version=preflight.cli_version,
             cli_profile=preflight.cli_profile,
@@ -1595,7 +1639,7 @@ def unsupported_platform_evidence(
     assert live.reasoning_effort is not None
     now = datetime.now(UTC)
     return CodexExecutionEvidence(
-        schema_version="1.3",
+        schema_version=CODEX_EVIDENCE_SCHEMA_VERSION,
         provider=Provider.CODEX,
         cli_version=preflight.cli_version,
         cli_profile=preflight.cli_profile,

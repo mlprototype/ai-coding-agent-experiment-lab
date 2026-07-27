@@ -37,6 +37,7 @@ from agentlab.models import (
     CodexExecutionStage,
     CodexFailureStage,
     CodexInvocationState,
+    CodexItemType,
     CodexRunnerState,
     DiagnosticCleanupState,
     DiagnosticFailureStage,
@@ -389,6 +390,43 @@ def test_live_success_runs_provider_and_gates_in_same_workspace_and_replays(
     assert result.metrics == artifact.metrics
 
 
+def test_live_pre_turn_warning_is_nonfatal_and_runs_gates(tmp_path: Path) -> None:
+    raw_warning = "raw-pre-turn-warning-secret"
+    spec_path, _fixture, prompt_path, output = _write_case(tmp_path)
+    live_code = (
+        "sys.stdin.read()\n"
+        "pathlib.Path('task.txt').write_text('status=COMPLETE\\n',encoding='utf-8')\n"
+        "print(json.dumps({'type':'thread.started'}),flush=True)\n"
+        f"print(json.dumps({{'type':'item.completed','item':{{'type':'error','message':{raw_warning!r}}}}}),flush=True)\n"
+        "print(json.dumps({'type':'turn.started'}),flush=True)\n"
+        "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'raw-agent-secret'}}),flush=True)\n"
+        "print(json.dumps({'type':'turn.completed'}),flush=True)"
+    )
+    environment, _inspection = _fake_codex(tmp_path, live_code=live_code)
+
+    outcome = _run(spec_path, output, environment)
+    artifact = load_live_artifact(output)
+    recording = load_replay_recording(outcome.recording_path)
+
+    assert artifact.overall_status is LiveOverallStatus.PASSED
+    assert artifact.failure_kind is LiveFailureKind.NONE
+    assert artifact.codex.schema_version == "1.4"
+    assert artifact.codex.item_type_counts == {
+        CodexItemType.AGENT_MESSAGE: 1,
+        CodexItemType.ERROR: 1,
+    }
+    assert artifact.codex.error_event_count == 0
+    assert len(artifact.gate_commands) == 4
+    assert artifact.metrics is not None
+    assert artifact.metrics.quality_gate_pass is True
+    assert isinstance(recording.completed, LiveRunCompletedEvent)
+    assert artifact.workspace_lifecycle is WorkspaceLifecycle.REMOVED
+    assert not _diagnostic_path(output).exists()
+    persisted = output.read_bytes() + outcome.recording_path.read_bytes()
+    assert raw_warning.encode() not in persisted
+    assert prompt_path.read_bytes() not in persisted
+
+
 def test_normal_gate_failure_has_metrics_and_completed_recording(tmp_path: Path) -> None:
     quality_gate = {
         "acceptance": [[sys.executable, "-c", "raise SystemExit(1)"]],
@@ -434,6 +472,7 @@ def test_provider_failure_skips_gates_and_writes_failed_recording(tmp_path: Path
         "sys.stdin.read()\n"
         "print(json.dumps({'type':'thread.started'}),flush=True)\n"
         "print(json.dumps({'type':'turn.started'}),flush=True)\n"
+        "print(json.dumps({'type':'error','message':'provider-raw-secret'}),flush=True)\n"
         "print(json.dumps({'type':'turn.failed','error':'provider-raw-secret'}),flush=True)"
     )
     environment, _inspection = _fake_codex(tmp_path, live_code=live_code)
@@ -445,8 +484,12 @@ def test_provider_failure_skips_gates_and_writes_failed_recording(tmp_path: Path
     assert outcome.artifact.failure_kind is LiveFailureKind.PROVIDER_TURN_FAILED
     assert outcome.artifact.gate_commands == []
     assert outcome.artifact.metrics is None
+    assert outcome.artifact.codex.schema_version == "1.4"
+    assert outcome.artifact.codex.error_event_count == 1
+    assert outcome.artifact.codex.turn_failed_count == 1
     assert isinstance(recording.failed, LiveRunFailedEvent)
     assert not gate_marker.exists()
+    assert not _diagnostic_path(output).exists()
     with pytest.raises(ReplayError, match="Metrics are absent"):
         replay_spec = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
         replay_spec["execution_mode"] = "replay"
@@ -455,6 +498,60 @@ def test_provider_failure_skips_gates_and_writes_failed_recording(tmp_path: Path
         replay_path = spec_path.parent / "replay-failed.yaml"
         replay_path.write_text(yaml.safe_dump(replay_spec), encoding="utf-8")
         run_replay(replay_path, tmp_path / "must-not-exist.json")
+
+
+def test_live_protocol_error_publishes_strict_paired_failure_without_diagnostic(
+    tmp_path: Path,
+) -> None:
+    gate_marker = tmp_path / "gate-must-not-run"
+    quality_gate = {
+        "acceptance": [
+            [
+                sys.executable,
+                "-c",
+                f"import pathlib;pathlib.Path({str(gate_marker)!r}).write_text('ran')",
+            ]
+        ],
+        "regression": [],
+        "lint": [],
+        "typecheck": [],
+    }
+    spec_path, _fixture, prompt_path, output = _write_case(
+        tmp_path,
+        quality_gate=quality_gate,
+    )
+    raw_secret = "raw-protocol-event-secret"
+    live_code = (
+        "import signal\n"
+        "sys.stdin.read()\n"
+        f"print(json.dumps({{'type':'thread.started','value':{raw_secret!r}}}),flush=True)\n"
+        f"print(json.dumps({{'type':'thread.started','value':{raw_secret!r}}}),flush=True)\n"
+        "signal.pause()"
+    )
+    environment, _inspection = _fake_codex(tmp_path, live_code=live_code)
+
+    outcome = _run(spec_path, output, environment)
+    artifact = load_live_artifact(output)
+    recording = load_replay_recording(outcome.recording_path)
+
+    assert artifact.overall_status is LiveOverallStatus.PROVIDER_ERROR
+    assert artifact.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
+    assert artifact.codex.schema_version == "1.4"
+    assert artifact.codex.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
+    assert artifact.codex.process_started is True
+    assert artifact.codex.cleanup_state is CodexCleanupState.CLEARED
+    assert artifact.codex.event_count == 1
+    assert artifact.codex.thread_started_count == 1
+    assert artifact.gate_commands == []
+    assert artifact.metrics is None
+    assert artifact.workspace_lifecycle is WorkspaceLifecycle.REMOVED
+    assert isinstance(recording.failed, LiveRunFailedEvent)
+    assert recording.failed.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
+    assert not gate_marker.exists()
+    assert not _diagnostic_path(output).exists()
+    persisted = output.read_bytes() + outcome.recording_path.read_bytes()
+    assert raw_secret.encode() not in persisted
+    assert prompt_path.read_bytes() not in persisted
 
 
 def test_provider_timeout_skips_gates_and_removes_workspace(tmp_path: Path) -> None:
@@ -843,7 +940,7 @@ def test_runner_boundary_faults_preserve_pre_spawn_lifecycle(
         expected_execution_stage=CodexExecutionStage.PREFLIGHT_COMPLETED,
         expected_failure_kind=LiveFailureKind.EVIDENCE_ERROR,
     )
-    assert outcome.artifact.codex.schema_version == "1.3"
+    assert outcome.artifact.codex.schema_version == "1.4"
     assert outcome.artifact.codex.runner_state is expected_runner_state
     assert (
         outcome.artifact.codex.invocation_state
@@ -954,7 +1051,7 @@ def test_pre_provider_faults_persist_safe_stage_without_running_gates(
     assert b"synthetic failure text must not be persisted" not in persisted
     assert len(temporary_roots) == 1
     assert not temporary_roots[0].exists()
-    assert outcome.artifact.codex.schema_version == "1.3"
+    assert outcome.artifact.codex.schema_version == "1.4"
     assert outcome.artifact.codex.runner_state is CodexRunnerState.STARTED
     if expected_execution_stage is CodexExecutionStage.PREFLIGHT_COMPLETED:
         assert (
@@ -1073,7 +1170,7 @@ def test_post_spawn_handoff_faults_preserve_process_lifecycle(
         expected_process_started=True,
     )
     codex = outcome.artifact.codex
-    assert codex.schema_version == "1.3"
+    assert codex.schema_version == "1.4"
     assert codex.runner_state is CodexRunnerState.STARTED
     assert codex.invocation_state is CodexInvocationState.PROCESS_STARTED
     assert codex.cleanup_state is CodexCleanupState.CLEARED
@@ -1539,7 +1636,7 @@ def test_reachable_lifecycle_states_build_strict_evidence_or_truthful_diagnostic
             live=live,
             lifecycle=lifecycle,
         )
-        assert evidence.schema_version == "1.3"
+        assert evidence.schema_version == "1.4"
         assert evidence.runner_state is runner_state
         assert evidence.invocation_state is invocation_state
         assert evidence.cleanup_state is cleanup_state
@@ -1995,7 +2092,7 @@ def test_post_spawn_faults_persist_safe_stage_and_reap_process(
         is CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
     )
     assert artifact.codex.process_started is True
-    assert artifact.codex.schema_version == "1.3"
+    assert artifact.codex.schema_version == "1.4"
     assert artifact.codex.runner_state is CodexRunnerState.STARTED
     assert (
         artifact.codex.invocation_state is CodexInvocationState.PROCESS_STARTED
@@ -3009,6 +3106,42 @@ def test_legacy_codex_evidence_12_failure_remains_loadable(
     assert legacy.codex.runner_state is None
     assert legacy.codex.invocation_state is None
     assert legacy.codex.cleanup_state is None
+
+
+def test_legacy_codex_evidence_13_remains_strictly_loadable(
+    tmp_path: Path,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(tmp_path, live_code=_success_code())
+    payload = _run(spec_path, output, environment).artifact.model_dump(mode="json")
+    payload["codex"]["schema_version"] = "1.3"
+
+    legacy = LiveRunArtifact.model_validate(payload)
+
+    assert legacy.codex.schema_version == "1.3"
+    assert legacy.codex.runner_state is CodexRunnerState.STARTED
+    assert legacy.codex.invocation_state is CodexInvocationState.PROCESS_STARTED
+    assert legacy.codex.cleanup_state is CodexCleanupState.CLEARED
+
+
+def test_codex_evidence_13_does_not_adopt_14_error_count_semantics(
+    tmp_path: Path,
+) -> None:
+    spec_path, _fixture, _prompt, output = _write_case(tmp_path)
+    live_code = (
+        "sys.stdin.read()\n"
+        "print(json.dumps({'type':'thread.started'}),flush=True)\n"
+        "print(json.dumps({'type':'turn.started'}),flush=True)\n"
+        "print(json.dumps({'type':'error'}),flush=True)\n"
+        "print(json.dumps({'type':'turn.failed'}),flush=True)"
+    )
+    environment, _inspection = _fake_codex(tmp_path, live_code=live_code)
+    payload = _run(spec_path, output, environment).artifact.model_dump(mode="json")
+    assert payload["codex"]["schema_version"] == "1.4"
+    payload["codex"]["schema_version"] = "1.3"
+
+    with pytest.raises(ValidationError, match="terminal_event"):
+        LiveRunArtifact.model_validate(payload)
 
 
 def test_codex_evidence_12_failure_requires_safe_stage(

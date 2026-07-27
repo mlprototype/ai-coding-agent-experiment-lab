@@ -38,11 +38,14 @@ Phase 0〜2を完了し、現在は
 
 Replayは引き続きRecording内の保存済みMetricsだけを再構成し、外部処理を呼びません。
 通常テストは短時間のfake Codex executableだけを使い、実Codex、外部AI、network、
-quotaを呼びません。Phase 3のmanual Live smokeは累計3回実行し、3回とも成功受入に
+quotaを呼びません。Phase 3のmanual Live smokeは累計4回実行し、4回とも成功受入に
 達していないため、Phase 3は引き続きCurrentです。003ではstrict lifecycle Evidenceを
-構築できず、Evidence／Recordingは作成されませんでした。003のProvider起動、Prompt送信、
-model API到達、quota消費は確定不能です。003は再実行せず、次回Liveには修正commitの
-レビューと別の明示承認が必要です。
+構築できず、004はSpec予約commit
+`b54ab576d352553227877c8d59d4af611e79b884`に対する1回の実行でCodex Evidence
+validationに失敗しました。004はFailure Diagnostic 1.0だけを作成し、
+Evidence／Recording、Gate、Replayはありません。Provider process開始とcleanup成功は
+観測済みですが、Prompt送信、model API到達、quota消費、実際のJSONL event列は確定不能です。
+003／004は再実行せず、次回Liveには修正commitのレビューと別の明示承認が必要です。
 scheduler、staged Workflow、Workflow A/B、Antigravity、Provider比較、比較レポートは
 未実装です。
 
@@ -69,7 +72,7 @@ uv run mypy src
 ```
 
 次はPhase 3で使用したmanual smokeのCLI形式です。実Codexを使うため、通常テストやCIでは
-実行しません。承認済みmanual smokeは累計3回で、003は再実行しません。新しい実行は
+実行しません。承認済みmanual smokeは累計4回で、003／004は再実行しません。新しい実行は
 レビュー済みの別commitと個別の明示承認なしには行いません。
 
 ```console
@@ -88,14 +91,14 @@ read-only preflightに成功します。このprofileは
 `--ask-for-approval`には依存しません。profile名、CLI version、明示設定の根拠を
 Evidenceへ保存します。preflightを完了できない場合はprofileを`not_selected`とし、
 approval policyを適用済みとは記録しません。preflight完了後もProvider起動前なら、選択済み
-profileと確認済みflagを保持しつつ、approval policyはnullのままです。新規Codex
-Evidence 1.3はrunner、Popen試行、process生成、process group回収の観測状態を固定Enumで
-保持します。旧1.2の`provider_orchestration` fallbackはこの状態を正確に保持できないため、
-2回目のProvider起動・Prompt送信・model API到達・quota消費は確定不能です。manual Live
-受入は累計3回とも未達です。003はstrict lifecycle Evidence構築に失敗してpaired成果物が
-なく、Provider活動を確定できません。新しいFailure Diagnosticは、この種の失敗時に
-固定Enumの観測値だけをatomic・上書き禁止で保存します。Evidence／Recordingの代替でも
-Replay入力でもなく、作成されても受入成功を意味しません。
+profileと確認済みflagを保持しつつ、approval policyはnullのままです。Codex Evidence 1.3は
+runner、Popen試行、process生成、process group回収の観測状態を固定Enumで保持し、新規
+Evidence 1.4はtop-level `error`をturn terminalと分離して数えます。1.1〜1.3は従来の
+制約のままstrict loadできます。固定CLI sourceで到達可能なpre-turn warningと
+`error`→`turn.failed`へparserをオフラインで合わせましたが、004の実際のevent列は
+復元できず、この欠陥が004の直接原因だったとは断定しません。Failure Diagnosticは、
+strict paired成果物を構築できない場合だけ固定Enumの観測値をatomic・上書き禁止で保存し、
+Evidence／Recordingの代替でもReplay入力でもありません。
 
 `--confirm-live-codex`なしではversion/help preflightを含むsubprocessを起動しません。
 確認付き実行はCodex model APIへのPrompt送信とquota消費を伴います。Promptはargvへ

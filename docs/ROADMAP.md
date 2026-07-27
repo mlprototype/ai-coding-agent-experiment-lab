@@ -61,14 +61,19 @@ JSONL parser、Provider process tree停止、正規化Codex Evidence、redaction
 
 **受入条件:** 手動の隔離環境で一つのfixtureを実行・Recordでき、その記録をReplayして
 同じ正規化eventを得る。認証情報や機密Promptを成果物へ保存しない。通常CIは呼ばない。
-実Codexによるmanual Live smokeは累計3回実行し、3回とも成功受入に達していない。003は
-strict lifecycle Evidenceを構築できず、Evidence／Recordingは作成されなかったため、
-Provider起動、Prompt送信、model API到達、quota消費は確定不能である。003 Spec予約commitと
-001／002のGit管理外Live成果物4件を保持し、003は再実行しない。strict契約を緩めず、
-Evidence構築失敗時だけ固定Enumと観測済みlifecycleをatomic・上書き禁止で保存する独立
-Failure Diagnosticのoffline修正と再レビューを行う。DiagnosticはReplay対象でも受入成功の
-根拠でもない。次回Liveには新しい修正commitのレビューと別の明示承認を必要とする。
-Phase 3はCurrentのままとし、Completeへ変更しない。
+実Codexによるmanual Live smokeは累計4回実行し、4回とも成功受入に達していない。003は
+strict lifecycle Evidenceを構築できず、Provider活動は確定不能である。004は予約commit
+`b54ab576d352553227877c8d59d4af611e79b884`に対して1回だけ実行し、Codex Evidence
+validation失敗となった。004はFailure Diagnostic 1.0だけを作成し、Evidence／Recording、
+Gate、Replayはない。Provider process開始とcleanup成功は観測済みだが、Prompt送信、
+model API到達、quota消費、実際のJSONL event列は確定不能である。
+
+固定CLI sourceとparserの間にあるpre-turn warning、top-level `error`→`turn.failed`、
+拒否eventの部分的な件数更新という互換性欠陥をオフライン修正する。Codex Evidence 1.4で
+top-level error件数とturn terminalを分離し、1.1〜1.3のstrict契約を維持する。ただし、この
+欠陥が004で実際に発生したevent列だったとは断定しない。001〜004の失敗履歴とGit管理外
+成果物を保持し、003／004は再実行しない。次回Liveには修正commitのレビューと別の明示承認
+を必要とする。Phase 3はCurrentのままとし、Completeへ変更しない。
 
 ## Phase 4: Workflow A/B Experiment
 

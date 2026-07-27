@@ -578,6 +578,37 @@ def test_jsonl_parser_preserves_missing_usage_as_not_available() -> None:
     assert usage.output_tokens is None
 
 
+def test_jsonl_parser_accepts_pre_turn_error_item_as_nonfatal_warning() -> None:
+    parser = CodexJsonlParser(max_line_bytes=4096, max_total_bytes=16384)
+    warning_secret = "raw-config-warning-secret"
+    for event in (
+        {"type": "thread.started"},
+        {
+            "type": "item.completed",
+            "item": {"type": "error", "message": warning_secret},
+        },
+        {"type": "turn.started"},
+        {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "raw-agent-secret"},
+        },
+        {"type": "turn.completed"},
+    ):
+        parser.feed(_json_line(event))
+
+    summary = parser.finish()
+
+    assert summary.event_count == 5
+    assert summary.terminal_event is CodexTerminalEvent.TURN_COMPLETED
+    assert summary.item_type_counts == {
+        CodexItemType.AGENT_MESSAGE: 1,
+        CodexItemType.ERROR: 1,
+    }
+    assert summary.error_event_count == 0
+    assert summary.turn_failed is False
+    assert warning_secret not in repr(summary)
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -628,6 +659,88 @@ def test_jsonl_parser_rejects_invalid_lifecycle(events: list[dict[str, str]]) ->
             parser.feed(_json_line(event))
 
 
+@pytest.mark.parametrize(
+    ("accepted_events", "rejected_event"),
+    [
+        ([], {"type": "turn.started"}),
+        ([{"type": "thread.started"}], {"type": "thread.started"}),
+        (
+            [{"type": "thread.started"}],
+            {"type": "item.started", "item": {"type": "error"}},
+        ),
+        (
+            [{"type": "thread.started"}],
+            {"type": "item.completed", "item": {"type": "agent_message"}},
+        ),
+        ([{"type": "thread.started"}], {"type": "turn.completed"}),
+        (
+            [{"type": "thread.started"}, {"type": "turn.started"}],
+            {"type": "turn.started"},
+        ),
+        (
+            [{"type": "thread.started"}, {"type": "turn.started"}],
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": True},
+            },
+        ),
+        (
+            [
+                {"type": "thread.started"},
+                {"type": "turn.started"},
+                {"type": "turn.completed"},
+            ],
+            {"type": "future.event"},
+        ),
+        (
+            [
+                {"type": "thread.started"},
+                {"type": "turn.started"},
+                {"type": "error"},
+            ],
+            {"type": "turn.completed"},
+        ),
+    ],
+    ids=[
+        "turn-before-thread",
+        "duplicate-thread",
+        "pre-turn-item-started",
+        "pre-turn-non-error-item",
+        "terminal-before-turn",
+        "duplicate-turn",
+        "invalid-usage",
+        "event-after-terminal",
+        "success-terminal-after-error",
+    ],
+)
+def test_jsonl_parser_rejected_event_does_not_partially_update_state(
+    accepted_events: list[dict[str, object]],
+    rejected_event: dict[str, object],
+) -> None:
+    parser = CodexJsonlParser(max_line_bytes=4096, max_total_bytes=16384)
+    for event in accepted_events:
+        parser.feed(_json_line(event))
+    before = parser.summary()
+    stdout_bytes_before = parser.total_bytes
+
+    with pytest.raises(CodexProtocolError):
+        parser.feed(_json_line(rejected_event))
+
+    after = parser.summary()
+    normalized_count = (
+        after.thread_started_count
+        + after.turn_started_count
+        + after.turn_completed_count
+        + after.turn_failed_count
+        + after.error_event_count
+        + sum(after.item_type_counts.values())
+        + after.unknown_event_count
+    )
+    assert after == before
+    assert normalized_count == after.event_count
+    assert parser.total_bytes > stdout_bytes_before
+
+
 def test_jsonl_parser_rejects_missing_terminal() -> None:
     parser = CodexJsonlParser(max_line_bytes=4096, max_total_bytes=16384)
     parser.feed(_json_line({"type": "thread.started"}))
@@ -649,14 +762,43 @@ def test_jsonl_parser_classifies_turn_failed() -> None:
     assert parser.finish().turn_failed is True
 
 
-def test_jsonl_parser_classifies_terminal_error() -> None:
+def test_jsonl_parser_records_top_level_error_before_turn_failed() -> None:
     parser = CodexJsonlParser(max_line_bytes=4096, max_total_bytes=16384)
-    parser.feed(_json_line({"type": "error", "message": "raw-secret"}))
+    for event in (
+        {"type": "thread.started"},
+        {"type": "turn.started"},
+        {"type": "error", "message": "raw-top-level-error-secret"},
+        {"type": "turn.failed", "error": "raw-turn-failure-secret"},
+    ):
+        parser.feed(_json_line(event))
 
     summary = parser.finish()
 
     assert summary.turn_failed is True
-    assert summary.event_count == 1
+    assert summary.event_count == 4
+    assert summary.error_event_count == 1
+    assert summary.turn_failed_count == 1
+    assert summary.terminal_event is CodexTerminalEvent.TURN_FAILED
+
+
+def test_jsonl_parser_accepts_pre_turn_warning_before_failed_turn() -> None:
+    parser = CodexJsonlParser(max_line_bytes=4096, max_total_bytes=16384)
+    for event in (
+        {"type": "thread.started"},
+        {"type": "item.completed", "item": {"type": "error"}},
+        {"type": "turn.started"},
+        {"type": "error"},
+        {"type": "turn.failed"},
+    ):
+        parser.feed(_json_line(event))
+
+    summary = parser.finish()
+
+    assert summary.event_count == 5
+    assert summary.item_type_counts == {CodexItemType.ERROR: 1}
+    assert summary.error_event_count == 1
+    assert summary.turn_failed_count == 1
+    assert summary.terminal_event is CodexTerminalEvent.TURN_FAILED
 
 
 def test_jsonl_parser_enforces_line_and_total_limits() -> None:
@@ -710,7 +852,7 @@ def test_process_runner_uses_safe_argv_stdin_and_separate_environment(
     argv = observed["argv"]
 
     assert result.evidence.status is ProviderExecutionStatus.SUCCEEDED
-    assert result.evidence.schema_version == "1.3"
+    assert result.evidence.schema_version == "1.4"
     assert result.evidence.runner_state is CodexRunnerState.STARTED
     assert (
         result.evidence.invocation_state
@@ -854,6 +996,82 @@ def test_process_runner_classifies_cli_and_protocol_failures(
 
     assert result.evidence.status is ProviderExecutionStatus.FAILED
     assert result.evidence.failure_kind is expected
+
+
+def test_process_runner_preserves_pre_turn_warning_and_official_failed_turn(
+    tmp_path: Path,
+) -> None:
+    raw_secret = "raw-official-provider-error-secret"
+    live_code = (
+        "sys.stdin.read()\n"
+        "print(json.dumps({'type':'thread.started'}),flush=True)\n"
+        f"print(json.dumps({{'type':'item.completed','item':{{'type':'error','message':{raw_secret!r}}}}}),flush=True)\n"
+        "print(json.dumps({'type':'turn.started'}),flush=True)\n"
+        f"print(json.dumps({{'type':'error','message':{raw_secret!r}}}),flush=True)\n"
+        f"print(json.dumps({{'type':'turn.failed','error':{raw_secret!r}}}),flush=True)"
+    )
+    environment, _inspection = _fake_codex(tmp_path, live_code=live_code)
+    preflight = preflight_codex(parent_environment=environment)
+    workspace, environment_root = _workspace(tmp_path)
+
+    result = CodexProcessRunner(
+        live=_live_settings(),
+        runner=_runner_settings(),
+    ).run(
+        preflight=preflight,
+        prompt=b"safe prompt",
+        workspace=workspace,
+        environment_root=environment_root,
+        parent_environment=environment,
+    )
+    evidence = result.evidence
+
+    assert evidence.schema_version == "1.4"
+    assert evidence.failure_kind is LiveFailureKind.PROVIDER_TURN_FAILED
+    assert evidence.terminal_event is CodexTerminalEvent.TURN_FAILED
+    assert evidence.error_event_count == 1
+    assert evidence.turn_failed_count == 1
+    assert evidence.item_type_counts == {CodexItemType.ERROR: 1}
+    assert evidence.event_count == 5
+    assert evidence.termination.process_group_cleared is True
+    assert raw_secret not in evidence.model_dump_json()
+
+
+def test_process_runner_protocol_error_keeps_only_accepted_event_counts(
+    tmp_path: Path,
+) -> None:
+    raw_secret = "raw-duplicate-thread-secret"
+    live_code = (
+        "sys.stdin.read()\n"
+        f"print(json.dumps({{'type':'thread.started','value':{raw_secret!r}}}),flush=True)\n"
+        f"print(json.dumps({{'type':'thread.started','value':{raw_secret!r}}}),flush=True)\n"
+        "signal.pause()"
+    )
+    environment, _inspection = _fake_codex(tmp_path, live_code=live_code)
+    preflight = preflight_codex(parent_environment=environment)
+    workspace, environment_root = _workspace(tmp_path)
+
+    result = CodexProcessRunner(
+        live=_live_settings(),
+        runner=_runner_settings(),
+    ).run(
+        preflight=preflight,
+        prompt=b"safe prompt",
+        workspace=workspace,
+        environment_root=environment_root,
+        parent_environment=environment,
+    )
+    evidence = result.evidence
+
+    assert evidence.schema_version == "1.4"
+    assert evidence.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
+    assert evidence.process_started is True
+    assert evidence.cleanup_state is CodexCleanupState.CLEARED
+    assert evidence.event_count == 1
+    assert evidence.thread_started_count == 1
+    assert evidence.turn_started_count == 0
+    assert evidence.terminal_event is CodexTerminalEvent.NONE
+    assert raw_secret not in evidence.model_dump_json()
 
 
 def test_process_runner_classifies_signal_termination(tmp_path: Path) -> None:

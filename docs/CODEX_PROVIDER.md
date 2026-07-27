@@ -4,9 +4,9 @@
 
 Phase 3は、1 task・1 Codex Provider・1 repetition・`one_shot`を人間が手動実行する最小
 vertical sliceである。scheduler、staged Workflow、比較実験、自動retryはPhase 4以降で
-あり、実装していない。通常テストはfake Codexだけを使う。manual Live smokeは累計3回
-実行し、3回とも成功受入に達していない。003は再実行せず、次回Liveには新しい修正commit
-のレビューと別の明示承認が必要である。
+あり、実装していない。通常テストはfake Codexだけを使う。manual Live smokeは累計4回
+実行し、4回とも成功受入に達していない。003／004は再実行せず、次回Liveには新しい
+修正commitのレビューと別の明示承認が必要である。
 
 ## Read-only preflight
 
@@ -89,13 +89,26 @@ Phase 2 allowlist環境と専用の一時HOME/TMP/cacheで起動するため、P
 stdoutはraw全体を保持せずchunkごとに処理する。各行でstrict UTF-8、非空、JSON object、
 duplicate key、非有限数、string `type`、1行/全体byte上限を確認する。
 
-成功lifecycleは`thread.started`、`turn.started`、exactly one `turn.completed`の順である。
-`turn.failed`とterminal `error`はProvider失敗にする。item payloadは保存せずitem type件数
-だけを数え、認識していないitem type文字列は本文を保持せず`unknown`へ集約する。
-未知eventはraw payloadを破棄してunknown件数へ加算し、core lifecycleが正しければ
-許容する。Evidenceにはthread/turn開始数、terminal種別、completed/failed/error数を
-正規化し、全event件数との一致を検証する。item type keyは安全なEnumと`unknown`だけを
-許可する。
+[固定commitのJSONL event processor](https://github.com/openai/codex/blob/ff75c5b939c477c49eb1bd5248da6dab71b109d1/codex-rs/exec/src/event_processor_with_jsonl_output.rs)
+と
+[exec event定義](https://github.com/openai/codex/blob/ff75c5b939c477c49eb1bd5248da6dab71b109d1/codex-rs/exec/src/exec_events.rs)
+に合わせ、`thread.started`を一意な最初のcore eventとする。通常成功は
+`thread.started`、`turn.started`、exactly one `turn.completed`の順である。
+`thread.started`後かつ`turn.started`前は、config warningとして到達可能な
+`item.completed/error`だけを限定的に許容する。item-level `error`は非fatalな件数であり、
+単独ではProvider失敗にしない。
+
+top-level `error`は独立した観測件数として保持し、直ちにterminalへ変換しない。その後の
+正規な`turn.failed`を失敗turnのterminalとして保持し、この列を
+`provider_turn_failed`とする。構造、順序、item type、Usageをすべて検証してから1 eventの
+状態を一括反映するため、拒否したeventはevent数、lifecycle、item数、Usage、terminalを
+部分更新しない。受信byte数だけは実際のstdout観測値として維持する。
+
+item payloadは保存せずitem type件数だけを数え、認識していないitem type文字列は本文を
+保持せず`unknown`へ集約する。未知eventはraw payloadを破棄してunknown件数へ加算し、
+core lifecycleが正しければ許容する。Evidenceにはthread/turn開始数、turn terminal種別、
+completed/failed/top-level error数を正規化し、全event件数との一致を検証する。item type
+keyは安全なEnumと`unknown`だけを許可する。
 
 `turn.completed.usage`に存在する非負integerのinput/cached input/output/reasoning output
 Tokenだけを`provider_reported`として写す。Usage欠損は0にせず`not_available`とする。
@@ -109,7 +122,8 @@ Provider環境構築、process起動試行、pipe/selector初期化、process収
 構築、runner result構築／抽出、Provider orchestrationを区別する。さらに
 `runner_state`、`invocation_state`、`cleanup_state`を固定Enumで保存し、runner未開始、
 Popen未試行、Popen試行済みでprocess未生成、process生成済み、回収済み、回収失敗を
-表現する。
+表現する。1.4はこのlifecycle契約を継承し、top-level `error`件数とturn terminalを
+独立して表現する。新規実行だけを1.4で生成し、1.3のterminal/error対応は変更しない。
 `Popen`を呼んだ時点から`provider_invocation_attempted`とapproval
 `never`/`explicit_config_never`を記録し、spawn失敗では`process_started=false`を保つ。
 それ以前は`preflight_completed`、`process_started=false`、approval policy/basis null
@@ -142,12 +156,13 @@ thread/session ID、`CODEX_HOME`、executable path、認証情報、親process�
 traceback、filesystem pathはDiagnosticへ保存しない。任意の例外class名も含めず、
 固定Enum以外の失敗理由を永続化しない。
 
-既存CodexExecutionEvidence 1.1は`failure_stage`なし、1.2は1.3のlifecycle fieldなしで
-引き続きstrict loaderが受理する。新規Evidenceだけを1.3で保存するため、保存済み
-Codex Evidence 1.1／1.2、Recording 1.1、Live Artifact 1.0を変換・上書きせず
-後方互換で読み込める。旧1.2の`provider_orchestration` fallbackはrunner内部の観測状態を
-保持しなかったため、そこからProvider起動、Prompt送信、model API到達、quota消費、
-process group回収の有無を確定してはならない。
+既存CodexExecutionEvidence 1.1は`failure_stage`なし、1.2は1.3以降のlifecycle fieldなしで
+引き続きstrict loaderが受理する。1.1／1.2／1.3のvalidatorを緩めず、新規Evidenceだけを
+1.4で保存する。保存済みCodex Evidence 1.1〜1.3、Recording 1.1、Live Artifact 1.0、
+Failure Diagnostic 1.0を変換・上書きせず後方互換で読み込める。旧1.2の
+`provider_orchestration` fallbackはrunner内部の観測状態を保持しなかったため、そこから
+Provider起動、Prompt送信、model API到達、quota消費、process group回収の有無を確定しては
+ならない。
 
 ## Persisted and excluded fields
 
@@ -155,7 +170,8 @@ CodexExecutionEvidenceにはrequested model/reasoning、sandbox/approval/network
 CLI profile/version、execution stage、時刻/duration、process開始有無、status/exit、
 thread/turn/terminal/event/unknown/item件数、Usage、stdout/stderr byte数と上限状態、
 process termination、safe failure kind、1.2以降のsafe failure stageを保存する。
-1.3ではrunner／invocation／cleanupの固定状態も保存する。
+1.3以降はrunner／invocation／cleanupの固定状態も保存し、1.4ではtop-level errorを
+turn terminalと分離して保存する。
 
 Prompt本文、agent最終回答、reasoning、command本文/output、file content、raw JSONL、
 raw stderr、thread/session ID、executable path、HOME/CODEX_HOME、認証情報は保存しない。
@@ -238,7 +254,7 @@ READMEの`live-codex ... --confirm-live-codex`を明示承認の範囲で手動�
 
 現在確認した`codex-cli 0.146.0-alpha.3.1`は
 `headless_exec_explicit_never_v2`のversion allowlistとread-only preflightに成功した。
-manual Live smokeは累計3回実行し、3回とも成功受入に達していない。2回目は
+manual Live smokeは累計4回実行し、4回とも成功受入に達していない。2回目は
 `overall_status=harness_error`、`failure_kind=evidence_error`、
 `failure_stage=provider_orchestration`だったが、旧1.2 fallbackが起動・回収状態を
 ゼロ値で合成しうる欠陥があった。この成果物だけからProvider起動、Prompt送信、model API
@@ -251,5 +267,15 @@ manual Live smokeは累計3回実行し、3回とも成功受入に達してい�
 過去の内部例外も復元できない。003 Specの予約commitは保持し、003は再実行しない。
 001／002のLive Evidence／Recording 4件はGit管理外で保持する。Failure Diagnosticは
 将来の同種失敗を固定値で識別するためのoffline修正であり、003の過去状態を補完せず、
-受入成功を意味しない。Phase 3はCurrentのままである。次回Liveは新しい修正commitの
-レビューと別の明示承認がある場合だけ、新しいSpecとrun-idで1回実行する。
+受入成功を意味しない。
+
+004はSpec予約commit `b54ab576d352553227877c8d59d4af611e79b884`に対して1回だけ
+実行し、Codex Evidence validation失敗で停止した。Failure Diagnostic 1.0だけが作成され、
+Evidence／Recordingは未作成、Gate／Replayは未実行である。DiagnosticではProvider
+process開始とprocess group cleanup成功を観測したが、Prompt送信、model API到達、quota
+消費、実際のJSONL event列は確定不能である。固定CLI sourceとの比較で、pre-turn warningと
+top-level `error`→`turn.failed`を拒むparser互換性欠陥、および拒否eventが件数を部分更新する
+欠陥は確定したためオフライン修正した。ただし004のevent列は復元できず、この欠陥が004の
+直接原因だったとは断定しない。004は再実行しない。Phase 3はCurrentのままであり、次回
+Liveは新しい修正commitのレビューと別の明示承認がある場合だけ、新しいSpecとrun-idで
+1回実行する。
