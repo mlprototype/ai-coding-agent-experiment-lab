@@ -50,7 +50,7 @@ Evidence不完全ではMetricsを生成しない。Phase 1 Replayのbyte決定�
 
 ## Phase 3: Codex CLI Provider
 
-**Status: Current**
+**Status: Complete**
 
 **目的:** Codex CLIを共通Provider境界へ接続し、安全なLive Recordを実現する。
 
@@ -60,22 +60,16 @@ JSONL parser、Provider process tree停止、正規化Codex Evidence、redaction
 構築できない場合の独立Failure Diagnostic、fake CLI offline test。
 
 **受入条件:** 手動の隔離環境で一つのfixtureを実行・Recordでき、その記録をReplayして
-同じ正規化eventを得る。認証情報や機密Promptを成果物へ保存しない。通常CIは呼ばない。
-実Codexによるmanual Live smokeは累計5回実行し、5回とも成功受入に達していない。005は
-予約commit `b63024ab2214611b059fb75da0444d200d3d32d9`（親の修正実装commit
-`2cb4eadfbfdc54e3d71f1d6a1a070bd3e53a3566`）に対して1回だけ実行し、
-`provider_turn_failed`／exit 1になった。Evidence 1.4とRecording 1.1はstrict再読込、
-SHA-256照合、redaction、Workspace／process group回収に成功したが、Gateは0件、Metricsは
-null、Replayは未実行でDiagnosticもない。raw turn errorは保存されず根本原因を復元できない。
-Prompt書込み完了、model API到達、quota消費も確定不能であり、原因を推測しない。
-
-固定CLI sourceとparserの間にあるpre-turn warning、top-level `error`→`turn.failed`、
-拒否eventの部分的な件数更新という互換性欠陥をオフライン修正する。Codex Evidence 1.4で
-top-level error件数とturn terminalを分離した。Evidence 1.5ではOS stdin pipe書込み状態と、
-free-form messageを破棄して得る固定Enumのadvisory failure hintを追加し、1.1〜1.4のstrict
-契約を維持する。001〜005の全履歴とGit管理外成果物を保持し、003〜005は再実行しない。
-次回Liveにはdiagnostics commitのレビュー、新しいSpec／run-id／出力先、別の明示承認を
-必要とする。Phase 3はCurrentのままとし、Completeへ変更しない。Phase 4は未着手である。
+同じ正規化結果を得る。認証情報や機密Promptを成果物へ保存せず、通常CIからLiveを呼ばない。
+manual Liveは累計8試行である。006はProvider起動後の`model_access`境界、007は
+`inconclusive_prompt_delivery_failure`として履歴を保持し、成功へ変更しない。008は人間が
+selectable catalogから明示選択した`gpt-5.6-sol`をcommit
+`cc97e53bf0bac426b08346f63e6f527ed7d5be9e`のAgentLab製品経路で1回実行した。agent call 1、
+retry／fallback 0、Provider exit 0、`turn.completed` 1件、`turn.failed` 0件で、
+`task.txt`だけを期待どおり変更した。4種類のQuality Gateは全PASSし、Evidence 1.5／
+Recording 1.1のstrict再読込、offline Replay、Metrics一致、redaction、process group／
+Workspace cleanupを確認した。これによりPhase 3の最小vertical slice受入を完了した。
+この結果は一般的なモデル性能やProvider比較を示さず、Phase 4はPlannedのまま未着手である。
 
 ## Phase 4: Workflow A/B Experiment
 

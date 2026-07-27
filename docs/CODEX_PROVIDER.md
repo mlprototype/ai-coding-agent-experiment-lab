@@ -4,9 +4,10 @@
 
 Phase 3は、1 task・1 Codex Provider・1 repetition・`one_shot`を人間が手動実行する最小
 vertical sliceである。scheduler、staged Workflow、比較実験、自動retryはPhase 4以降で
-あり、実装していない。通常テストはfake Codexだけを使う。manual Live smokeは累計5回
-実行し、5回とも成功受入に達していない。003〜005は再実行せず、次回Liveには診断修正
-commitのレビュー、新しいSpec／run-id／出力先、別の明示承認が必要である。
+あり、実装していない。通常テストはfake Codexだけを使う。manual Liveは累計8試行で、
+008のAgentLab製品経路とoffline ReplayによってPhase 3の最小vertical slice受入を完了した。
+過去runは再実行せず、新しいLiveにはレビュー済みcommit、新しいSpec／run-id／出力先、
+別の明示承認を必要とする。
 
 ## Read-only preflight
 
@@ -269,7 +270,7 @@ READMEの`live-codex ... --confirm-live-codex`を明示承認の範囲で手動�
 
 現在確認した`codex-cli 0.146.0-alpha.3.1`は
 `headless_exec_explicit_never_v2`のversion allowlistとread-only preflightに成功した。
-manual Live smokeは累計5回実行し、5回とも成功受入に達していない。2回目は
+manual Live 001〜005は5試行すべて成功受入に達していない。2回目は
 `overall_status=harness_error`、`failure_kind=evidence_error`、
 `failure_stage=provider_orchestration`だったが、旧1.2 fallbackが起動・回収状態を
 ゼロ値で合成しうる欠陥があった。この成果物だけからProvider起動、Prompt送信、model API
@@ -307,6 +308,32 @@ fixtureであり、複雑さを失敗理由とはしない。001／002成果物4
 Evidence／RecordingはGit管理外で保持し、005は再実行しない。
 
 この履歴を補完せず、commit `a5193e3693afe380bddc181895c1e29b8624c24c`でEvidence 1.5の
-stdin write観測とadvisory failure hintをoffline追加した。次回Liveはこのdiagnostics
-commitのレビュー、新しいSpec／run-id／Evidence／Recording／Diagnostic出力先、別の
-明示承認が揃う場合だけ1回実行する。Phase 3はCurrentのままで、Phase 4は未着手である。
+stdin write観測とadvisory failure hintをoffline追加した。commit
+`f994560bc931a73b11424f44ee03c3343d63d89d`では、末尾改行なしの不正JSONL eventを
+nonzero exitより優先してprotocol failureへ分類し、正常な`turn.failed`と出力なしの
+nonzero exitの既存分類を維持した。
+
+006は`gpt-5.6`でProviderを起動し、stdin writeは`complete`だったが、
+`provider_turn_failed`／advisory hint `model_access`で停止した。Gateは未実行であり、
+Provider message本文を保存しない契約上、hintを根本原因とは断定しない。Evidence 1.5と
+Recording 1.1、redaction、process／Workspace cleanupは成立したが、成功受入ではない。
+
+007は製品Provider外の診断wrapperでPrompt delivery前に停止し、
+`inconclusive_prompt_delivery_failure`として保持する。固定Prompt送信、Live AI turn、
+model API到達は確認できず、Artifactも作成されていない。007を成功またはモデル失敗へ
+分類し直さない。
+
+008は人間がselectable catalogから明示選択したexact model ID `gpt-5.6-sol`を使用した。
+これはCLI default／recommendedの推測ではない。Spec予約commit
+`cc97e53bf0bac426b08346f63e6f527ed7d5be9e`のAgentLab製品経路で1回だけ実行し、
+agent call 1、retry／fallback 0、Provider exit 0、`turn.completed` 1件、
+`turn.failed` 0件となった。使い捨てFixtureでは`task.txt`だけが`status=TODO`から
+`status=COMPLETE`へ変更され、acceptance、regression、lint、typecheckがすべてPASSした。
+Evidence 1.5／Recording 1.1のstrict再読込、Recording SHA-256、redaction、process group／
+Workspace cleanupを確認し、Failure Diagnosticは成功契約どおり作成されていない。
+成功Recordingのoffline Replayは外部AI、Provider、Codex CLIを呼ばずにRunResultを再構成し、
+Evidence／RecordingとMetricsが一致した。
+
+manual Live 006／007の失敗・不明履歴を上書きせず、008の成功だけを選別しない。Phase 3の
+最小vertical slice受入は完了したが、この結果は一般的な`gpt-5.6-sol`性能やProvider比較を
+示さない。Phase 4はPlannedのまま未着手である。

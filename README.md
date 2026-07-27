@@ -16,8 +16,8 @@ Antigravity CLI / Replay Provider）は分離します。一度に変える独�
 
 ## 現在の状態
 
-Phase 0〜2を完了し、現在は
-**Phase 3: Codex CLI Provider** です。次を提供します。
+Phase 0〜3を完了しました。**Phase 4: Workflow A/B Experiment** はPlannedであり、
+まだ着手していません。Phase 3までに次を提供します。
 
 - バージョン付きExperimentSpec、RunMetrics、UsageMetrics、CapabilityReport
 - YAML Specの検証
@@ -36,18 +36,17 @@ Phase 0〜2を完了し、現在は
 - Provider成功後に同じ使い捨てWorkspaceで品質Gateを実行する最小vertical slice
 - strict paired成果物を構築できない場合だけの独立したFailure Diagnostic 1.0
 
-Replayは引き続きRecording内の保存済みMetricsだけを再構成し、外部処理を呼びません。
-通常テストは短時間のfake Codex executableだけを使い、実Codex、外部AI、network、
-quotaを呼びません。Phase 3のmanual Live smokeは累計5回実行し、5回とも成功受入に
-達していないため、Phase 3は引き続きCurrentです。005はSpec予約commit
-`b63024ab2214611b059fb75da0444d200d3d32d9`（修正実装は親commit
-`2cb4eadfbfdc54e3d71f1d6a1a070bd3e53a3566`）に対して1回だけ実行し、
-`provider_turn_failed`／exit 1になりました。Evidence 1.4とRecording 1.1はstrict
-再読込でき、Workspaceとprocess groupの回収、Recording SHA-256、redactionも確認済みです。
-一方、Gateは0件、Metricsはnull、Replayは未実行で、Diagnosticは作成されていません。
-raw turn errorを保存していないため根本原因は復元不能であり、Promptのstdin書込み完了、
-model API到達、quota消費も確定不能です。003〜005は再実行せず、次回Liveには診断修正commit
-のレビュー、新しいSpec／run-id／出力先、別の明示承認が必要です。
+ReplayはRecording内の保存済みMetricsだけを再構成し、外部処理を呼びません。通常テストは
+短時間のfake Codex executableだけを使い、実Codex、外部AI、network、quotaを呼びません。
+Phase 3のmanual Liveは累計8試行です。006はProvider起動後の`model_access`境界、
+007は`inconclusive_prompt_delivery_failure`として履歴を保持します。008は人間が
+selectable catalogから明示選択した`gpt-5.6-sol`を、commit
+`cc97e53bf0bac426b08346f63e6f527ed7d5be9e`のAgentLab製品経路で1回実行して成功しました。
+agent callは1、retry／fallbackは0で、`turn.completed` 1件、Provider exit 0、
+`task.txt`の期待した1行変更、4種類のQuality Gate全PASS、Evidence 1.5／Recording 1.1の
+strict再読込、redaction、process／Workspace cleanup、成功Recordingのoffline Replay、
+Replay Metrics一致を確認しました。この最小vertical sliceの結果は、一般的なモデル性能や
+Provider比較結果を示すものではありません。
 scheduler、staged Workflow、Workflow A/B、Antigravity、Provider比較、比較レポートは
 未実装です。
 
@@ -74,9 +73,8 @@ uv run mypy src
 ```
 
 次はPhase 3で使用したmanual smokeのCLI形式です。実Codexを使うため、通常テストやCIでは
-実行しません。承認済みmanual smokeは累計5回で、003〜005は再実行しません。新しい実行は
-レビュー済みの診断修正commit、新しいSpec／run-id／出力先、個別の明示承認なしには
-行いません。
+実行しません。承認済みmanual smokeは累計8試行で、過去runを再実行しません。新しい実行は
+レビュー済みcommit、新しいSpec／run-id／出力先、個別の明示承認なしには行いません。
 
 ```console
 uv run agentlab live-codex experiments/examples/codex-live-smoke.yaml \
@@ -156,8 +154,8 @@ macOSはlocal process-tree testで検証済みです。Linux実装経路は有�
 - Phase 0: Foundation and Capability Spike（完了）
 - Phase 1: Replay Vertical Slice（完了）
 - Phase 2: Safe Runner, Evidence and Quality Gate（完了）
-- Phase 3: Codex CLI Provider（現在、成功経路受入用diagnosticsのoffline修正・再レビュー中）
-- Phase 4: Workflow A/B Experiment
+- Phase 3: Codex CLI Provider（完了）
+- Phase 4: Workflow A/B Experiment（Planned、未着手）
 - Phase 5: Antigravity CLI Provider
 - Phase 6: Multi-language Fixtures and Public Report
 - Phase 7: Optional Enhancements
