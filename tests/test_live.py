@@ -41,6 +41,7 @@ from agentlab.models import (
     CodexProviderFailureHint,
     CodexRunnerState,
     CodexStdinWriteState,
+    CodexTerminalEvent,
     DiagnosticCleanupState,
     DiagnosticFailureStage,
     DiagnosticInvocationState,
@@ -574,6 +575,62 @@ def test_live_protocol_error_publishes_strict_paired_failure_without_diagnostic(
     assert artifact.codex.cleanup_state is CodexCleanupState.CLEARED
     assert artifact.codex.event_count == 1
     assert artifact.codex.thread_started_count == 1
+    assert artifact.gate_commands == []
+    assert artifact.metrics is None
+    assert artifact.workspace_lifecycle is WorkspaceLifecycle.REMOVED
+    assert isinstance(recording.failed, LiveRunFailedEvent)
+    assert recording.failed.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
+    assert not gate_marker.exists()
+    assert not _diagnostic_path(output).exists()
+    persisted = output.read_bytes() + outcome.recording_path.read_bytes()
+    assert raw_secret.encode() not in persisted
+    assert prompt_path.read_bytes() not in persisted
+
+
+def test_buffered_protocol_error_skips_gates_and_redacts_rejected_event(
+    tmp_path: Path,
+) -> None:
+    gate_marker = tmp_path / "gate-must-not-run"
+    quality_gate = {
+        "acceptance": [
+            [
+                sys.executable,
+                "-c",
+                f"import pathlib;pathlib.Path({str(gate_marker)!r}).write_text('ran')",
+            ]
+        ],
+        "regression": [],
+        "lint": [],
+        "typecheck": [],
+    }
+    spec_path, _fixture, prompt_path, output = _write_case(
+        tmp_path,
+        quality_gate=quality_gate,
+    )
+    raw_secret = "quota raw-buffered-live-secret"
+    live_code = (
+        "sys.stdin.read()\n"
+        "print(json.dumps({'type':'thread.started'}),flush=True)\n"
+        "print(json.dumps({'type':'turn.started'}),flush=True)\n"
+        f"sys.stdout.write(json.dumps({{'type':'turn.failed','error':{{'message':[{raw_secret!r}]}}}}))\n"
+        "raise SystemExit(1)"
+    )
+    environment, _inspection = _fake_codex(tmp_path, live_code=live_code)
+
+    outcome = _run(spec_path, output, environment)
+    artifact = load_live_artifact(output)
+    recording = load_replay_recording(outcome.recording_path)
+
+    assert artifact.overall_status is LiveOverallStatus.PROVIDER_ERROR
+    assert artifact.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
+    assert artifact.codex.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
+    assert artifact.codex.event_count == 2
+    assert artifact.codex.turn_failed_count == 0
+    assert artifact.codex.terminal_event is CodexTerminalEvent.NONE
+    assert (
+        artifact.codex.provider_failure_hint
+        is CodexProviderFailureHint.NOT_APPLICABLE
+    )
     assert artifact.gate_commands == []
     assert artifact.metrics is None
     assert artifact.workspace_lifecycle is WorkspaceLifecycle.REMOVED

@@ -743,13 +743,43 @@ def test_jsonl_parser_rejected_event_does_not_partially_update_state(
     assert parser.total_bytes > stdout_bytes_before
 
 
+def test_jsonl_parser_marks_rejected_buffered_event_without_partial_update() -> None:
+    parser = CodexJsonlParser(max_line_bytes=4096, max_total_bytes=16384)
+    parser.feed(_json_line({"type": "thread.started"}))
+    parser.feed(_json_line({"type": "turn.started"}))
+    before = parser.summary()
+    parser.feed(
+        json.dumps(
+            {
+                "type": "turn.failed",
+                "error": {"message": ["quota raw-buffered-secret"]},
+            }
+        ).encode()
+    )
+
+    with pytest.raises(CodexProtocolError) as error:
+        parser.finish()
+
+    assert (
+        error.value.origin
+        is codex_provider_module._CodexProtocolFailureOrigin.BUFFERED_EVENT_VALIDATION
+    )
+    assert parser.summary() == before
+    assert parser.summary().provider_failure_hint is CodexProviderFailureHint.NOT_APPLICABLE
+
+
 def test_jsonl_parser_rejects_missing_terminal() -> None:
     parser = CodexJsonlParser(max_line_bytes=4096, max_total_bytes=16384)
     parser.feed(_json_line({"type": "thread.started"}))
     parser.feed(_json_line({"type": "turn.started"}))
 
-    with pytest.raises(CodexProtocolError, match="terminal"):
+    with pytest.raises(CodexProtocolError, match="terminal") as error:
         parser.finish()
+
+    assert (
+        error.value.origin
+        is codex_provider_module._CodexProtocolFailureOrigin.TERMINAL_MISSING
+    )
 
 
 def test_jsonl_parser_classifies_turn_failed() -> None:
@@ -1144,6 +1174,86 @@ def test_process_runner_classifies_cli_and_protocol_failures(
 
     assert result.evidence.status is ProviderExecutionStatus.FAILED
     assert result.evidence.failure_kind is expected
+
+
+def test_process_runner_prioritizes_rejected_buffered_event_over_nonzero_exit(
+    tmp_path: Path,
+) -> None:
+    raw_secret = "quota raw-buffered-secret"
+    live_code = (
+        "sys.stdin.read()\n"
+        "print(json.dumps({'type':'thread.started'}),flush=True)\n"
+        "print(json.dumps({'type':'turn.started'}),flush=True)\n"
+        f"sys.stdout.write(json.dumps({{'type':'turn.failed','error':{{'message':[{raw_secret!r}]}}}}))\n"
+        "raise SystemExit(1)"
+    )
+    environment, _inspection = _fake_codex(tmp_path, live_code=live_code)
+    preflight = preflight_codex(parent_environment=environment)
+    workspace, environment_root = _workspace(tmp_path)
+
+    result = CodexProcessRunner(
+        live=_live_settings(),
+        runner=_runner_settings(),
+    ).run(
+        preflight=preflight,
+        prompt=b"safe prompt",
+        workspace=workspace,
+        environment_root=environment_root,
+        parent_environment=environment,
+    )
+    evidence = result.evidence
+
+    assert evidence.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
+    assert evidence.event_count == 2
+    assert evidence.thread_started_count == 1
+    assert evidence.turn_started_count == 1
+    assert evidence.turn_failed_count == 0
+    assert evidence.terminal_event is CodexTerminalEvent.NONE
+    assert evidence.item_type_counts == {}
+    assert evidence.usage_metrics.source is UsageMetricSource.NOT_AVAILABLE
+    assert (
+        evidence.provider_failure_hint
+        is CodexProviderFailureHint.NOT_APPLICABLE
+    )
+    assert raw_secret not in evidence.model_dump_json()
+
+
+def test_process_runner_preserves_valid_buffered_failed_turn_over_nonzero_exit(
+    tmp_path: Path,
+) -> None:
+    raw_secret = "quota raw-buffered-turn-failed-secret"
+    live_code = (
+        "sys.stdin.read()\n"
+        "print(json.dumps({'type':'thread.started'}),flush=True)\n"
+        "print(json.dumps({'type':'turn.started'}),flush=True)\n"
+        f"sys.stdout.write(json.dumps({{'type':'turn.failed','error':{{'message':{raw_secret!r}}}}}))\n"
+        "raise SystemExit(1)"
+    )
+    environment, _inspection = _fake_codex(tmp_path, live_code=live_code)
+    preflight = preflight_codex(parent_environment=environment)
+    workspace, environment_root = _workspace(tmp_path)
+
+    result = CodexProcessRunner(
+        live=_live_settings(),
+        runner=_runner_settings(),
+    ).run(
+        preflight=preflight,
+        prompt=b"safe prompt",
+        workspace=workspace,
+        environment_root=environment_root,
+        parent_environment=environment,
+    )
+    evidence = result.evidence
+
+    assert evidence.failure_kind is LiveFailureKind.PROVIDER_TURN_FAILED
+    assert evidence.event_count == 3
+    assert evidence.turn_failed_count == 1
+    assert evidence.terminal_event is CodexTerminalEvent.TURN_FAILED
+    assert (
+        evidence.provider_failure_hint
+        is CodexProviderFailureHint.QUOTA_OR_RATE_LIMIT
+    )
+    assert raw_secret not in evidence.model_dump_json()
 
 
 def test_process_runner_preserves_pre_turn_warning_and_official_failed_turn(

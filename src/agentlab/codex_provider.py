@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import IO, Any, Literal, NoReturn, cast
 
@@ -224,12 +225,30 @@ class CodexPreflightError(ValueError):
         self.termination = resolved_termination
 
 
+class _CodexProtocolFailureOrigin(StrEnum):
+    """Safe in-memory location of a JSONL protocol rejection."""
+
+    EVENT_VALIDATION = "event_validation"
+    BUFFERED_EVENT_VALIDATION = "buffered_event_validation"
+    TERMINAL_MISSING = "terminal_missing"
+    LIFECYCLE_INCOMPLETE = "lifecycle_incomplete"
+
+
 class CodexProtocolError(ValueError):
     """A bounded JSONL stream did not satisfy the minimal lifecycle contract."""
 
-    def __init__(self, failure_kind: LiveFailureKind, message: str) -> None:
+    def __init__(
+        self,
+        failure_kind: LiveFailureKind,
+        message: str,
+        *,
+        origin: _CodexProtocolFailureOrigin = (
+            _CodexProtocolFailureOrigin.EVENT_VALIDATION
+        ),
+    ) -> None:
         super().__init__(message)
         self.failure_kind = failure_kind
+        self.origin = origin
 
 
 class CodexRunnerError(RuntimeError):
@@ -441,11 +460,21 @@ class CodexJsonlParser:
         if self._buffer:
             encoded_line = bytes(self._buffer)
             self._buffer.clear()
-            self._consume_line(encoded_line)
+            try:
+                self._consume_line(encoded_line)
+            except CodexProtocolError as error:
+                raise CodexProtocolError(
+                    error.failure_kind,
+                    "Codex buffered JSONL event failed validation",
+                    origin=(
+                        _CodexProtocolFailureOrigin.BUFFERED_EVENT_VALIDATION
+                    ),
+                ) from error
         if not self._terminal_seen:
             raise CodexProtocolError(
                 LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
                 "Codex JSONL did not contain a terminal event",
+                origin=_CodexProtocolFailureOrigin.TERMINAL_MISSING,
             )
         if not self._turn_failed and not (
             self._thread_started and self._turn_started
@@ -453,6 +482,7 @@ class CodexJsonlParser:
             raise CodexProtocolError(
                 LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
                 "Codex success lifecycle is incomplete",
+                origin=_CodexProtocolFailureOrigin.LIFECYCLE_INCOMPLETE,
             )
         return self.summary()
 
@@ -1681,6 +1711,12 @@ class CodexProcessRunner:
             final_failure = LiveFailureKind.PROVIDER_SIGNAL_TERMINATION
         elif summary.turn_failed:
             final_failure = LiveFailureKind.PROVIDER_TURN_FAILED
+        elif (
+            protocol_error is not None
+            and protocol_error.origin
+            is _CodexProtocolFailureOrigin.BUFFERED_EVENT_VALIDATION
+        ):
+            final_failure = protocol_error.failure_kind
         elif return_code != 0:
             final_failure = LiveFailureKind.PROVIDER_CLI_NONZERO
         elif protocol_error is not None:
