@@ -44,6 +44,19 @@ CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS = frozenset(
     }
 )
 
+ANTIGRAVITY_REQUIRED_HELP_MARKERS = (
+    "--prompt",
+    "--output-format",
+    "stream-json",
+    "--model",
+    "--effort",
+    "--print-timeout",
+    "--sandbox",
+)
+
+ANTIGRAVITY_ALLOWLISTED_CLI_VERSIONS: frozenset[str] = frozenset()
+
+
 NonNegativeStrictInt = Annotated[StrictInt, Field(ge=0)]
 
 
@@ -169,6 +182,129 @@ class CodexFailureStage(StrEnum):
     PROVIDER_RUNNER_RESULT_CONSTRUCTION = "provider_runner_result_construction"
     PROVIDER_RUNNER_RESULT_EXTRACTION = "provider_runner_result_extraction"
     PROVIDER_ORCHESTRATION = "provider_orchestration"
+
+
+class AntigravityHelpMarker(StrEnum):
+    PROMPT = "--prompt"
+    OUTPUT_FORMAT = "--output-format"
+    STREAM_JSON = "stream-json"
+    MODEL = "--model"
+    EFFORT = "--effort"
+    PRINT_TIMEOUT = "--print-timeout"
+    SANDBOX = "--sandbox"
+
+
+class AntigravityReasoningEffort(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class AntigravityCliProfile(StrEnum):
+    """Versioned CLI contract selected by preflight."""
+
+    NOT_SELECTED = "not_selected"
+    HEADLESS_STREAM_JSON_V1 = "headless_stream_json_v1"
+
+
+class AntigravityTerminalStatus(StrEnum):
+    """Normalized terminal status emitted in Antigravity result event."""
+
+    SUCCESS = "SUCCESS"
+    ERROR = "ERROR"
+    CANCELED = "CANCELED"
+    INTERRUPTED = "INTERRUPTED"
+    INVALID = "INVALID"
+    WAITING = "WAITING"
+    RUNNING = "RUNNING"
+
+
+class AntigravityEventType(StrEnum):
+    INIT = "init"
+    STEP_UPDATE = "step_update"
+    RESULT = "result"
+
+
+class AntigravityStepType(StrEnum):
+    USER_INPUT = "user_input"
+    AGENT_RESPONSE = "agent_response"
+    TOOL = "tool"
+    CHECKPOINT = "checkpoint"
+
+
+class AntigravityPermissionMode(StrEnum):
+    AUTO = "auto"
+    CONFIRM = "confirm"
+    DISABLED = "disabled"
+    NOT_AVAILABLE = "not_available"
+
+
+class AntigravityPromptTransport(StrEnum):
+    UNSUPPORTED = "unsupported"
+
+
+class AntigravityExecutionStage(StrEnum):
+    """Furthest completed step at the Antigravity Provider boundary."""
+
+    PREFLIGHT_NOT_COMPLETED = "preflight_not_completed"
+    PREFLIGHT_COMPLETED = "preflight_completed"
+    PROVIDER_INVOCATION_ATTEMPTED = "provider_invocation_attempted"
+
+
+class AntigravityFailureStage(StrEnum):
+    """Safe fixed location for a failed Antigravity Provider lifecycle."""
+
+    PREFLIGHT = "preflight"
+    PREFLIGHT_PROCESS_SPAWN = "preflight_process_spawn"
+    PREFLIGHT_PROCESS_COLLECTION = "preflight_process_collection"
+    PREFLIGHT_PROCESS_CLEANUP = "preflight_process_cleanup"
+    STREAM_PARSING = "stream_parsing"
+    EVIDENCE_CONSTRUCTION = "evidence_construction"
+
+
+class AntigravityCleanupErrorCode(StrEnum):
+    CLEANUP_TIMEOUT = "cleanup_timeout"
+    CLEANUP_PROCESS_ERROR = "cleanup_process_error"
+    NONE = "none"
+
+
+class AntigravityTerminationEvidence(ContractModel):
+    reason: TerminationReason
+    sigterm_sent: StrictBool
+    sigkill_sent: StrictBool
+    process_group_cleared: StrictBool
+    error_code: AntigravityCleanupErrorCode
+
+    @model_validator(mode="after")
+    def signal_and_cleanup_state_must_be_consistent(
+        self,
+    ) -> AntigravityTerminationEvidence:
+        if self.sigkill_sent and not self.sigterm_sent:
+            raise ValueError("sigkill_sent requires sigterm_sent")
+        if self.reason is TerminationReason.NONE:
+            if self.sigterm_sent or self.sigkill_sent:
+                raise ValueError(
+                    "termination reason none must not contain sent signals"
+                )
+            if (
+                self.process_group_cleared
+                and self.error_code is not AntigravityCleanupErrorCode.NONE
+            ):
+                raise ValueError(
+                    "cleared process group requires error_code none"
+                )
+        if (
+            self.process_group_cleared
+            and self.error_code is not AntigravityCleanupErrorCode.NONE
+        ):
+            raise ValueError("cleared process group must have error_code none")
+        if (
+            not self.process_group_cleared
+            and self.error_code is AntigravityCleanupErrorCode.NONE
+        ):
+            raise ValueError("uncleared process group requires an error_code")
+        return self
+
 
 
 class CodexRunnerState(StrEnum):
@@ -1603,6 +1739,281 @@ class CodexExecutionEvidence(ContractModel):
         ):
             raise ValueError("process_cleanup_error requires an uncleared process group")
         return self
+
+
+class AntigravityExecutionEvidence(ContractModel):
+    """Redacted summary of one Antigravity CLI execution; raw stream is never persisted."""
+
+    schema_version: Literal["1.0"] = "1.0"
+    provider: Literal[Provider.ANTIGRAVITY] = Provider.ANTIGRAVITY
+    cli_version: StrictStr | None = None
+    profile: AntigravityCliProfile = AntigravityCliProfile.NOT_SELECTED
+    preflight_checked_at: datetime | None = None
+    preflight_verified_flags: list[AntigravityHelpMarker] = Field(
+        default_factory=list
+    )
+    requested_model: StrictStr | None = None
+    requested_reasoning_effort: AntigravityReasoningEffort | None = None
+    requested_output_format: Literal["stream-json"] | None = None
+    prompt_transport: AntigravityPromptTransport = (
+        AntigravityPromptTransport.UNSUPPORTED
+    )
+    prompt_argv_exposure: StrictBool = True
+    execution_stage: AntigravityExecutionStage = (
+        AntigravityExecutionStage.PREFLIGHT_NOT_COMPLETED
+    )
+    failure_stage: AntigravityFailureStage | None = None
+    invocation_state: CodexInvocationState = (
+        CodexInvocationState.NOT_ATTEMPTED
+    )
+    cleanup_state: CodexCleanupState = CodexCleanupState.NOT_APPLICABLE
+    requested_sandbox: StrictBool = True
+    observed_permission_mode: AntigravityPermissionMode | None = None
+    raw_stream_persisted: Literal[False] = False
+    provider_status: ProviderExecutionStatus
+    normalized_terminal_status: AntigravityTerminalStatus | None = None
+    exit_code: StrictInt | None = Field(default=None, ge=-255, le=255)
+    terminal_num_turns: StrictInt | None = Field(default=None, ge=0, le=10_000)
+    provider_duration_ms: StrictInt | None = Field(
+        default=None, ge=0, le=86_400_000
+    )
+    init_requested_model_present: StrictBool = False
+    init_requested_agent_present: StrictBool = False
+    event_count: StrictInt = Field(ge=0, le=100_000)
+    unknown_event_count: StrictInt = Field(default=0, ge=0, le=100_000)
+    unknown_step_type_count: StrictInt = Field(default=0, ge=0, le=100_000)
+    init_event_index: StrictInt | None = Field(default=None, ge=0, le=100_000)
+    result_event_index: StrictInt | None = Field(
+        default=None, ge=0, le=100_000
+    )
+    event_counts: dict[AntigravityEventType, NonNegativeStrictInt] = Field(
+        default_factory=dict
+    )
+    step_counts: dict[AntigravityStepType, NonNegativeStrictInt] = Field(
+        default_factory=dict
+    )
+    usage_metrics: UsageMetrics
+    stdout_bytes: StrictInt = Field(ge=0, le=64 * 1024 * 1024)
+    stderr_bytes: StrictInt = Field(ge=0, le=64 * 1024 * 1024)
+    stdout_truncated: StrictBool = False
+    stderr_truncated: StrictBool = False
+    termination: AntigravityTerminationEvidence
+    failure_kind: LiveFailureKind = LiveFailureKind.NONE
+
+    @field_validator("preflight_checked_at", mode="before")
+    @classmethod
+    def timestamps_must_use_datetime_or_iso_string(
+        cls, value: object
+    ) -> object:
+        if value is not None and not isinstance(value, (str, datetime)):
+            raise ValueError(
+                "Antigravity timestamps must be ISO strings or datetime values"
+            )
+        return value
+
+    @field_validator("preflight_checked_at")
+    @classmethod
+    def preflight_checked_at_must_be_timezone_aware(
+        cls, value: datetime | None
+    ) -> datetime | None:
+        if value is not None and (
+            value.tzinfo is None or value.utcoffset() is None
+        ):
+            raise ValueError(
+                "preflight_checked_at timestamp must be timezone-aware"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_antigravity_evidence(self) -> AntigravityExecutionEvidence:
+        if (
+            self.cli_version is not None
+            and not re.fullmatch(r"^agy \d+\.\d+\.\d+$", self.cli_version)
+        ):
+            raise ValueError("cli_version must strictly match 'agy X.Y.Z'")
+
+        if (
+            self.requested_model is not None
+            and not re.fullmatch(
+                r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$", self.requested_model
+            )
+        ):
+            raise ValueError(
+                "requested_model must be a bounded valid model slug"
+            )
+
+        expected_event_keys = list(AntigravityEventType)
+        if list(self.event_counts.keys()) != expected_event_keys:
+            raise ValueError(
+                "event_counts must include all AntigravityEventType keys in defined Enum order"
+            )
+
+        expected_step_keys = list(AntigravityStepType)
+        if list(self.step_counts.keys()) != expected_step_keys:
+            raise ValueError(
+                "step_counts must include all AntigravityStepType keys in defined Enum order"
+            )
+
+        total_event_counts = (
+            sum(self.event_counts.values()) + self.unknown_event_count
+        )
+        if total_event_counts != self.event_count:
+            raise ValueError(
+                "sum of event_counts + unknown_event_count must equal event_count"
+            )
+
+        step_update_count = self.event_counts.get(
+            AntigravityEventType.STEP_UPDATE, 0
+        )
+        total_step_counts = (
+            sum(self.step_counts.values()) + self.unknown_step_type_count
+        )
+        if total_step_counts != step_update_count:
+            raise ValueError(
+                "sum of step_counts + unknown_step_type_count must equal STEP_UPDATE event count"
+            )
+
+        if (
+            self.init_event_index is not None
+            and not (0 <= self.init_event_index < self.event_count)
+        ):
+            raise ValueError(
+                "init_event_index out of bounds [0, event_count)"
+            )
+        if (
+            self.result_event_index is not None
+            and not (0 <= self.result_event_index < self.event_count)
+        ):
+            raise ValueError(
+                "result_event_index out of bounds [0, event_count)"
+            )
+
+        if self.invocation_state is CodexInvocationState.PROCESS_STARTED:
+            if self.cleanup_state is CodexCleanupState.CLEARED:
+                if not (
+                    self.termination.process_group_cleared
+                    and self.termination.error_code
+                    is AntigravityCleanupErrorCode.NONE
+                ):
+                    raise ValueError(
+                        "cleared cleanup requires cleared process group and error_code NONE"
+                    )
+            elif (
+                self.cleanup_state is CodexCleanupState.FAILED
+                and not (
+                    not self.termination.process_group_cleared
+                    and self.termination.error_code
+                    is not AntigravityCleanupErrorCode.NONE
+                )
+            ):
+                raise ValueError(
+                    "failed cleanup requires uncleared process group and non-NONE error_code"
+                )
+        elif self.cleanup_state is not CodexCleanupState.NOT_APPLICABLE:
+            raise ValueError(
+                "unstarted process requires cleanup_state not_applicable"
+            )
+
+
+        if (
+            self.usage_metrics.estimated_api_cost is not None
+            or self.usage_metrics.quota_consumption is not None
+        ):
+            raise ValueError(
+                "Antigravity UsageMetrics must not contain estimated_api_cost or quota_consumption"
+            )
+
+        tokens = (
+            self.usage_metrics.input_tokens,
+            self.usage_metrics.cached_input_tokens,
+            self.usage_metrics.output_tokens,
+            self.usage_metrics.reasoning_output_tokens,
+        )
+        if any(t is not None and t > 10_000_000 for t in tokens):
+            raise ValueError("Token counts in UsageMetrics must not exceed 10,000,000")
+
+        if any(t is not None for t in tokens):
+            if (
+                self.usage_metrics.source
+                is not UsageMetricSource.PROVIDER_REPORTED
+            ):
+                raise ValueError(
+                    "Antigravity token metrics require source provider_reported"
+                )
+            if (
+                self.usage_metrics.input_tokens is not None
+                and self.usage_metrics.cached_input_tokens is not None
+                and self.usage_metrics.cached_input_tokens
+                > self.usage_metrics.input_tokens
+            ):
+                raise ValueError(
+                    "cached_input_tokens must not exceed input_tokens"
+                )
+            if (
+                self.usage_metrics.output_tokens is not None
+                and self.usage_metrics.reasoning_output_tokens is not None
+                and self.usage_metrics.reasoning_output_tokens
+                > self.usage_metrics.output_tokens
+            ):
+                raise ValueError(
+                    "reasoning_output_tokens must not exceed output_tokens"
+                )
+        else:
+            if self.usage_metrics.source is not UsageMetricSource.NOT_AVAILABLE:
+                raise ValueError(
+                    "absent token metrics require source not_available"
+                )
+
+        if self.provider_status is ProviderExecutionStatus.SUCCEEDED:
+            if self.failure_kind is not LiveFailureKind.NONE:
+                raise ValueError(
+                    "succeeded provider_status requires failure_kind NONE"
+                )
+            if self.failure_stage is not None:
+                raise ValueError(
+                    "succeeded provider_status requires failure_stage None"
+                )
+            if self.exit_code != 0:
+                raise ValueError(
+                    "succeeded provider_status requires exit_code 0"
+                )
+            if self.terminal_num_turns != 1:
+                raise ValueError(
+                    "succeeded provider_status requires terminal_num_turns 1"
+                )
+            if (
+                self.normalized_terminal_status
+                is not AntigravityTerminalStatus.SUCCESS
+            ):
+                raise ValueError(
+                    "succeeded provider_status requires normalized_terminal_status SUCCESS"
+                )
+            if self.init_event_index != 0:
+                raise ValueError(
+                    "succeeded provider_status requires init_event_index 0"
+                )
+            if self.result_event_index != self.event_count - 1:
+                raise ValueError(
+                    "succeeded provider_status requires result_event_index at last event"
+                )
+            if self.cleanup_state is not CodexCleanupState.CLEARED and (
+                self.invocation_state is CodexInvocationState.PROCESS_STARTED
+            ):
+                raise ValueError(
+                    "succeeded provider_status requires cleared cleanup_state"
+                )
+        else:
+            if self.failure_kind is LiveFailureKind.NONE:
+                raise ValueError(
+                    "failed provider_status requires non-NONE failure_kind"
+                )
+            if self.failure_stage is None:
+                raise ValueError(
+                    "failed provider_status requires non-None failure_stage"
+                )
+
+        return self
+
 
 
 class LiveFailureDiagnostic(ContractModel):
