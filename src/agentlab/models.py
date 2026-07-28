@@ -1916,11 +1916,31 @@ class AntigravityExecutionEvidence(ContractModel):
                 "unstarted process requires cleanup_state not_applicable"
             )
 
-        # 1. PROVIDER_INVOCATION_ATTEMPTED <=> SPAWN_ATTEMPTED or PROCESS_STARTED
+        # 1. PROVIDER_INVOCATION_ATTEMPTED requires HEADLESS_STREAM_JSON_V1 profile,
+        #    valid cli_version, timestamp, all required markers, and
+        #    SPAWN_ATTEMPTED or PROCESS_STARTED
         if (
             self.execution_stage
             is AntigravityExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
         ):
+            if self.profile is not AntigravityCliProfile.HEADLESS_STREAM_JSON_V1:
+                raise ValueError(
+                    "PROVIDER_INVOCATION_ATTEMPTED stage requires HEADLESS_STREAM_JSON_V1 profile"
+                )
+            if self.cli_version is None or not re.fullmatch(
+                r"^agy \d+\.\d+\.\d+$", self.cli_version
+            ):
+                raise ValueError(
+                    "PROVIDER_INVOCATION_ATTEMPTED stage requires valid cli_version"
+                )
+            if self.preflight_checked_at is None:
+                raise ValueError(
+                    "PROVIDER_INVOCATION_ATTEMPTED stage requires preflight_checked_at timestamp"
+                )
+            if set(self.preflight_verified_flags) != set(AntigravityHelpMarker):
+                raise ValueError(
+                    "PROVIDER_INVOCATION_ATTEMPTED stage requires all mandatory help markers"
+                )
             if self.invocation_state not in (
                 CodexInvocationState.SPAWN_ATTEMPTED,
                 CodexInvocationState.PROCESS_STARTED,
@@ -1937,7 +1957,16 @@ class AntigravityExecutionEvidence(ContractModel):
                 "Process invocation attempted requires PROVIDER_INVOCATION_ATTEMPTED stage"
             )
 
-        # 2. Selected Profile => exact cli_version, timestamp, help markers, stage >= COMPLETED
+        # 2. profile == NOT_SELECTED forbids SPAWN_ATTEMPTED / PROCESS_STARTED
+        if (
+            self.profile is AntigravityCliProfile.NOT_SELECTED
+            and self.invocation_state is not CodexInvocationState.NOT_ATTEMPTED
+        ):
+            raise ValueError(
+                "NOT_SELECTED profile forbids SPAWN_ATTEMPTED or PROCESS_STARTED invocation_state"
+            )
+
+        # 3. Selected Profile => exact cli_version, timestamp, help markers, stage >= COMPLETED
         if self.profile is not AntigravityCliProfile.NOT_SELECTED:
             if self.cli_version is None or not re.fullmatch(
                 r"^agy \d+\.\d+\.\d+$", self.cli_version
@@ -1960,7 +1989,7 @@ class AntigravityExecutionEvidence(ContractModel):
                     "PROVIDER_INVOCATION_ATTEMPTED stage"
                 )
 
-        # 3. PREFLIGHT_NOT_COMPLETED => NOT_SELECTED, NOT_ATTEMPTED, no help markers
+        # 4. PREFLIGHT_NOT_COMPLETED => NOT_SELECTED, NOT_ATTEMPTED, no help markers
         if (
             self.execution_stage
             is AntigravityExecutionStage.PREFLIGHT_NOT_COMPLETED
@@ -1978,7 +2007,7 @@ class AntigravityExecutionEvidence(ContractModel):
                     "PREFLIGHT_NOT_COMPLETED stage requires no help markers"
                 )
 
-        # 4. provider_status == SUCCEEDED => Selected profile, completed preflight, etc.
+        # 5. provider_status == SUCCEEDED => Selected profile, completed preflight, etc.
         if self.provider_status is ProviderExecutionStatus.SUCCEEDED:
             if self.profile is AntigravityCliProfile.NOT_SELECTED:
                 raise ValueError("SUCCEEDED status requires selected profile")
@@ -2005,14 +2034,14 @@ class AntigravityExecutionEvidence(ContractModel):
             if self.terminal_num_turns is None or self.terminal_num_turns < 1:
                 raise ValueError("SUCCEEDED status requires terminal_num_turns >= 1")
 
-        # 5. cleanup_state == FAILED <=> failure_kind == PROCESS_CLEANUP_ERROR
+        # 6. cleanup_state == FAILED <=> failure_kind == PROCESS_CLEANUP_ERROR
         if self.cleanup_state is CodexCleanupState.FAILED:
             if self.failure_kind is not LiveFailureKind.PROCESS_CLEANUP_ERROR:
                 raise ValueError("FAILED cleanup_state requires PROCESS_CLEANUP_ERROR failure_kind")
         elif self.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR:
             raise ValueError("PROCESS_CLEANUP_ERROR failure_kind requires FAILED cleanup_state")
 
-        # 6. termination.reason == TIMEOUT <=> failure_kind == PROVIDER_TIMEOUT
+        # 7. termination.reason == TIMEOUT <=> failure_kind == PROVIDER_TIMEOUT
         if self.termination.reason is TerminationReason.TIMEOUT:
             if self.failure_kind is not LiveFailureKind.PROVIDER_TIMEOUT:
                 raise ValueError(
@@ -2021,12 +2050,14 @@ class AntigravityExecutionEvidence(ContractModel):
         elif self.failure_kind is LiveFailureKind.PROVIDER_TIMEOUT:
             raise ValueError("PROVIDER_TIMEOUT failure_kind requires TIMEOUT termination reason")
 
-        # 7. failure_kind == PROVIDER_OUTPUT_LIMIT => stdout_truncated
-        if (
-            self.failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
-            and not self.stdout_truncated
-        ):
-            raise ValueError("PROVIDER_OUTPUT_LIMIT requires stdout_truncated to be True")
+        # 8. failure_kind == PROVIDER_OUTPUT_LIMIT => stdout_truncated and non-zero bytes
+        if self.failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT:
+            if not self.stdout_truncated:
+                raise ValueError("PROVIDER_OUTPUT_LIMIT requires stdout_truncated to be True")
+            if self.stdout_bytes == 0 and self.stderr_bytes == 0:
+                raise ValueError(
+                    "PROVIDER_OUTPUT_LIMIT forbids stdout_bytes == 0 and stderr_bytes == 0"
+                )
 
         # 8. failure_kind specific rules
         if (

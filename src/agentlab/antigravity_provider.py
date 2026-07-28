@@ -356,6 +356,22 @@ class StrictAntigravityStreamParser:
                     )
                     return
 
+                if cache_val is not None:
+                    if in_val is None:
+                        self.protocol_error = "cached_input_tokens requires input_tokens"
+                        return
+                    if cache_val > in_val:
+                        self.protocol_error = "cached_input_tokens exceeds input_tokens"
+                        return
+
+                if think_val is not None:
+                    if out_val is None:
+                        self.protocol_error = "reasoning_output_tokens requires output_tokens"
+                        return
+                    if think_val > out_val:
+                        self.protocol_error = "reasoning_output_tokens exceeds output_tokens"
+                        return
+
                 if any(v is not None for v in (in_val, cache_val, out_val, think_val)):
                     self.usage_metrics = UsageMetrics(
                         input_tokens=in_val,
@@ -381,7 +397,7 @@ def _is_process_group_alive(pgid: int) -> bool:
     try:
         os.killpg(pgid, 0)
         return True
-    except ProcessLookupError:
+    except (ProcessLookupError, OSError):
         return False
     except PermissionError:
         return True
@@ -392,7 +408,16 @@ def _run_preflight_subprocess(
     args: list[str],
     timeout_seconds: float,
     clean_env: dict[str, str],
-) -> tuple[int | None, str, str, AntigravityFailureStage | None, LiveFailureKind]:
+) -> tuple[
+    int | None,
+    str,
+    str,
+    AntigravityFailureStage | None,
+    LiveFailureKind,
+    int,
+    int,
+    bool,
+]:
     """Execute preflight subprocess with strict process group isolation and bounded collection."""
     try:
         proc = subprocess.Popen(
@@ -411,6 +436,9 @@ def _run_preflight_subprocess(
             "",
             AntigravityFailureStage.PREFLIGHT_PROCESS_SPAWN,
             LiveFailureKind.PROVIDER_UNAVAILABLE,
+            0,
+            0,
+            False,
         )
     except Exception:
         return (
@@ -419,6 +447,9 @@ def _run_preflight_subprocess(
             "",
             AntigravityFailureStage.PREFLIGHT_PROCESS_SPAWN,
             LiveFailureKind.PROVIDER_UNAVAILABLE,
+            0,
+            0,
+            False,
         )
 
     stdout_buf = bytearray()
@@ -428,6 +459,7 @@ def _run_preflight_subprocess(
     start_time = time.monotonic()
     timed_out = False
     collection_error = False
+    output_limit_exceeded = False
     cleanup_failed = False
     cleanup_exception = False
 
@@ -440,44 +472,71 @@ def _run_preflight_subprocess(
                 collection_error = True
 
     try:
-        while True:
-            elapsed = time.monotonic() - start_time
-            if elapsed >= timeout_seconds:
-                timed_out = True
-                break
+        if not collection_error:
+            while True:
+                elapsed = time.monotonic() - start_time
+                if elapsed >= timeout_seconds:
+                    timed_out = True
+                    break
 
-            active_pipes = [p for p in pipes if p is not None and not p.closed]
-            if not active_pipes:
-                break
+                active_pipes = [p for p in pipes if p is not None and not p.closed]
+                if not active_pipes:
+                    break
 
-            remaining_timeout = max(0.001, timeout_seconds - elapsed)
-            select_wait = min(0.1, remaining_timeout)
-            rlist, _, _ = select.select(active_pipes, [], [], select_wait)
+                remaining_timeout = max(0.001, timeout_seconds - elapsed)
+                select_wait = min(0.1, remaining_timeout)
+                try:
+                    rlist, _, _ = select.select(active_pipes, [], [], select_wait)
+                except Exception:
+                    collection_error = True
+                    break
 
-            for pipe in rlist:
-                buf = stdout_buf if pipe is proc.stdout else stderr_buf
-                max_read = min(4096, PREFLIGHT_MAX_BYTES - len(buf))
-                if max_read <= 0:
-                    continue
-
-                data = pipe.read(max_read)
-                if not data:
-                    pipe.close()
-                    continue
-                buf.extend(data)
-
-            if proc.poll() is not None:
-                # Read any remaining buffered data up to strict limit
-                for pipe in [proc.stdout, proc.stderr]:
-                    if pipe is not None and not pipe.closed:
-                        buf = stdout_buf if pipe is proc.stdout else stderr_buf
-                        max_read = PREFLIGHT_MAX_BYTES - len(buf)
-                        if max_read > 0:
-                            data = pipe.read(max_read)
-                            if data:
-                                buf.extend(data)
+                for pipe in rlist:
+                    buf = stdout_buf if pipe is proc.stdout else stderr_buf
+                    max_read = min(4096, (PREFLIGHT_MAX_BYTES + 1) - len(buf))
+                    if max_read <= 0:
+                        output_limit_exceeded = True
                         pipe.close()
-                break
+                        continue
+
+                    try:
+                        data = pipe.read(max_read)
+                    except Exception:
+                        collection_error = True
+                        break
+
+                    if not data:
+                        pipe.close()
+                        continue
+
+                    buf.extend(data)
+                    if len(buf) > PREFLIGHT_MAX_BYTES:
+                        output_limit_exceeded = True
+                        del buf[PREFLIGHT_MAX_BYTES:]
+                        pipe.close()
+
+                if collection_error:
+                    break
+
+                if proc.poll() is not None:
+                    # Read any remaining buffered data up to limit + 1 byte
+                    for pipe in [proc.stdout, proc.stderr]:
+                        if pipe is not None and not pipe.closed:
+                            buf = stdout_buf if pipe is proc.stdout else stderr_buf
+                            max_read = (PREFLIGHT_MAX_BYTES + 1) - len(buf)
+                            if max_read > 0:
+                                try:
+                                    data = pipe.read(max_read)
+                                    if data:
+                                        buf.extend(data)
+                                except Exception:
+                                    collection_error = True
+                                    break
+                            if len(buf) > PREFLIGHT_MAX_BYTES:
+                                output_limit_exceeded = True
+                                del buf[PREFLIGHT_MAX_BYTES:]
+                            pipe.close()
+                    break
 
     except Exception:
         collection_error = True
@@ -556,10 +615,11 @@ def _run_preflight_subprocess(
                 except Exception:
                     cleanup_failed = True
 
-            # Final re-verification of process group and child process extinction
+            # Final re-verification: if child is reaped and pg is extinct, cleanup succeeded
             try:
-                if proc.poll() is None or _is_process_group_alive(pgid):
-                    cleanup_failed = True
+                proc_reaped = proc.poll() is not None
+                pg_extinct = not _is_process_group_alive(pgid)
+                cleanup_failed = not (proc_reaped and pg_extinct)
             except Exception:
                 cleanup_failed = True
 
@@ -568,16 +628,16 @@ def _run_preflight_subprocess(
 
         # Ensure pipes are closed
         for pipe in (proc.stdout, proc.stderr):
-            if pipe is not None and not pipe.closed:
-                try:
+            if pipe is not None:
+                with contextlib.suppress(Exception):
                     pipe.close()
-                except Exception:
-                    cleanup_failed = True
 
+    stdout_bytes = len(stdout_buf)
+    stderr_bytes = len(stderr_buf)
     stdout_str = stdout_buf.decode("utf-8", errors="replace")
     stderr_str = stderr_buf.decode("utf-8", errors="replace")
 
-    # Priority ranking: Cleanup failure > Timeout > Collection error
+    # Priority ranking: Cleanup failure > Timeout > Output limit > Collection error
     if cleanup_failed or cleanup_exception:
         return (
             proc.returncode,
@@ -585,6 +645,9 @@ def _run_preflight_subprocess(
             stderr_str,
             AntigravityFailureStage.PREFLIGHT_PROCESS_CLEANUP,
             LiveFailureKind.PROCESS_CLEANUP_ERROR,
+            stdout_bytes,
+            stderr_bytes,
+            output_limit_exceeded,
         )
 
     if timed_out:
@@ -594,6 +657,21 @@ def _run_preflight_subprocess(
             stderr_str,
             AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
             LiveFailureKind.PROVIDER_TIMEOUT,
+            stdout_bytes,
+            stderr_bytes,
+            output_limit_exceeded,
+        )
+
+    if output_limit_exceeded:
+        return (
+            proc.returncode,
+            stdout_str,
+            stderr_str,
+            AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
+            LiveFailureKind.PROVIDER_OUTPUT_LIMIT,
+            stdout_bytes,
+            stderr_bytes,
+            True,
         )
 
     if collection_error:
@@ -603,9 +681,27 @@ def _run_preflight_subprocess(
             stderr_str,
             AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
             LiveFailureKind.EVIDENCE_ERROR,
+            stdout_bytes,
+            stderr_bytes,
+            output_limit_exceeded,
         )
 
-    return proc.returncode, stdout_str, stderr_str, None, LiveFailureKind.NONE
+    return (
+        proc.returncode,
+        stdout_str,
+        stderr_str,
+        None,
+        LiveFailureKind.NONE,
+        stdout_bytes,
+        stderr_bytes,
+        False,
+    )
+
+
+def _matches_cli_flag(flag_val: str, text: str) -> bool:
+    """Check if flag_val matches exact CLI token boundaries in text."""
+    pattern = r"(?:^|[\s=,'\"])" + re.escape(flag_val) + r"(?:$|[\s=,'\"])"
+    return bool(re.search(pattern, text))
 
 
 def probe_antigravity_preflight(
@@ -641,11 +737,28 @@ def probe_antigravity_preflight(
     }
 
     # Version probe
-    ret_v, stdout_v, stderr_v, stage_v, kind_v = _run_preflight_subprocess(
-        cmd, ["--version"], timeout_seconds, clean_env
+    ret_v, stdout_v, stderr_v, stage_v, kind_v, _b_v_out, _b_v_err, trunc_v = (
+        _run_preflight_subprocess(cmd, ["--version"], timeout_seconds, clean_env)
     )
-    if kind_v is not LiveFailureKind.NONE:
-        return AntigravityCliProfile.NOT_SELECTED, None, [], checked_at, stage_v, kind_v
+    if kind_v is not LiveFailureKind.NONE or trunc_v:
+        final_kind = (
+            kind_v
+            if kind_v is not LiveFailureKind.NONE
+            else LiveFailureKind.PROVIDER_OUTPUT_LIMIT
+        )
+        final_stage = (
+            stage_v
+            if stage_v is not None
+            else AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
+        )
+        return (
+            AntigravityCliProfile.NOT_SELECTED,
+            None,
+            [],
+            checked_at,
+            final_stage,
+            final_kind,
+        )
 
     version_str: str | None = None
     if ret_v == 0:
@@ -660,17 +773,34 @@ def probe_antigravity_preflight(
                 version_str = match.group(0)
 
     # Help probe
-    ret_h, stdout_h, stderr_h, stage_h, kind_h = _run_preflight_subprocess(
-        cmd, ["--help"], timeout_seconds, clean_env
+    ret_h, stdout_h, stderr_h, stage_h, kind_h, _b_h_out, _b_h_err, trunc_h = (
+        _run_preflight_subprocess(cmd, ["--help"], timeout_seconds, clean_env)
     )
-    if kind_h is not LiveFailureKind.NONE:
-        return AntigravityCliProfile.NOT_SELECTED, version_str, [], checked_at, stage_h, kind_h
+    if kind_h is not LiveFailureKind.NONE or trunc_h:
+        final_kind = (
+            kind_h
+            if kind_h is not LiveFailureKind.NONE
+            else LiveFailureKind.PROVIDER_OUTPUT_LIMIT
+        )
+        final_stage = (
+            stage_h
+            if stage_h is not None
+            else AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
+        )
+        return (
+            AntigravityCliProfile.NOT_SELECTED,
+            version_str,
+            [],
+            checked_at,
+            final_stage,
+            final_kind,
+        )
 
     verified_flags: list[AntigravityHelpMarker] = []
     if ret_h == 0:
         help_output = f"{stdout_h}\n{stderr_h}".lower()
         for marker in AntigravityHelpMarker:
-            if marker.value in help_output:
+            if _matches_cli_flag(marker.value, help_output):
                 verified_flags.append(marker)
 
     profile = select_antigravity_profile(version_str, verified_flags, allowlist=allowlist)
