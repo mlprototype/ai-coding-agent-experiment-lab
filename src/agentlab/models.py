@@ -1916,61 +1916,119 @@ class AntigravityExecutionEvidence(ContractModel):
                 "unstarted process requires cleanup_state not_applicable"
             )
 
+        # 1. PROVIDER_INVOCATION_ATTEMPTED <=> SPAWN_ATTEMPTED or PROCESS_STARTED
         if (
-            self.invocation_state
-            in (
-                CodexInvocationState.PROCESS_STARTED,
+            self.execution_stage
+            is AntigravityExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+        ):
+            if self.invocation_state not in (
                 CodexInvocationState.SPAWN_ATTEMPTED,
-            )
-            and self.execution_stage
-            is not AntigravityExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+                CodexInvocationState.PROCESS_STARTED,
+            ):
+                raise ValueError(
+                    "PROVIDER_INVOCATION_ATTEMPTED stage requires "
+                    "SPAWN_ATTEMPTED or PROCESS_STARTED invocation_state"
+                )
+        elif self.invocation_state in (
+            CodexInvocationState.SPAWN_ATTEMPTED,
+            CodexInvocationState.PROCESS_STARTED,
         ):
             raise ValueError(
                 "Process invocation attempted requires PROVIDER_INVOCATION_ATTEMPTED stage"
             )
 
-        if (
-            self.execution_stage
-            is AntigravityExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
-        ):
-            if self.profile is not AntigravityCliProfile.HEADLESS_STREAM_JSON_V1:
-                raise ValueError(
-                    "Invocation attempted requires HEADLESS_STREAM_JSON_V1 profile"
-                )
+        # 2. Selected Profile => exact cli_version, timestamp, help markers, stage >= COMPLETED
+        if self.profile is not AntigravityCliProfile.NOT_SELECTED:
             if self.cli_version is None or not re.fullmatch(
                 r"^agy \d+\.\d+\.\d+$", self.cli_version
             ):
-                raise ValueError("Invocation attempted requires valid cli_version")
+                raise ValueError("Selected profile requires valid cli_version")
             if self.preflight_checked_at is None:
                 raise ValueError(
-                    "Invocation attempted requires preflight_checked_at timestamp"
+                    "Selected profile requires preflight_checked_at timestamp"
+                )
+            if set(self.preflight_verified_flags) != set(AntigravityHelpMarker):
+                raise ValueError(
+                    "Selected profile requires all mandatory help markers"
+                )
+            if self.execution_stage not in (
+                AntigravityExecutionStage.PREFLIGHT_COMPLETED,
+                AntigravityExecutionStage.PROVIDER_INVOCATION_ATTEMPTED,
+            ):
+                raise ValueError(
+                    "Selected profile requires PREFLIGHT_COMPLETED or "
+                    "PROVIDER_INVOCATION_ATTEMPTED stage"
                 )
 
-        if (
-            self.profile is AntigravityCliProfile.NOT_SELECTED
-            and self.invocation_state is not CodexInvocationState.NOT_ATTEMPTED
-        ):
-            raise ValueError(
-                "Unselected profile cannot attempt process invocation"
-            )
-
+        # 3. PREFLIGHT_NOT_COMPLETED => NOT_SELECTED, NOT_ATTEMPTED, no help markers
         if (
             self.execution_stage
             is AntigravityExecutionStage.PREFLIGHT_NOT_COMPLETED
-            and self.invocation_state is not CodexInvocationState.NOT_ATTEMPTED
         ):
-            raise ValueError(
-                "Uncompleted preflight cannot attempt process invocation"
-            )
+            if self.profile is not AntigravityCliProfile.NOT_SELECTED:
+                raise ValueError(
+                    "PREFLIGHT_NOT_COMPLETED stage requires NOT_SELECTED profile"
+                )
+            if self.invocation_state is not CodexInvocationState.NOT_ATTEMPTED:
+                raise ValueError(
+                    "PREFLIGHT_NOT_COMPLETED stage requires NOT_ATTEMPTED invocation_state"
+                )
+            if self.preflight_verified_flags:
+                raise ValueError(
+                    "PREFLIGHT_NOT_COMPLETED stage requires no help markers"
+                )
 
+        # 4. provider_status == SUCCEEDED => Selected profile, completed preflight, etc.
+        if self.provider_status is ProviderExecutionStatus.SUCCEEDED:
+            if self.profile is AntigravityCliProfile.NOT_SELECTED:
+                raise ValueError("SUCCEEDED status requires selected profile")
+            if (
+                self.execution_stage
+                is not AntigravityExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+            ):
+                raise ValueError(
+                    "SUCCEEDED status requires PROVIDER_INVOCATION_ATTEMPTED stage"
+                )
+            if set(self.preflight_verified_flags) != set(AntigravityHelpMarker):
+                raise ValueError("SUCCEEDED status requires all mandatory help markers")
+            if self.invocation_state is not CodexInvocationState.PROCESS_STARTED:
+                raise ValueError("SUCCEEDED status requires PROCESS_STARTED invocation_state")
+            if self.cleanup_state is not CodexCleanupState.CLEARED:
+                raise ValueError("SUCCEEDED status requires CLEARED cleanup_state")
+            if self.exit_code != 0:
+                raise ValueError("SUCCEEDED status requires exit_code == 0")
+            if (
+                self.normalized_terminal_status
+                is not AntigravityTerminalStatus.SUCCESS
+            ):
+                raise ValueError("SUCCEEDED status requires SUCCESS terminal status")
+            if self.terminal_num_turns is None or self.terminal_num_turns < 1:
+                raise ValueError("SUCCEEDED status requires terminal_num_turns >= 1")
+
+        # 5. cleanup_state == FAILED <=> failure_kind == PROCESS_CLEANUP_ERROR
+        if self.cleanup_state is CodexCleanupState.FAILED:
+            if self.failure_kind is not LiveFailureKind.PROCESS_CLEANUP_ERROR:
+                raise ValueError("FAILED cleanup_state requires PROCESS_CLEANUP_ERROR failure_kind")
+        elif self.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR:
+            raise ValueError("PROCESS_CLEANUP_ERROR failure_kind requires FAILED cleanup_state")
+
+        # 6. termination.reason == TIMEOUT <=> failure_kind == PROVIDER_TIMEOUT
+        if self.termination.reason is TerminationReason.TIMEOUT:
+            if self.failure_kind is not LiveFailureKind.PROVIDER_TIMEOUT:
+                raise ValueError(
+                    "TIMEOUT termination reason requires PROVIDER_TIMEOUT failure_kind"
+                )
+        elif self.failure_kind is LiveFailureKind.PROVIDER_TIMEOUT:
+            raise ValueError("PROVIDER_TIMEOUT failure_kind requires TIMEOUT termination reason")
+
+        # 7. failure_kind == PROVIDER_OUTPUT_LIMIT => stdout_truncated
         if (
-            self.failure_kind is LiveFailureKind.PROVIDER_TIMEOUT
-            and self.termination.reason is not TerminationReason.TIMEOUT
+            self.failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
+            and not self.stdout_truncated
         ):
-            raise ValueError(
-                "PROVIDER_TIMEOUT requires TIMEOUT termination reason"
-            )
+            raise ValueError("PROVIDER_OUTPUT_LIMIT requires stdout_truncated to be True")
 
+        # 8. failure_kind specific rules
         if (
             self.failure_kind is LiveFailureKind.PROVIDER_SIGNAL_TERMINATION
             and (self.exit_code is None or self.exit_code >= 0)
@@ -2000,14 +2058,7 @@ class AntigravityExecutionEvidence(ContractModel):
                 "PROVIDER_TURN_FAILED requires ERROR, CANCELED, or INTERRUPTED status"
             )
 
-        if (
-            self.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
-            and self.cleanup_state is not CodexCleanupState.FAILED
-        ):
-            raise ValueError(
-                "PROCESS_CLEANUP_ERROR requires FAILED cleanup_state"
-            )
-
+        # 9. Usage metrics rules
         if (
             self.usage_metrics.cached_input_tokens is not None
             and self.usage_metrics.input_tokens is None

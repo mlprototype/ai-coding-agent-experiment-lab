@@ -385,8 +385,6 @@ def _is_process_group_alive(pgid: int) -> bool:
         return False
     except PermissionError:
         return True
-    except Exception:
-        return False
 
 
 def _run_preflight_subprocess(
@@ -487,28 +485,83 @@ def _run_preflight_subprocess(
     # Single mandatory cleanup block for process group and pipes
     finally:
         try:
-            # Terminate process group if timed out or still alive
-            if timed_out or _is_process_group_alive(pgid):
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(pgid, signal.SIGTERM)
+            # Check if termination is required (timeout, alive pgid, or un-reaped child)
+            pg_alive = False
+            try:
+                pg_alive = _is_process_group_alive(pgid)
+            except Exception:
+                cleanup_failed = True
 
-                grace_start = time.monotonic()
-                while time.monotonic() - grace_start < 0.5:
-                    if not _is_process_group_alive(pgid):
+            if timed_out or pg_alive or (proc.poll() is None):
+                if pg_alive:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(pgid, signal.SIGTERM)
+
+                term_deadline = time.monotonic() + 0.5
+                while time.monotonic() < term_deadline:
+                    if proc.poll() is None:
+                        try:
+                            proc.wait(timeout=0.02)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        except Exception:
+                            cleanup_failed = True
+
+                    try:
+                        if not _is_process_group_alive(pgid):
+                            break
+                    except Exception:
+                        cleanup_failed = True
                         break
-                    time.sleep(0.05)
+                    time.sleep(0.01)
 
-                if _is_process_group_alive(pgid):
+                try:
+                    pg_alive_after_term = _is_process_group_alive(pgid)
+                except Exception:
+                    cleanup_failed = True
+                    pg_alive_after_term = True
+
+                if pg_alive_after_term:
                     with contextlib.suppress(ProcessLookupError):
                         os.killpg(pgid, signal.SIGKILL)
-                    time.sleep(0.05)
-                    if _is_process_group_alive(pgid):
+
+                    kill_deadline = time.monotonic() + 0.5
+                    while time.monotonic() < kill_deadline:
+                        if proc.poll() is None:
+                            try:
+                                proc.wait(timeout=0.02)
+                            except subprocess.TimeoutExpired:
+                                pass
+                            except Exception:
+                                cleanup_failed = True
+
+                        try:
+                            if not _is_process_group_alive(pgid):
+                                break
+                        except Exception:
+                            cleanup_failed = True
+                            break
+                        time.sleep(0.01)
+
+                    try:
+                        if _is_process_group_alive(pgid):
+                            cleanup_failed = True
+                    except Exception:
                         cleanup_failed = True
 
-            # Ensure direct child process is waited/reaped
+            # Final reap attempt for direct child
             if proc.poll() is None:
-                with contextlib.suppress(Exception):
-                    proc.wait(timeout=0.5)
+                try:
+                    proc.wait(timeout=0.2)
+                except Exception:
+                    cleanup_failed = True
+
+            # Final re-verification of process group and child process extinction
+            try:
+                if proc.poll() is None or _is_process_group_alive(pgid):
+                    cleanup_failed = True
+            except Exception:
+                cleanup_failed = True
 
         except Exception:
             cleanup_exception = True
@@ -516,13 +569,15 @@ def _run_preflight_subprocess(
         # Ensure pipes are closed
         for pipe in (proc.stdout, proc.stderr):
             if pipe is not None and not pipe.closed:
-                with contextlib.suppress(Exception):
+                try:
                     pipe.close()
+                except Exception:
+                    cleanup_failed = True
 
     stdout_str = stdout_buf.decode("utf-8", errors="replace")
     stderr_str = stderr_buf.decode("utf-8", errors="replace")
 
-    # Priority ranking: Cleanup > Timeout > Collection error
+    # Priority ranking: Cleanup failure > Timeout > Collection error
     if cleanup_failed or cleanup_exception:
         return (
             proc.returncode,
@@ -754,7 +809,7 @@ def build_antigravity_evidence(
         usage_metrics=p.usage_metrics,
         stdout_bytes=stdout_bytes,
         stderr_bytes=stderr_bytes,
-        stdout_truncated=False,
+        stdout_truncated=p.output_limit_exceeded,
         stderr_truncated=False,
         termination=term,
         failure_kind=final_failure_kind,
