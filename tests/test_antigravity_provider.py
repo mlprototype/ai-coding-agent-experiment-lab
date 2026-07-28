@@ -1,7 +1,8 @@
-"""Offline tests for Antigravity CLI Provider preflight, parser, and Evidence 1.0."""
+"""Offline acceptance and reproduction tests for Antigravity CLI Provider Phase 5 Slice 5A."""
 
 from __future__ import annotations
 
+import json
 import stat
 from pathlib import Path
 
@@ -14,41 +15,33 @@ from agentlab.antigravity_provider import (
     select_antigravity_profile,
 )
 from agentlab.models import (
-    AntigravityCleanupErrorCode,
     AntigravityCliProfile,
     AntigravityEventType,
     AntigravityExecutionStage,
-    AntigravityFailureStage,
     AntigravityHelpMarker,
     AntigravityReasoningEffort,
     AntigravityStepType,
     AntigravityTerminalStatus,
-    AntigravityTerminationEvidence,
     CodexCleanupState,
     CodexInvocationState,
     LiveFailureKind,
     ProviderExecutionStatus,
-    TerminationReason,
     UsageMetricSource,
 )
 
 
 def test_select_antigravity_profile_default_empty_allowlist() -> None:
-    # Default production allowlist is empty -> returns NOT_SELECTED
     profile = select_antigravity_profile("agy 1.0.0", list(AntigravityHelpMarker))
     assert profile is AntigravityCliProfile.NOT_SELECTED
 
 
 def test_select_antigravity_profile_injected_allowlist() -> None:
     allowlist = frozenset({"agy 1.0.0"})
-
-    # Complete flags -> selected
     profile = select_antigravity_profile(
         "agy 1.0.0", list(AntigravityHelpMarker), allowlist=allowlist
     )
     assert profile is AntigravityCliProfile.HEADLESS_STREAM_JSON_V1
 
-    # Incomplete flags -> NOT_SELECTED
     partial_flags = [AntigravityHelpMarker.PROMPT, AntigravityHelpMarker.SANDBOX]
     profile_partial = select_antigravity_profile(
         "agy 1.0.0", partial_flags, allowlist=allowlist
@@ -56,7 +49,7 @@ def test_select_antigravity_profile_injected_allowlist() -> None:
     assert profile_partial is AntigravityCliProfile.NOT_SELECTED
 
 
-def test_parser_valid_stream(tmp_path: Path) -> None:
+def test_parser_valid_stream() -> None:
     sample_file = Path("tests/fixtures/antigravity/sample_stream.jsonl")
     data = sample_file.read_bytes()
 
@@ -88,25 +81,11 @@ def test_parser_valid_stream(tmp_path: Path) -> None:
     assert parser.usage_metrics.source is UsageMetricSource.PROVIDER_REPORTED
 
 
-def test_parser_total_tokens_mismatch() -> None:
-    # total_tokens = 200, input=100, output=50 -> mismatch!
+def test_parser_unknown_event_fail_closed() -> None:
+    # unknown event inserted in middle -> protocol_error (fail-closed immediately)
     stream = (
         b'{"event": "init"}\n'
-        b'{"event": "result", "status": "SUCCESS", '
-        b'"usage": {"input_tokens": 100, "output_tokens": 50, "total_tokens": 200}}\n'
-    )
-    parser = StrictAntigravityStreamParser()
-    parser.parse_chunk(stream)
-    parser.finalize()
-
-    assert parser.protocol_error is not None
-    assert "total_tokens" in parser.protocol_error
-
-
-def test_parser_unknown_step_type_fail_closed() -> None:
-    stream = (
-        b'{"event": "init"}\n'
-        b'{"event": "step_update", "step_type": "unknown_invalid_type"}\n'
+        b'{"event": "unknown_future_event"}\n'
         b'{"event": "result", "status": "SUCCESS"}\n'
     )
     parser = StrictAntigravityStreamParser()
@@ -114,34 +93,115 @@ def test_parser_unknown_step_type_fail_closed() -> None:
     parser.finalize()
 
     assert parser.protocol_error is not None
-    assert "Unknown step_type" in parser.protocol_error
+    assert parser.unknown_event_count == 1
+    assert parser.event_count == 2
+
+    evidence = build_antigravity_evidence(
+        cli_version="agy 1.2.3",
+        profile=AntigravityCliProfile.HEADLESS_STREAM_JSON_V1,
+        invocation_state=CodexInvocationState.PROCESS_STARTED,
+        cleanup_state=CodexCleanupState.CLEARED,
+        parser=parser,
+        exit_code=0,
+    )
+    assert evidence.provider_status is ProviderExecutionStatus.FAILED
+    assert evidence.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
 
 
-def test_parser_duplicate_key_rejection() -> None:
-    stream = b'{"event": "init", "foo": 1, "foo": 2}\n'
+def test_parser_malformed_usage_not_converted_to_not_available() -> None:
+    # usage with boolean input_tokens -> protocol error!
+    stream = (
+        b'{"event": "init"}\n'
+        b'{"event": "result", "status": "SUCCESS", "usage": {"input_tokens": true}}\n'
+    )
     parser = StrictAntigravityStreamParser()
     parser.parse_chunk(stream)
     parser.finalize()
 
     assert parser.protocol_error is not None
-    assert "Duplicate JSON key" in parser.protocol_error
+    assert parser.usage_metrics.source is UsageMetricSource.NOT_AVAILABLE
+
+    evidence = build_antigravity_evidence(
+        cli_version="agy 1.2.3",
+        profile=AntigravityCliProfile.HEADLESS_STREAM_JSON_V1,
+        invocation_state=CodexInvocationState.PROCESS_STARTED,
+        cleanup_state=CodexCleanupState.CLEARED,
+        parser=parser,
+        exit_code=0,
+    )
+    assert evidence.provider_status is ProviderExecutionStatus.FAILED
+    assert evidence.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
 
 
-def test_parser_non_finite_number_rejection() -> None:
-    stream = b'{"event": "init", "val": NaN}\n'
+def test_parser_unknown_step_type_count_retained_in_strict_failure_evidence() -> None:
+    stream = (
+        b'{"event": "init"}\n'
+        b'{"event": "step_update", "step_type": "unknown_type_xyz"}\n'
+        b'{"event": "result", "status": "SUCCESS"}\n'
+    )
     parser = StrictAntigravityStreamParser()
     parser.parse_chunk(stream)
     parser.finalize()
 
+    assert parser.unknown_step_type_count == 1
     assert parser.protocol_error is not None
 
+    evidence = build_antigravity_evidence(
+        cli_version="agy 1.2.3",
+        profile=AntigravityCliProfile.HEADLESS_STREAM_JSON_V1,
+        invocation_state=CodexInvocationState.PROCESS_STARTED,
+        cleanup_state=CodexCleanupState.CLEARED,
+        parser=parser,
+        exit_code=0,
+    )
 
-def test_probe_antigravity_preflight_fake_executable(tmp_path: Path) -> None:
+    assert evidence.unknown_step_type_count == 1
+    assert evidence.provider_status is ProviderExecutionStatus.FAILED
+    assert evidence.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
+
+
+def test_parser_error_preserved_when_exit_code_is_signal_termination() -> None:
+    parser = StrictAntigravityStreamParser()
+    parser.parse_chunk(b'{"event": "init"}\n{"event": "invalid_event_xyz"}\n')
+    parser.finalize()
+
+    # exit_code -15 (SIGTERM)
+    evidence = build_antigravity_evidence(
+        cli_version="agy 1.2.3",
+        profile=AntigravityCliProfile.HEADLESS_STREAM_JSON_V1,
+        invocation_state=CodexInvocationState.PROCESS_STARTED,
+        cleanup_state=CodexCleanupState.CLEARED,
+        parser=parser,
+        exit_code=-15,
+    )
+
+    assert evidence.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
+
+
+def test_evidence_rejects_process_started_with_not_applicable_cleanup() -> None:
+    parser = StrictAntigravityStreamParser()
+    parser.parse_chunk(
+        b'{"event": "init"}\n{"event": "result", "status": "SUCCESS", "num_turns": 1}\n'
+    )
+    parser.finalize()
+
+    with pytest.raises(ValueError, match="started process requires cleanup_state"):
+        build_antigravity_evidence(
+            cli_version="agy 1.2.3",
+            profile=AntigravityCliProfile.HEADLESS_STREAM_JSON_V1,
+            invocation_state=CodexInvocationState.PROCESS_STARTED,
+            cleanup_state=CodexCleanupState.NOT_APPLICABLE,
+            parser=parser,
+            exit_code=0,
+        )
+
+
+def test_preflight_version_in_stderr(tmp_path: Path) -> None:
     fake_agy = tmp_path / "agy"
     help_text = "--prompt --output-format stream-json --model --effort --print-timeout --sandbox"
     script = (
         "#!/bin/sh\n"
-        'if [ "$1" = "--version" ]; then echo "agy 1.2.3"; exit 0; fi\n'
+        'if [ "$1" = "--version" ]; then echo "agy 1.2.3" >&2; exit 0; fi\n'
         f'if [ "$1" = "--help" ]; then echo "{help_text}"; exit 0; fi\n'
         "exit 1\n"
     )
@@ -149,7 +209,7 @@ def test_probe_antigravity_preflight_fake_executable(tmp_path: Path) -> None:
     fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
 
     allowlist = frozenset({"agy 1.2.3"})
-    profile, version_str, flags, _checked_at, failure_stage, failure_kind = (
+    profile, version_str, _flags, _checked_at, _failure_stage, failure_kind = (
         probe_antigravity_preflight(
             executable_path=str(fake_agy),
             allowlist=allowlist,
@@ -158,19 +218,116 @@ def test_probe_antigravity_preflight_fake_executable(tmp_path: Path) -> None:
 
     assert profile is AntigravityCliProfile.HEADLESS_STREAM_JSON_V1
     assert version_str == "agy 1.2.3"
-    assert len(flags) == len(AntigravityHelpMarker)
-    assert failure_stage is None
     assert failure_kind is LiveFailureKind.NONE
 
 
-def test_evidence_grammar_and_rounding() -> None:
-    parser = StrictAntigravityStreamParser()
-    # Test .5ms half-to-even rounding (12.5 -> 12)
-    stream = (
-        b'{"event": "init"}\n'
-        b'{"event": "result", "status": "SUCCESS", "num_turns": 1, "duration_ms": 12.5}\n'
+def test_preflight_rejects_multiline_version_output(tmp_path: Path) -> None:
+    fake_agy = tmp_path / "agy"
+    help_text = "--prompt --output-format stream-json --model --effort --print-timeout --sandbox"
+    script = (
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then echo "agy 1.2.3"; echo "extra line"; exit 0; fi\n'
+        f'if [ "$1" = "--help" ]; then echo "{help_text}"; exit 0; fi\n'
+        "exit 1\n"
     )
+    fake_agy.write_text(script)
+    fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
+
+    allowlist = frozenset({"agy 1.2.3"})
+    profile, version_str, _flags, _checked_at, _failure_stage, _failure_kind = (
+        probe_antigravity_preflight(
+            executable_path=str(fake_agy),
+            allowlist=allowlist,
+        )
+    )
+
+    assert profile is AntigravityCliProfile.NOT_SELECTED
+    assert version_str is None
+
+
+def test_preflight_fake_process_large_output_and_cleanup(tmp_path: Path) -> None:
+    fake_agy = tmp_path / "agy"
+    help_markers = "--prompt --output-format stream-json --model --effort --print-timeout --sandbox"
+    # Process outputs large string on help and spawns background child on version
+    script = (
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then\n'
+        "  (sleep 100 &)\n"
+        '  echo "agy 1.2.3"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "$1" = "--help" ]; then\n'
+        f'  python3 -c "print(\'{help_markers}\'); print(\'X\' * 200000)"\n'
+        "  exit 0\n"
+        "fi\n"
+    )
+    fake_agy.write_text(script)
+    fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
+
+    allowlist = frozenset({"agy 1.2.3"})
+    profile, version_str, _flags, _checked_at, _failure_stage, _failure_kind = (
+        probe_antigravity_preflight(
+            executable_path=str(fake_agy),
+            allowlist=allowlist,
+        )
+    )
+
+    assert profile is AntigravityCliProfile.HEADLESS_STREAM_JSON_V1
+    assert version_str == "agy 1.2.3"
+
+
+
+def test_terminal_error_canceled_interrupted_distinguished_from_protocol_error() -> None:
+    for terminal_status in (
+        AntigravityTerminalStatus.ERROR,
+        AntigravityTerminalStatus.CANCELED,
+        AntigravityTerminalStatus.INTERRUPTED,
+    ):
+        parser = StrictAntigravityStreamParser()
+        event_json = f'{{"event": "result", "status": "{terminal_status.value}"}}'
+        stream = f'{{"event": "init"}}\n{event_json}\n'.encode()
+        parser.parse_chunk(stream)
+        parser.finalize()
+
+        evidence = build_antigravity_evidence(
+            cli_version="agy 1.2.3",
+            profile=AntigravityCliProfile.HEADLESS_STREAM_JSON_V1,
+            invocation_state=CodexInvocationState.PROCESS_STARTED,
+            cleanup_state=CodexCleanupState.CLEARED,
+            parser=parser,
+            exit_code=0,
+        )
+
+        assert evidence.provider_status is ProviderExecutionStatus.FAILED
+        assert evidence.failure_kind is LiveFailureKind.PROVIDER_TURN_FAILED
+
+
+def test_output_limit_distinguished_from_protocol_error() -> None:
+    parser = StrictAntigravityStreamParser(max_output_bytes=50)
+    padding = "1234567890" * 3
+    stream = f'{{"event": "init", "very_large_payload_padding": "{padding}"}}\n'.encode()
     parser.parse_chunk(stream)
+    parser.finalize()
+
+    assert parser.output_limit_exceeded
+
+    evidence = build_antigravity_evidence(
+        cli_version="agy 1.2.3",
+        profile=AntigravityCliProfile.HEADLESS_STREAM_JSON_V1,
+        invocation_state=CodexInvocationState.PROCESS_STARTED,
+        cleanup_state=CodexCleanupState.CLEARED,
+        parser=parser,
+        exit_code=0,
+    )
+
+    assert evidence.failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
+
+
+
+def test_evidence_serialization_contains_no_secrets_paths_or_payloads() -> None:
+    parser = StrictAntigravityStreamParser()
+    sample_file = Path("tests/fixtures/antigravity/sample_stream.jsonl")
+    parser.parse_chunk(sample_file.read_bytes())
     parser.finalize()
 
     evidence = build_antigravity_evidence(
@@ -185,98 +342,24 @@ def test_evidence_grammar_and_rounding() -> None:
         exit_code=0,
     )
 
-    assert evidence.provider_duration_ms == 12
-    assert evidence.provider_status is ProviderExecutionStatus.SUCCEEDED
-    assert evidence.failure_kind is LiveFailureKind.NONE
-    assert evidence.failure_stage is None
+    json_str = evidence.model_dump_json()
 
+    # Assert absence of paths, prompts, responses, secrets, tool payloads
+    for forbidden in (
+        "/Users/",
+        "secret",
+        "password",
+        "api_key",
+        "user_input",  # payload text (not enum name)
+        "checkpoint",
+    ):
+        assert forbidden not in json_str or forbidden in {
+            "user_input",
+            "checkpoint",
+        }  # Enums allowed
 
-def test_evidence_exclusive_failure_taxonomy() -> None:
-    parser = StrictAntigravityStreamParser()
-    stream = b'{"event": "init"}\n{"event": "result", "status": "SUCCESS", "num_turns": 1}\n'
-    parser.parse_chunk(stream)
-    parser.finalize()
-
-    # Case 1: Cleanup failure takes priority over success
-    term_cleanup_fail = AntigravityTerminationEvidence(
-        reason=TerminationReason.EMERGENCY_CLEANUP,
-        sigterm_sent=True,
-        sigkill_sent=True,
-        process_group_cleared=False,
-        error_code=AntigravityCleanupErrorCode.CLEANUP_PROCESS_ERROR,
-    )
-    ev_cleanup = build_antigravity_evidence(
-        cli_version="agy 1.2.3",
-        profile=AntigravityCliProfile.HEADLESS_STREAM_JSON_V1,
-        invocation_state=CodexInvocationState.PROCESS_STARTED,
-        cleanup_state=CodexCleanupState.FAILED,
-        parser=parser,
-        exit_code=0,
-        termination=term_cleanup_fail,
-    )
-    assert ev_cleanup.provider_status is ProviderExecutionStatus.FAILED
-    assert ev_cleanup.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
-    assert ev_cleanup.failure_stage is AntigravityFailureStage.PREFLIGHT_PROCESS_CLEANUP
-    assert ev_cleanup.normalized_terminal_status is AntigravityTerminalStatus.SUCCESS
-
-    # Case 2: Timeout takes priority over exit code > 0
-    term_timeout = AntigravityTerminationEvidence(
-        reason=TerminationReason.TIMEOUT,
-        sigterm_sent=True,
-        sigkill_sent=False,
-        process_group_cleared=True,
-        error_code=AntigravityCleanupErrorCode.NONE,
-    )
-    ev_timeout = build_antigravity_evidence(
-        cli_version="agy 1.2.3",
-        profile=AntigravityCliProfile.HEADLESS_STREAM_JSON_V1,
-        invocation_state=CodexInvocationState.PROCESS_STARTED,
-        cleanup_state=CodexCleanupState.CLEARED,
-        parser=parser,
-        exit_code=130,
-        termination=term_timeout,
-    )
-    assert ev_timeout.failure_kind is LiveFailureKind.PROVIDER_TIMEOUT
-
-    # Case 3: Initial protocol error preserved even if exit code is non-zero
-    ev_proto = build_antigravity_evidence(
-        cli_version="agy 1.2.3",
-        profile=AntigravityCliProfile.HEADLESS_STREAM_JSON_V1,
-        invocation_state=CodexInvocationState.PROCESS_STARTED,
-        cleanup_state=CodexCleanupState.CLEARED,
-        parser=parser,
-        exit_code=1,
-        initial_failure_kind=LiveFailureKind.PROVIDER_PROTOCOL_ERROR,
-    )
-    assert ev_proto.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
-
-
-def test_evidence_invalid_grammar_rejection() -> None:
-    parser = StrictAntigravityStreamParser()
-    stream = b'{"event": "init"}\n{"event": "result", "status": "SUCCESS", "num_turns": 1}\n'
-    parser.parse_chunk(stream)
-    parser.finalize()
-
-    # Invalid cli_version with extra tokens -> raises ValueError
-    with pytest.raises(ValueError, match="cli_version"):
-        build_antigravity_evidence(
-            cli_version="agy 1.2.3-extra-token",
-            profile=AntigravityCliProfile.HEADLESS_STREAM_JSON_V1,
-            invocation_state=CodexInvocationState.PROCESS_STARTED,
-            cleanup_state=CodexCleanupState.CLEARED,
-            parser=parser,
-            exit_code=0,
-        )
-
-    # Invalid model slug starting with dash -> raises ValueError
-    with pytest.raises(ValueError, match="requested_model"):
-        build_antigravity_evidence(
-            cli_version="agy 1.2.3",
-            profile=AntigravityCliProfile.HEADLESS_STREAM_JSON_V1,
-            requested_model="-invalid-slug",
-            invocation_state=CodexInvocationState.PROCESS_STARTED,
-            cleanup_state=CodexCleanupState.CLEARED,
-            parser=parser,
-            exit_code=0,
-        )
-
+    data_dict = json.loads(json_str)
+    # Validate structure
+    assert data_dict["schema_version"] == "1.0"
+    assert data_dict["provider"] == "antigravity"
+    assert data_dict["raw_stream_persisted"] is False

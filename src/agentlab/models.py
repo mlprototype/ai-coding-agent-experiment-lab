@@ -1898,21 +1898,24 @@ class AntigravityExecutionEvidence(ContractModel):
                     raise ValueError(
                         "cleared cleanup requires cleared process group and error_code NONE"
                     )
-            elif (
-                self.cleanup_state is CodexCleanupState.FAILED
-                and not (
+            elif self.cleanup_state is CodexCleanupState.FAILED:
+                if not (
                     not self.termination.process_group_cleared
                     and self.termination.error_code
                     is not AntigravityCleanupErrorCode.NONE
-                )
-            ):
+                ):
+                    raise ValueError(
+                        "failed cleanup requires uncleared process group and non-NONE error_code"
+                    )
+            else:
                 raise ValueError(
-                    "failed cleanup requires uncleared process group and non-NONE error_code"
+                    "started process requires cleanup_state CLEARED or FAILED"
                 )
         elif self.cleanup_state is not CodexCleanupState.NOT_APPLICABLE:
             raise ValueError(
                 "unstarted process requires cleanup_state not_applicable"
             )
+
 
 
         if (

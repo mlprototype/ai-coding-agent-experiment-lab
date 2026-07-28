@@ -5,11 +5,15 @@ Offline Slice 5A implementation.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import select
 import shutil
+import signal
 import subprocess
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -40,6 +44,7 @@ from agentlab.models import (
 DEFAULT_PROBE_TIMEOUT_SECONDS = 5.0
 DEFAULT_MAX_LINE_BYTES = 4 * 1024 * 1024
 DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024 * 1024
+PREFLIGHT_MAX_BYTES = 64 * 1024
 
 
 def select_antigravity_profile(
@@ -112,14 +117,16 @@ class StrictAntigravityStreamParser:
         )
 
         self.protocol_error: str | None = None
+        self.output_limit_exceeded = False
         self.result_received = False
 
     def parse_chunk(self, chunk: bytes) -> None:
-        if self.protocol_error is not None:
+        if self.protocol_error is not None or self.output_limit_exceeded:
             return
 
         self.total_bytes_read += len(chunk)
         if self.total_bytes_read > self.max_output_bytes:
+            self.output_limit_exceeded = True
             self.protocol_error = "Total output exceeded maximum bytes limit"
             return
 
@@ -129,6 +136,7 @@ class StrictAntigravityStreamParser:
             newline_index = self.buffer.find(b"\n")
             if newline_index == -1:
                 if len(self.buffer) > self.max_line_bytes:
+                    self.output_limit_exceeded = True
                     self.protocol_error = "Line byte count exceeded limit"
                 break
 
@@ -140,6 +148,7 @@ class StrictAntigravityStreamParser:
                 return
 
             if len(line_bytes) > self.max_line_bytes:
+                self.output_limit_exceeded = True
                 self.protocol_error = "Line byte count exceeded limit"
                 return
 
@@ -159,17 +168,18 @@ class StrictAntigravityStreamParser:
                 return
 
             self._process_event(obj)
-            if self.protocol_error is not None:
+            if self.protocol_error is not None or self.output_limit_exceeded:
                 return
 
     def finalize(self) -> None:
-        if self.protocol_error is not None:
+        if self.protocol_error is not None or self.output_limit_exceeded:
             return
 
         if self.buffer:
             line_bytes = bytes(self.buffer).rstrip(b"\r")
             if line_bytes:
                 if len(line_bytes) > self.max_line_bytes:
+                    self.output_limit_exceeded = True
                     self.protocol_error = "Line byte count exceeded limit"
                     return
                 try:
@@ -209,6 +219,7 @@ class StrictAntigravityStreamParser:
         except ValueError:
             self.unknown_event_count += 1
             self.event_count += 1
+            self.protocol_error = f"Unknown top-level event: {event_type_str}"
             return
 
         current_index = self.event_count
@@ -243,6 +254,7 @@ class StrictAntigravityStreamParser:
 
             step_type_str = obj.get("step_type")
             if not isinstance(step_type_str, str):
+                self.unknown_step_type_count += 1
                 self.protocol_error = "Missing or non-string step_type"
                 return
 
@@ -250,6 +262,7 @@ class StrictAntigravityStreamParser:
                 step_type = AntigravityStepType(step_type_str)
                 self.step_counts[step_type] += 1
             except ValueError:
+                self.unknown_step_type_count += 1
                 self.protocol_error = f"Unknown step_type: {step_type_str}"
                 return
 
@@ -276,41 +289,66 @@ class StrictAntigravityStreamParser:
                 return
 
             num_turns = obj.get("num_turns")
-            if isinstance(num_turns, int) and not isinstance(num_turns, bool) and num_turns >= 0:
+            if num_turns is not None:
+                if (
+                    isinstance(num_turns, bool)
+                    or not isinstance(num_turns, int)
+                    or num_turns < 0
+                    or num_turns > 10_000
+                ):
+                    self.protocol_error = f"Invalid num_turns: {num_turns}"
+                    return
                 self.terminal_num_turns = num_turns
 
             duration_ms = obj.get("duration_ms")
-            if (
-                isinstance(duration_ms, (int, float))
-                and not isinstance(duration_ms, bool)
-                and duration_ms >= 0
-            ):
+            if duration_ms is not None:
+                if (
+                    isinstance(duration_ms, bool)
+                    or not isinstance(duration_ms, (int, float))
+                    or duration_ms < 0
+                    or duration_ms > 86_400_000
+                ):
+                    self.protocol_error = f"Invalid duration_ms: {duration_ms}"
+                    return
                 self.provider_duration_ms = round(float(duration_ms))
 
-            usage_obj = obj.get("usage")
-            if isinstance(usage_obj, dict):
-                in_tok = usage_obj.get("input_tokens")
-                cache_tok = usage_obj.get("cache_read_tokens")
-                out_tok = usage_obj.get("output_tokens")
-                think_tok = usage_obj.get("thinking_tokens")
-                tot_tok = usage_obj.get("total_tokens")
+            usage_raw = obj.get("usage")
+            if usage_raw is not None:
+                if not isinstance(usage_raw, dict):
+                    self.protocol_error = "usage field must be a JSON object"
+                    return
 
-                def _valid_int(val: Any) -> int | None:
-                    if isinstance(val, int) and not isinstance(val, bool) and val >= 0:
-                        return val
-                    return None
+                in_tok = usage_raw.get("input_tokens")
+                cache_tok = usage_raw.get("cache_read_tokens")
+                out_tok = usage_raw.get("output_tokens")
+                think_tok = usage_raw.get("thinking_tokens")
+                tot_tok = usage_raw.get("total_tokens")
 
-                in_val = _valid_int(in_tok)
-                cache_val = _valid_int(cache_tok)
-                out_val = _valid_int(out_tok)
-                think_val = _valid_int(think_tok)
-                tot_val = _valid_int(tot_tok)
+                def _strict_valid_int(val: Any, name: str) -> int | None:
+                    if val is None:
+                        return None
+                    if (
+                        isinstance(val, bool)
+                        or not isinstance(val, int)
+                        or val < 0
+                        or val > 10_000_000
+                    ):
+                        raise ValueError(f"Invalid {name}: {val}")
+                    return int(val)
+
+                try:
+                    in_val = _strict_valid_int(in_tok, "input_tokens")
+                    cache_val = _strict_valid_int(cache_tok, "cache_read_tokens")
+                    out_val = _strict_valid_int(out_tok, "output_tokens")
+                    think_val = _strict_valid_int(think_tok, "thinking_tokens")
+                    tot_val = _strict_valid_int(tot_tok, "total_tokens")
+                except ValueError as err:
+                    self.protocol_error = str(err)
+                    return
 
                 if (
                     tot_val is not None
-                    and in_val is not None
-                    and out_val is not None
-                    and tot_val != in_val + out_val
+                    and (in_val is None or out_val is None or tot_val != in_val + out_val)
                 ):
                     self.protocol_error = (
                         "total_tokens does not equal input_tokens + output_tokens"
@@ -327,6 +365,137 @@ class StrictAntigravityStreamParser:
                     )
                 else:
                     self.usage_metrics = UsageMetrics(source=UsageMetricSource.NOT_AVAILABLE)
+
+
+def _run_preflight_subprocess(
+    cmd: str,
+    args: list[str],
+    timeout_seconds: float,
+    clean_env: dict[str, str],
+) -> tuple[int | None, str, str, AntigravityFailureStage | None, LiveFailureKind]:
+    """Execute preflight subprocess with strict process group isolation and bounded collection."""
+    try:
+        proc = subprocess.Popen(
+            [cmd, *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            start_new_session=True,
+            env=clean_env,
+        )
+    except FileNotFoundError:
+        return (
+            None,
+            "",
+            "",
+            AntigravityFailureStage.PREFLIGHT_PROCESS_SPAWN,
+            LiveFailureKind.PROVIDER_UNAVAILABLE,
+        )
+    except Exception:
+        return (
+            None,
+            "",
+            "",
+            AntigravityFailureStage.PREFLIGHT_PROCESS_SPAWN,
+            LiveFailureKind.PROVIDER_UNAVAILABLE,
+        )
+
+    stdout_buf = bytearray()
+    stderr_buf = bytearray()
+
+    pgid = proc.pid
+    start_time = time.monotonic()
+    timed_out = False
+
+    pipes = [proc.stdout, proc.stderr]
+    for pipe in pipes:
+        if pipe is not None:
+            os.set_blocking(pipe.fileno(), False)
+
+    try:
+        while True:
+            elapsed = time.monotonic() - start_time
+            if elapsed > timeout_seconds:
+                timed_out = True
+                break
+
+            active_pipes = [p for p in pipes if p is not None and not p.closed]
+            rlist, _, _ = select.select(active_pipes, [], [], 0.1)
+
+            for pipe in rlist:
+                data = pipe.read(4096)
+                if not data:
+                    pipe.close()
+                    continue
+                if pipe is proc.stdout and len(stdout_buf) < PREFLIGHT_MAX_BYTES:
+                    stdout_buf.extend(data)
+                elif pipe is proc.stderr and len(stderr_buf) < PREFLIGHT_MAX_BYTES:
+                    stderr_buf.extend(data)
+
+            if proc.poll() is not None:
+                # Read any remaining buffered data
+                for pipe in [proc.stdout, proc.stderr]:
+                    if pipe is not None and not pipe.closed:
+                        data = pipe.read(PREFLIGHT_MAX_BYTES)
+                        if data:
+                            if pipe is proc.stdout and len(stdout_buf) < PREFLIGHT_MAX_BYTES:
+                                stdout_buf.extend(data)
+                            elif pipe is proc.stderr and len(stderr_buf) < PREFLIGHT_MAX_BYTES:
+                                stderr_buf.extend(data)
+                        pipe.close()
+                break
+
+    except Exception:
+        pass
+
+    # Cleanup phase
+    cleanup_failed = False
+    if timed_out or proc.poll() is None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGTERM)
+
+        grace_start = time.monotonic()
+        while time.monotonic() - grace_start < 0.5:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+
+        if proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGKILL)
+            time.sleep(0.05)
+            if proc.poll() is None:
+                cleanup_failed = True
+
+    # Close pipe handles if still open
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is not None and not pipe.closed:
+            with contextlib.suppress(Exception):
+                pipe.close()
+
+    stdout_str = stdout_buf.decode("utf-8", errors="replace")
+    stderr_str = stderr_buf.decode("utf-8", errors="replace")
+
+    if cleanup_failed:
+        return (
+            proc.returncode,
+            stdout_str,
+            stderr_str,
+            AntigravityFailureStage.PREFLIGHT_PROCESS_CLEANUP,
+            LiveFailureKind.PROCESS_CLEANUP_ERROR,
+        )
+
+    if timed_out:
+        return (
+            None,
+            stdout_str,
+            stderr_str,
+            AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
+            LiveFailureKind.PROVIDER_TIMEOUT,
+        )
+
+    return proc.returncode, stdout_str, stderr_str, None, LiveFailureKind.NONE
 
 
 def probe_antigravity_preflight(
@@ -361,82 +530,35 @@ def probe_antigravity_preflight(
         if key in {"PATH", "TMPDIR", "TEMP", "TMP", "USER", "LOGNAME", "HOME", "LANG", "LC_ALL"}
     }
 
+    # Version probe
+    ret_v, stdout_v, stderr_v, stage_v, kind_v = _run_preflight_subprocess(
+        cmd, ["--version"], timeout_seconds, clean_env
+    )
+    if kind_v is not LiveFailureKind.NONE:
+        return AntigravityCliProfile.NOT_SELECTED, None, [], checked_at, stage_v, kind_v
+
     version_str: str | None = None
-    try:
-        proc_v = subprocess.run(
-            [cmd, "--version"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            env=clean_env,
-        )
-        if proc_v.returncode == 0:
-            lines = proc_v.stdout.strip().splitlines()
-            stdout_first_line = lines[0] if lines else ""
-            if match := re.fullmatch(r"^agy \d+\.\d+\.\d+$", stdout_first_line):
+    if ret_v == 0:
+        # Check non-empty lines from stdout or stderr
+        out_lines = [line.strip() for line in (stdout_v or stderr_v).splitlines() if line.strip()]
+        if len(out_lines) == 1:
+            first_line = out_lines[0]
+            if match := re.fullmatch(r"^agy \d+\.\d+\.\d+$", first_line):
                 version_str = match.group(0)
-    except FileNotFoundError:
-        return (
-            AntigravityCliProfile.NOT_SELECTED,
-            None,
-            [],
-            checked_at,
-            AntigravityFailureStage.PREFLIGHT_PROCESS_SPAWN,
-            LiveFailureKind.PROVIDER_UNAVAILABLE,
-        )
-    except subprocess.TimeoutExpired:
-        return (
-            AntigravityCliProfile.NOT_SELECTED,
-            None,
-            [],
-            checked_at,
-            AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
-            LiveFailureKind.PROVIDER_TIMEOUT,
-        )
-    except Exception:
-        return (
-            AntigravityCliProfile.NOT_SELECTED,
-            None,
-            [],
-            checked_at,
-            AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
-            LiveFailureKind.EVIDENCE_ERROR,
-        )
+
+    # Help probe
+    ret_h, stdout_h, stderr_h, stage_h, kind_h = _run_preflight_subprocess(
+        cmd, ["--help"], timeout_seconds, clean_env
+    )
+    if kind_h is not LiveFailureKind.NONE:
+        return AntigravityCliProfile.NOT_SELECTED, version_str, [], checked_at, stage_h, kind_h
 
     verified_flags: list[AntigravityHelpMarker] = []
-    try:
-        proc_h = subprocess.run(
-            [cmd, "--help"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            env=clean_env,
-        )
-        if proc_h.returncode == 0:
-            help_output = f"{proc_h.stdout}\n{proc_h.stderr}".lower()
-            for marker in AntigravityHelpMarker:
-                if marker.value in help_output:
-                    verified_flags.append(marker)
-    except subprocess.TimeoutExpired:
-        return (
-            AntigravityCliProfile.NOT_SELECTED,
-            version_str,
-            [],
-            checked_at,
-            AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
-            LiveFailureKind.PROVIDER_TIMEOUT,
-        )
-    except Exception:
-        return (
-            AntigravityCliProfile.NOT_SELECTED,
-            version_str,
-            [],
-            checked_at,
-            AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
-            LiveFailureKind.EVIDENCE_ERROR,
-        )
+    if ret_h == 0:
+        help_output = f"{stdout_h}\n{stderr_h}".lower()
+        for marker in AntigravityHelpMarker:
+            if marker.value in help_output:
+                verified_flags.append(marker)
 
     profile = select_antigravity_profile(version_str, verified_flags, allowlist=allowlist)
     if profile is not AntigravityCliProfile.NOT_SELECTED:
@@ -492,26 +614,34 @@ def build_antigravity_evidence(
 
     if term.error_code is not AntigravityCleanupErrorCode.NONE or not term.process_group_cleared:
         final_failure_kind = LiveFailureKind.PROCESS_CLEANUP_ERROR
-        final_failure_stage = failure_stage or AntigravityFailureStage.PREFLIGHT_PROCESS_CLEANUP
+        final_failure_stage = (
+            failure_stage or AntigravityFailureStage.PREFLIGHT_PROCESS_CLEANUP
+        )
     elif term.reason is TerminationReason.TIMEOUT:
         final_failure_kind = LiveFailureKind.PROVIDER_TIMEOUT
         final_failure_stage = failure_stage or AntigravityFailureStage.STREAM_PARSING
-    elif exit_code is not None and exit_code < 0:
-        final_failure_kind = LiveFailureKind.PROVIDER_SIGNAL_TERMINATION
+    elif p.output_limit_exceeded:
+        final_failure_kind = LiveFailureKind.PROVIDER_OUTPUT_LIMIT
         final_failure_stage = failure_stage or AntigravityFailureStage.STREAM_PARSING
     elif (
         initial_failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
         or p.protocol_error is not None
     ):
         final_failure_kind = LiveFailureKind.PROVIDER_PROTOCOL_ERROR
-        final_failure_stage = (
-            failure_stage or AntigravityFailureStage.STREAM_PARSING
-        )
+        final_failure_stage = failure_stage or AntigravityFailureStage.STREAM_PARSING
+    elif exit_code is not None and exit_code < 0:
+        final_failure_kind = LiveFailureKind.PROVIDER_SIGNAL_TERMINATION
+        final_failure_stage = failure_stage or AntigravityFailureStage.STREAM_PARSING
+    elif p.normalized_terminal_status in {
+        AntigravityTerminalStatus.ERROR,
+        AntigravityTerminalStatus.CANCELED,
+        AntigravityTerminalStatus.INTERRUPTED,
+    }:
+        final_failure_kind = LiveFailureKind.PROVIDER_TURN_FAILED
+        final_failure_stage = failure_stage or AntigravityFailureStage.STREAM_PARSING
     elif exit_code is not None and exit_code > 0:
         final_failure_kind = LiveFailureKind.PROVIDER_CLI_NONZERO
-        final_failure_stage = (
-            failure_stage or AntigravityFailureStage.STREAM_PARSING
-        )
+        final_failure_stage = failure_stage or AntigravityFailureStage.STREAM_PARSING
     elif initial_failure_kind is not LiveFailureKind.NONE:
         final_failure_kind = initial_failure_kind
         final_failure_stage = failure_stage or AntigravityFailureStage.PREFLIGHT
