@@ -22,6 +22,12 @@ offline実装とfake Codexによる受入を完了し、レビュー済みcommit
 Campaignを2026-07-28に1回だけ実行しました。予定6 run／6 Provider callsに対し、最初の
 `staged` runを1回／1 call実行後、`harness_failure`で安全停止し、残り5 runは
 `not_run`です。complete pairは0、reportは`not_estimable`なのでPhase 4はCurrentのままです。
+Campaign 001のArtifactと失敗履歴は変更せず、判明したPython bytecode cache混入だけを
+offlineで修正しました。Provider processとGate commandには、run専用system temporary
+directory配下のHarness管理`PYTHONPYCACHEPREFIX`を明示し、bytecode cacheを評価Workspace
+から分離します。未知のbinary変更は従来どおり不完全Evidenceとして拒否します。
+Campaign 001は再実行しません。修正後の新しいLiveにも、新experiment ID、新Artifact root、
+新canonical Plan、reviewed commit、別の明示承認が必要です。
 Phase 4までに次を提供します。
 
 - バージョン付きExperimentSpec、RunMetrics、UsageMetrics、CapabilityReport

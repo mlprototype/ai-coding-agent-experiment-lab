@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -24,6 +25,7 @@ from agentlab.models import (
     CommandStatus,
     EvidenceOverallStatus,
     FailureKind,
+    TerminationReason,
     UsageMetrics,
     UsageMetricSource,
 )
@@ -134,6 +136,142 @@ def test_all_gates_run_in_group_order_and_generate_metrics(tmp_path: Path) -> No
     assert restored.diff.added_lines == 4
     assert restored.workspace_removed is True
     assert not (fixture / "order.txt").exists()
+
+
+def test_py_compile_cache_is_isolated_from_workspace_diff_and_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_change = (
+        "import pathlib;"
+        "path=pathlib.Path('tag_normalizer.py');"
+        "path.write_text(path.read_text(encoding='utf-8')+'# changed\\n',"
+        "encoding='utf-8')"
+    )
+    quality_gate = {
+        "acceptance": [[sys.executable, "-c", source_change]],
+        "regression": [[sys.executable, "-c", "raise SystemExit(0)"]],
+        "lint": [["python3", "-m", "py_compile", "tag_normalizer.py"]],
+        "typecheck": [[sys.executable, "-c", "raise SystemExit(0)"]],
+    }
+    spec_path, fixture, _recording = _write_case(
+        tmp_path,
+        quality_gate=quality_gate,
+    )
+    (fixture / "tag_normalizer.py").write_text(
+        "def normalize_tags(tags: list[str]) -> list[str]:\n"
+        "    return []\n",
+        encoding="utf-8",
+    )
+    parent_pycache = tmp_path / "parent-python-bytecode-cache"
+    monkeypatch.setenv("PYTHONPYCACHEPREFIX", str(parent_pycache))
+    original_popen = subprocess.Popen
+    observed: list[tuple[Path, Path]] = []
+
+    def record_environment(args: object, **kwargs: Any):
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        workspace = Path(kwargs["cwd"])
+        pycache = Path(environment["PYTHONPYCACHEPREFIX"])
+        observed.append((workspace, pycache))
+        return original_popen(args, **kwargs)
+
+    monkeypatch.setattr("agentlab.runner.subprocess.Popen", record_environment)
+    output = tmp_path / "pycompile-evidence.json"
+
+    artifact = _run(spec_path, output).artifact
+
+    assert artifact.overall_status is EvidenceOverallStatus.PASSED
+    assert artifact.failure_kind is FailureKind.NONE
+    assert artifact.metrics is not None
+    assert artifact.metrics.quality_gate_pass is True
+    assert [command.status for command in artifact.commands] == [
+        CommandStatus.PASSED,
+        CommandStatus.PASSED,
+        CommandStatus.PASSED,
+        CommandStatus.PASSED,
+    ]
+    assert artifact.commands[2].argv == [
+        "python3",
+        "-m",
+        "py_compile",
+        "tag_normalizer.py",
+    ]
+    assert artifact.diff.changed_files == ["tag_normalizer.py"]
+    assert artifact.diff.binary_files == []
+    assert artifact.diff.line_counts_complete is True
+    assert artifact.diff.added_lines == 1
+    assert artifact.diff.deleted_lines == 0
+    assert not (fixture / "__pycache__").exists()
+    assert len(observed) == 4
+    assert len({pycache for _workspace, pycache in observed}) == 4
+    for workspace, pycache in observed:
+        assert pycache.is_absolute()
+        assert not pycache.is_relative_to(workspace)
+        assert pycache != parent_pycache
+        assert not pycache.exists()
+    persisted = output.read_bytes()
+    assert str(parent_pycache).encode() not in persisted
+    assert all(str(pycache).encode() not in persisted for _workspace, pycache in observed)
+    assert b"PYTHONPYCACHEPREFIX" not in persisted
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_status", "expected_termination"),
+    [
+        ("failure", EvidenceOverallStatus.FAILED, TerminationReason.NONE),
+        ("timeout", EvidenceOverallStatus.HARNESS_ERROR, TerminationReason.TIMEOUT),
+        ("process_cleanup", EvidenceOverallStatus.PASSED, TerminationReason.RESIDUAL_PROCESS),
+    ],
+)
+def test_python_bytecode_cache_is_removed_on_gate_terminal_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected_status: EvidenceOverallStatus,
+    expected_termination: TerminationReason,
+) -> None:
+    if mode == "failure":
+        script = "raise SystemExit(7)"
+        timeout_ms = 1000
+    elif mode == "timeout":
+        script = "import signal; signal.pause()"
+        timeout_ms = 150
+    else:
+        child = "import signal; signal.pause()"
+        script = (
+            "import subprocess,sys;"
+            f"subprocess.Popen([sys.executable,'-c',{child!r}])"
+        )
+        timeout_ms = 1000
+    spec_path, _fixture, _recording = _write_case(
+        tmp_path,
+        quality_gate={
+            "acceptance": [[sys.executable, "-c", script]],
+            "regression": [],
+            "lint": [],
+            "typecheck": [],
+        },
+        timeout_ms=timeout_ms,
+    )
+    original_popen = subprocess.Popen
+    observed_pycache: list[Path] = []
+
+    def record_environment(args: object, **kwargs: Any):
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        observed_pycache.append(Path(environment["PYTHONPYCACHEPREFIX"]))
+        return original_popen(args, **kwargs)
+
+    monkeypatch.setattr("agentlab.runner.subprocess.Popen", record_environment)
+
+    artifact = _run(spec_path, tmp_path / f"{mode}.json").artifact
+
+    assert artifact.overall_status is expected_status
+    assert artifact.commands[0].termination.reason is expected_termination
+    assert artifact.workspace_removed is True
+    assert len(observed_pycache) == 1
+    assert not observed_pycache[0].exists()
 
 
 def test_normal_failures_continue_and_use_command_level_metrics(tmp_path: Path) -> None:

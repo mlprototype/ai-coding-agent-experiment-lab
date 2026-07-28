@@ -140,3 +140,11 @@ Workflow別には、`one_shot`がscheduled 3／attempted 0／completed 0／not_r
 `staged`がscheduled 3／attempted 1／completed 0／harness_failed 1／not_run 2である。
 `staged`の4 Gate commandは4件ともPASSしたが、run自体はHarness障害のため
 quality-gate-passed runへ数えない。
+
+Campaign 001のArtifact、report、上記失敗分類は変更しない。その後のoffline Harness修正で、
+Provider processと各Gate commandへHarness管理`PYTHONPYCACHEPREFIX`を設定し、Python
+bytecode cacheをrun専用system temporary root内かつ評価Workspace外へ隔離した。binary diff
+拒否やline count完全性は緩めず、Harness管理外のbinary変更は引き続き`evidence_error`である。
+Campaign 001は再実行しない。修正後のLiveを行う場合も、新experiment ID、新Artifact root、
+新canonical Plan、reviewed commit、別の人間による明示承認を必要とする。Phase 4は
+`Current`、Phase 5は`Planned`のままである。

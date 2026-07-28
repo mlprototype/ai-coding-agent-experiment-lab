@@ -24,10 +24,11 @@ Spec reviewではGateが外部AIやnetworkを呼ばないことも確認する�
 2. system temporary directoryにWorkspaceと専用環境directoryを作る。
 3. Fixtureをsymlinkをdereferenceせずコピーし、コピー後snapshotを照合する。
 4. Workspaceの初期snapshotを保持する。
-5. 品質GateをWorkspace内で順番に実行する。
-6. 最終snapshot、diff、Evidenceを作る。
-7. 成否やHarness例外にかかわらずtemporary rootを削除する。
-8. sourceが変更されていないことを再確認し、完成したEvidenceをatomicに保存する。
+5. commandごとのPython bytecode cacheを専用環境directory配下へ作る。
+6. 品質GateをWorkspace内で順番に実行する。
+7. 最終snapshot、diff、Evidenceを作る。
+8. 成否やHarness例外にかかわらずtemporary rootを削除する。
+9. sourceが変更されていないことを再確認し、完成したEvidenceをatomicに保存する。
 
 Artifact出力はFixture source内へ置けない。`--force`でもExperimentSpec、Replay
 Recording、Fixture source file、またはそれらへのsymlink/hard linkを置換できない。
@@ -63,8 +64,11 @@ process group APIを保証できないplatformではcommand起動前に
 親環境から渡せるのは`PATH`、`LANG`、`LC_ALL`と、必要なplatform変数
 `SYSTEMROOT`、`COMSPEC`、`PATHEXT`だけである。`HOME`、`TMPDIR`、
 `XDG_CACHE_HOME`はrun専用temporary directoryへ差し替える。
-`PYTHONDONTWRITEBYTECODE=1`も固定設定する。その他のsecret、Token、認証変数は継承
-しない。
+`PYTHONDONTWRITEBYTECODE=1`に加え、親の同名変数を継承せず、Harnessが
+`PYTHONPYCACHEPREFIX`をcommandごとに決定する。cache rootはsystem temporary root内の
+専用環境directory配下にあり、Fixture source、評価Workspace、Artifact rootの外である。
+Gate成功、通常失敗、timeout、process cleanup、Harness例外のいずれでもWorkspaceと同じ
+cleanup lifecycleで回収する。その他のsecret、Token、認証変数は継承しない。
 
 これはnetworkを遮断しない。信頼済みGate自体がnetworkへ接続しない設計を別途守る。
 
@@ -76,8 +80,9 @@ stdoutとstderrは別pipeとして最後までnon-blockingでdrainする。そ�
 変換が発生したstreamは`*_decode_replaced=true`として、commandが元から出力した置換文字
 と区別する。
 
-temporary Workspaceは`<WORKSPACE>`、専用HOME/cache/tempはplaceholderへ正規化する。
-一時絶対pathや親環境のsecretをEvidenceへ保存しない。
+temporary Workspaceは`<WORKSPACE>`、専用HOME/cache/tempとPython bytecode cacheは
+placeholderへ正規化する。一時絶対path、`PYTHONPYCACHEPREFIX`の実値、親環境のsecretを
+Evidenceへ保存しない。
 
 ## Evidence contract
 
@@ -119,6 +124,9 @@ unified diffと正確な追加・削除行数を生成する。diff本文は`max
 
 binary、NULを含むfile、不正UTF-8の変更はpathを保存し、line countを不完全とする。
 推測した行数は保存しない。この場合はRunMetricsも生成しない。
+Pythonの正常なbytecode副生成物はHarness管理cacheへ隔離し、diffからのignore処理では
+隠さない。Harness管理外でWorkspaceへ生成された`.pyc`を含む未知binary変更は、従来どおり
+line count不完全な`evidence_error`として安全停止する。
 
 ## Command-level Metrics
 

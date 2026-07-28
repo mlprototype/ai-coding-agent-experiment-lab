@@ -53,6 +53,7 @@ from agentlab.runner import (
     UnsupportedRunnerPlatformError,
     ensure_runner_platform_supported,
     merge_termination_error,
+    prepare_python_bytecode_cache_root,
     process_group_exists,
     terminate_process_group,
     termination_without_signal,
@@ -1014,6 +1015,10 @@ def build_codex_environment(
 ) -> dict[str, str]:
     """Pass only basic locale/PATH plus the existing managed-auth CODEX_HOME path."""
     parent = os.environ if parent_environment is None else parent_environment
+    bytecode_cache_root = prepare_python_bytecode_cache_root(
+        environment_root,
+        namespace="provider",
+    )
     environment = _probe_environment(parent)
     environment.update(
         {
@@ -1021,6 +1026,7 @@ def build_codex_environment(
             "TMPDIR": str(environment_root / "tmp"),
             "XDG_CACHE_HOME": str(environment_root / "cache"),
             "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPYCACHEPREFIX": str(bytecode_cache_root),
         }
     )
     environment["CODEX_HOME"] = str(resolve_codex_home(parent))

@@ -88,7 +88,9 @@ API通信は必要で、Phase 3はfirewall、VM、containerによる完全なnet
 保存しない。未設定、相対path、存在しないpathはpreflight前に拒否し、`HOME/.codex`へ
 fallbackしない。品質Gateは別の
 Phase 2 allowlist環境と専用の一時HOME/TMP/cacheで起動するため、Provider側の一時環境や
-`CODEX_HOME`を受け取らない。
+`CODEX_HOME`を受け取らない。Provider processとGate commandにはそれぞれrun専用system
+temporary root配下のHarness管理`PYTHONPYCACHEPREFIX`を設定し、親の同名変数を継承しない。
+実値はEvidence、Recording、Diagnosticへ保存せず、run cleanupでcache rootも回収する。
 
 ## Incremental JSONL parser
 

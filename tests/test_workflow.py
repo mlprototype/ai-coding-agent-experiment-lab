@@ -20,9 +20,11 @@ from agentlab.campaign import (
     load_campaign,
     run_workflow_campaign,
 )
+from agentlab.live import load_live_artifact
 from agentlab.models import (
     CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS,
     LiveFailureKind,
+    LiveOverallStatus,
     Workflow,
 )
 from agentlab.workflow import (
@@ -464,7 +466,8 @@ def _fake_codex_environment(
         "    prompt=sys.stdin.buffer.read()\n"
         "    with log.open('a',encoding='utf-8') as stream:\n"
         "        stream.write(json.dumps({'prompt_sha256':hashlib.sha256(prompt).hexdigest(),"
-        "'cwd':os.getcwd()})+'\\n')\n"
+        "'cwd':os.getcwd(),"
+        "'pycache_prefix':os.environ.get('PYTHONPYCACHEPREFIX')})+'\\n')\n"
         "    pathlib.Path('task.txt').write_text('status=COMPLETE\\n',encoding='utf-8')\n"
         "    print(json.dumps({'type':'thread.started','thread_id':'discarded'}),flush=True)\n"
         "    print(json.dumps({'type':'turn.started'}),flush=True)\n"
@@ -478,6 +481,7 @@ def _fake_codex_environment(
         "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
         "HOME": str(tmp_path / "parent-home"),
         "CODEX_HOME": str(codex_home),
+        "PYTHONPYCACHEPREFIX": str(tmp_path / "parent-python-bytecode-cache"),
     }
     return environment, log
 
@@ -486,6 +490,20 @@ def _run_fake_campaign(
     tmp_path: Path,
 ) -> tuple[Path, Path, Path, Path]:
     spec_path = _case(tmp_path, repetitions=1)
+    fixture = spec_path.parent / "fixtures" / "task"
+    (fixture / "tag_normalizer.py").write_text(
+        "def normalize_tags(tags: list[str]) -> list[str]:\n"
+        "    return []\n",
+        encoding="utf-8",
+    )
+    raw_spec = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
+    raw_spec["quality_gate"]["lint"] = [
+        ["python3", "-m", "py_compile", "tag_normalizer.py"]
+    ]
+    spec_path.write_text(
+        yaml.safe_dump(raw_spec, sort_keys=False),
+        encoding="utf-8",
+    )
     plan_path = _plan_file(spec_path)
     environment, call_log = _fake_codex_environment(tmp_path)
     campaign_path = spec_path.parent / "campaign.jsonl"
@@ -515,6 +533,24 @@ def test_fake_campaign_has_one_call_per_run_independent_workspaces_and_offline_r
     assert len({call["cwd"] for call in calls}) == 2
     assert len({call["prompt_sha256"] for call in calls}) == 2
     assert all(not Path(call["cwd"]).exists() for call in calls)
+    assert len({call["pycache_prefix"] for call in calls}) == 2
+    assert all(not Path(call["pycache_prefix"]).exists() for call in calls)
+
+    plan = load_workflow_plan(plan_path)
+    run_artifacts = [
+        load_live_artifact(spec_path.parent / Path(run.evidence_path))
+        for run in plan.runs
+    ]
+    assert all(
+        artifact.overall_status is LiveOverallStatus.PASSED
+        for artifact in run_artifacts
+    )
+    assert all(
+        artifact.diff.changed_files == ["task.txt"]
+        and artifact.diff.binary_files == []
+        and artifact.diff.line_counts_complete
+        for artifact in run_artifacts
+    )
 
     report = aggregate_workflow_campaign(spec_path, plan_path, campaign_path)
     assert report.pairing.status is Estimability.ESTIMABLE
