@@ -1,4 +1,4 @@
-"""Command-line interface for experiment contracts, Replay, and Phase 2 gates."""
+"""Command-line interface for Replay, Live runs, and Workflow experiments."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from typing import Annotated
 
 import typer
 
+from agentlab.campaign import CampaignError, CampaignStopReason, run_workflow_campaign
 from agentlab.capabilities import doctor_report
 from agentlab.gates import RunGatesError, run_gates
 from agentlab.live import LiveCodexError, run_live_codex
@@ -14,6 +15,14 @@ from agentlab.models import EvidenceOverallStatus, LiveOverallStatus
 from agentlab.recording import RecordingLoadError
 from agentlab.replay import ReplayError, run_replay
 from agentlab.specs import SpecLoadError, load_experiment_spec
+from agentlab.workflow import (
+    WorkflowPlanError,
+    WorkflowSpecError,
+    create_workflow_plan,
+    load_workflow_spec,
+    plan_publication_path,
+)
+from agentlab.workflow_report import WorkflowReportError, create_workflow_report
 
 app = typer.Typer(
     name="agentlab",
@@ -61,6 +70,141 @@ def validate_spec(path: Annotated[Path, typer.Argument(exists=True, dir_okay=Fal
         f"valid ExperimentSpec: {spec.experiment_id} "
         f"(axis={spec.comparison_axis.value}, mode={spec.execution_mode.value})"
     )
+
+
+@app.command("validate-workflow")
+def validate_workflow_spec(
+    path: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+) -> None:
+    """Validate a strict Phase 4 Workflow A/B Spec without executing anything."""
+    try:
+        loaded = load_workflow_spec(path)
+    except WorkflowSpecError as error:
+        typer.echo(f"invalid Workflow Spec: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(
+        f"valid Workflow Spec: {loaded.spec.experiment_id} "
+        f"(axis=workflow, runs={len(loaded.spec.task_ids) * loaded.spec.repetitions * 2})"
+    )
+    typer.echo("external AI executed: no")
+
+
+@app.command("plan-workflow")
+def plan_workflow_command(
+    spec_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    output_path: Annotated[
+        Path,
+        typer.Option("--output", help="Create-only destination for canonical Plan JSON."),
+    ],
+) -> None:
+    """Preregister a deterministic Workflow A/B run order without external AI."""
+    try:
+        plan = create_workflow_plan(spec_path, output_path)
+    except (WorkflowSpecError, WorkflowPlanError) as error:
+        typer.echo(f"plan-workflow failed: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(f"experiment: {plan.experiment_id}")
+    typer.echo(f"planned runs: {plan.planned_run_count}")
+    typer.echo(f"planned Provider calls: {plan.planned_provider_call_count}")
+    typer.echo(f"canonical Plan: {output_path}")
+    typer.echo(f"publication metadata: {plan_publication_path(output_path)}")
+    typer.echo("external AI executed: no")
+
+
+@app.command("run-workflow-campaign")
+def run_workflow_campaign_command(
+    spec_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    plan_path: Annotated[
+        Path,
+        typer.Option("--plan", exists=True, dir_okay=False, help="Preregistered Plan JSON."),
+    ],
+    campaign_path: Annotated[
+        Path,
+        typer.Option("--campaign", help="Create-only append-only Campaign JSONL."),
+    ],
+    confirm_live_codex: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-live-codex",
+            help="Explicitly allow external AI transmission and quota consumption.",
+        ),
+    ] = False,
+    confirm_provider_calls: Annotated[
+        int | None,
+        typer.Option(
+            "--confirm-provider-calls",
+            help="Confirm the exact total Provider-call budget shown in the Plan.",
+        ),
+    ] = None,
+) -> None:
+    """Run one sequential, preregistered Workflow Campaign; never used by CI."""
+    if confirm_live_codex and confirm_provider_calls is not None:
+        typer.echo(
+            "WARNING: external AI execution, data transmission, and quota consumption "
+            f"may occur for up to {confirm_provider_calls} Provider calls."
+        )
+    try:
+        outcome = run_workflow_campaign(
+            spec_path,
+            plan_path,
+            campaign_path,
+            confirm_live_codex=confirm_live_codex,
+            confirm_provider_calls=confirm_provider_calls,
+        )
+    except (CampaignError, WorkflowSpecError, WorkflowPlanError) as error:
+        typer.echo(f"run-workflow-campaign failed: {error}", err=True)
+        typer.echo("automatic retry/fallback: 0")
+        raise typer.Exit(code=2) from error
+    typer.echo(f"campaign: {outcome.campaign_path}")
+    typer.echo(f"attempted runs: {outcome.attempted_run_count}")
+    typer.echo(f"Provider calls: {outcome.provider_call_count}")
+    typer.echo(
+        "Provider call count unknown runs: "
+        f"{outcome.provider_call_count_unknown_runs}"
+    )
+    typer.echo(f"stop reason: {outcome.stop_reason.value}")
+    typer.echo("automatic retry/fallback: 0")
+    if outcome.stop_reason is not CampaignStopReason.NONE:
+        raise typer.Exit(code=1)
+
+
+@app.command("report-workflow")
+def report_workflow_command(
+    spec_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    plan_path: Annotated[
+        Path,
+        typer.Option("--plan", exists=True, dir_okay=False),
+    ],
+    campaign_path: Annotated[
+        Path,
+        typer.Option("--campaign", exists=True, dir_okay=False),
+    ],
+    output_path: Annotated[
+        Path,
+        typer.Option("--output", help="Create-only strict aggregate JSON."),
+    ],
+    markdown_path: Annotated[
+        Path,
+        typer.Option("--markdown", help="Create-only Markdown report."),
+    ],
+) -> None:
+    """Aggregate only saved Plan, Campaign, Recording, and Evidence Artifacts."""
+    try:
+        report = create_workflow_report(
+            spec_path,
+            plan_path,
+            campaign_path,
+            output_path,
+            markdown_path,
+        )
+    except WorkflowReportError as error:
+        typer.echo(f"report-workflow failed: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(f"experiment: {report.experiment_id}")
+    typer.echo(f"pairing: {report.pairing.status.value}")
+    typer.echo(f"JSON report: {output_path}")
+    typer.echo(f"Markdown report: {markdown_path}")
+    typer.echo("Provider, subprocess, network, and quality Gate executed: no")
 
 
 @app.command()
@@ -193,8 +337,7 @@ def live_codex_command(
     """Run one manually confirmed Codex CLI vertical slice."""
     if confirm_live_codex:
         typer.echo(
-            "WARNING: external AI execution, data transmission, and quota consumption "
-            "will occur."
+            "WARNING: external AI execution, data transmission, and quota consumption will occur."
         )
     try:
         outcome = run_live_codex(
@@ -211,13 +354,8 @@ def live_codex_command(
         typer.echo(f"run: {run_id}")
         typer.echo(f"task: {task_id}")
         typer.echo(f"evidence output: {output_path}")
-        if (
-            isinstance(error, LiveCodexError)
-            and error.workspace_lifecycle is not None
-        ):
-            typer.echo(
-                f"workspace lifecycle: {error.workspace_lifecycle.value}"
-            )
+        if isinstance(error, LiveCodexError) and error.workspace_lifecycle is not None:
+            typer.echo(f"workspace lifecycle: {error.workspace_lifecycle.value}")
         else:
             typer.echo("workspace removed: not_created")
         typer.echo("raw Prompt persisted: no")
@@ -231,9 +369,7 @@ def live_codex_command(
     typer.echo(f"status: {artifact.overall_status.value}")
     typer.echo(f"failure kind: {artifact.failure_kind.value}")
     if artifact.codex.provider_failure_hint is not None:
-        typer.echo(
-            f"provider failure hint: {artifact.codex.provider_failure_hint.value}"
-        )
+        typer.echo(f"provider failure hint: {artifact.codex.provider_failure_hint.value}")
     typer.echo(f"recording output: {outcome.recording_path}")
     typer.echo(f"evidence output: {outcome.output_path}")
     typer.echo(f"workspace lifecycle: {artifact.workspace_lifecycle.value}")

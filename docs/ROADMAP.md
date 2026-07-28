@@ -69,19 +69,24 @@ retry／fallback 0、Provider exit 0、`turn.completed` 1件、`turn.failed` 0�
 `task.txt`だけを期待どおり変更した。4種類のQuality Gateは全PASSし、Evidence 1.5／
 Recording 1.1のstrict再読込、offline Replay、Metrics一致、redaction、process group／
 Workspace cleanupを確認した。これによりPhase 3の最小vertical slice受入を完了した。
-この結果は一般的なモデル性能やProvider比較を示さず、Phase 4はPlannedのまま未着手である。
+この結果は一般的なモデル性能やProvider比較を示さない。
 
 ## Phase 4: Workflow A/B Experiment
 
-**Status: Planned**
+**Status: Current**
 
 **目的:** 同一Provider上で`one_shot`と`staged`を比較する最初の反復実験を行う。
 
-**成果物:** 二つのWorkflow定義、seed付き実行順生成、反復scheduler、事前登録Spec、
-内部分析notebookまたは集計データ。
+**成果物:** 二つの単一turn Workflow定義、後方互換なSpec 2.0、seed付きblock順序、
+byte決定的なcanonical Plan、逐次scheduler、append-only Campaign、JSON/Markdown集計。
 
-**受入条件:** Provider、fixture、Gateを固定し、順序と全runの状態を記録する。欠測と
-停止条件を説明でき、結論をベンチマーク範囲に限定する。
+**受入条件:** offline実装とfake Codex受入は完了した。Provider、exact model、fixture、
+Gate、sandbox、network、timeoutを固定し、両Workflowとも1 run = 1 Provider turn =
+1 agent callとする。順序と全run状態を記録し、欠測と停止条件を説明し、結論をFixture、
+Prompt、Gate、環境、実行時期へ限定する。Completeには、別の人間の明示指示により
+レビュー済みcommitへ事前登録した1 Task×2 Workflow×各3反復（最大6 Provider calls）の
+実Codex Campaignを実行し、最低1組のpaired結果をoffline集計する必要がある。安全停止で
+pairが成立しない場合はCurrentのままとし、失敗runを再実行しない。
 
 ## Phase 5: Antigravity CLI Provider
 

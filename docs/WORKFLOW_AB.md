@@ -1,0 +1,113 @@
+# Phase 4 Workflow A/B Experiment
+
+## Scope
+
+Phase 4は、同一Codex Provider、exact model ID、reasoning effort、Task Fixture、品質Gate、
+実行環境のもとでWorkflow Promptだけを比較する。Provider比較や一般的なモデル性能評価では
+ない。結論は事前登録したFixture、Task Prompt revision、Workflow revision、Gate、環境、
+実行時期の範囲に限定する。
+
+controlは`one_shot`、treatmentは`staged`である。両方とも次を固定する。
+
+```text
+1 run = 1 Provider turn = 1 agent call
+retry = 0
+fallback = 0
+```
+
+`one_shot`は共有Task要件と、実装・必要な確認をAgentへ委ねる指示を一つのPromptで渡す。
+詳細な作業順序は指定しない。`staged`は同じTask要件へ、調査、計画、テストの確認・追加、
+実装、自己レビューと必要な修正を加える。これらは単一turn内の論理段階であり、複数Codex
+process、multi-turn session、session resumeではない。内部の調査結果、計画、reasoning、
+agent message、stage出力は保存・評価しない。
+
+## Contracts and CLI
+
+ExperimentSpec 1.0のstrict loaderと未知field拒否は変更しない。Phase 4は独立した
+Workflow A/B Spec 2.0を使い、次で検証する。
+
+```console
+agentlab validate-workflow experiments/examples/workflow-ab.yaml
+```
+
+Spec 2.0はcomparison axis、control/treatment、固定Provider、exact model、reasoning effort、
+Task/Prompt/Workflow/Fixture revision、品質Gate、反復数、seed、Provider timeout、stop
+conditions、Artifact rootを一つのCampaign条件として保持する。Workflow別のProvider、
+model、Fixture、Gate、sandbox、network、timeout設定は存在しない。
+
+`plan-workflow`は外部AI、Provider、network、subprocess、Gateを呼ばずPlan 1.0を作る。
+task×repetition blockは`SHA-256(seed, "block", task_id, repetition)`で並べ、各block内の
+Workflow順は`SHA-256(seed, "workflow", task_id, repetition, workflow)`で決める。Pythonの
+暗黙hashは使わない。各blockはcontiguousで`one_shot`と`staged`を1件ずつ含む。
+
+canonical PlanはSpec SHA-256、Task Prompt/Fixture SHA-256、全run、run ID、初期
+`planned`状態、予定Provider call 1、revision、相対Artifact予約pathを持つ。現在時刻を
+含まないため、同一入力から同一bytesになる。作成時刻はcanonical Plan SHA-256付きの
+`*.metadata.json`へ分離する。両fileはcreate-onlyかつatomicに公開し、暗黙上書きしない。
+
+`run-workflow-campaign`はPlan順に逐次実行し、各runでsource Fixtureから独立した使い捨て
+Workspaceを作る。schedulerから`agentlab live-codex`を子process起動せず、Phase 3 core
+orchestrationを同じprocess内で再利用する。Campaign 1.0はrun前の`started`とrun後の
+terminal状態をappend-only JSONLへfsyncする。run状態は`planned`、`started`、`completed`、
+`failed`、`interrupted`、`not_run`を区別する。
+
+結果は通常成功、Quality Gate不合格、Provider失敗、Provider timeout、Harness障害、
+cleanup失敗、人間中断、stop condition未実行を固定Enumで分離する。retry、fallback、
+結果差し替え、中断Campaignのresume、並列実行は行わない。
+repositoryの`workflow-ab.yaml`はfake Provider受入専用の合成Specで、実Codex Liveへ
+使用しない。Live用Specは人間がexact model IDと非機密Promptを明示レビューした後に
+新しいPlanとして事前登録する。
+
+## Stop conditions
+
+- `fail_fast=true`: 最初のProvider失敗、Provider timeout、Quality Gate不合格後に停止する。
+- `max_failures`: Provider失敗、Provider timeout、Quality Gate不合格の累計へ適用する。
+- Harness障害、Provider process cleanup失敗、Workspace cleanup失敗: 件数によらず停止する。
+- `max_total_duration_ms`: 次run開始前にmonotonic elapsed timeを確認し、到達後は新しいrunを
+  開始しない。実行中runには個別Provider timeoutを適用する。
+- 停止後のrun: Provider call 0の`not_run`として固定停止理由を保存する。
+- `KeyboardInterrupt`/`SystemExit`: Phase 3 cleanupを維持し、実行中runを可能な範囲で
+  `interrupted`、残りを`not_run`としてCampaignへ記録してから再送出する。
+
+Provider callを開始していないrunはmanual Live試行数へ加算しない。Phase 4は自動retryや
+失敗runの置換をしない。
+
+## Live boundary
+
+Campaign全体に`--confirm-live-codex`と、Planの予定Provider call総数に一致する
+`--confirm-provider-calls`を要求する。不足または不一致ならCodex version/help preflightを
+含むsubprocessを一切起動しない。Live Campaignは通常テストやCIから実行しない。通常テストは
+短時間のfake Codex executableだけを使う。
+
+Phase 3と同じstdin Prompt、ChatGPT-managed auth、API key除外、approval `never`、
+ephemeral、workspace-write、web search無効、model-generated command network無効、
+timeout、process group回収、Provider/Gate環境分離、source Fixture保護を維持する。
+Prompt本文、raw JSONL、raw stderr、agent message、reasoning、command output、認証情報、
+ローカル絶対pathは成果物へ保存しない。Prompt SHA-256とbyte数だけをEvidence/Recordingへ
+保存する。Live対象は人間が事前レビューした非機密のTask Promptだけとする。Safe Runnerは
+事故範囲を縮小するが、OS security sandbox、完全なfilesystem/
+network隔離、CPU/memory quotaを提供しない。
+
+## Offline report
+
+`report-workflow`は保存済みPlan、Campaign、Run Evidence、Recordingだけをstrict loadする。
+Codex CLI、外部AI、network、Provider、品質Gate、Fixture変更、Prompt復元は行わない。同じ
+version付き集計modelからstrict JSONとMarkdownを生成する。
+
+Workflowごとにscheduled/attempted/completed、Gate pass/fail、Provider/Harness/cleanup/
+interrupted/not_run、4種Gate command結果、duration、agent call、retry、変更file/行数、
+Usageを集計する。各metricはdenominator、observed、missingを保持し、欠測値を0へ変換しない。
+Provider報告Tokenと推定Tokenは分離する。paired結果がなければ`not_estimable`とし、自動winner、
+有意差検定、信頼区間、leaderboardは作らない。
+
+## Non-goals and current acceptance
+
+Phase 4ではAntigravity、Provider比較、multi-language Fixture、public benchmark、dashboard、
+notebook、parallel/distributed scheduler、retry/fallback、resume、multi-turn staged、
+Prompt自動最適化、model自動選択、adaptive sampling、統計的検定、OS security sandbox、
+Phase 5以降を実装しない。
+
+offline実装とfake Provider受入後もPhase 4は`Current`である。`Complete`には別の人間の明示
+指示により、レビュー済みcommitへ事前登録した実Codex A/B（原則1 Task、両Workflow各3反復、
+最大6 Provider turns）を実行し、全run状態と最低1組のpaired結果をoffline集計する必要が
+ある。安全停止でpairが成立しなければ`Current`のままとし、失敗runを再実行しない。

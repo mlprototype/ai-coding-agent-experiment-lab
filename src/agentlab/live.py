@@ -320,12 +320,13 @@ def _validate_phase3_request(
     *,
     task_id: str,
     repetition_index: int,
+    allow_workflow_campaign: bool = False,
 ) -> None:
     if spec.execution_mode is not ExecutionMode.LIVE:
         raise LiveCodexError("execution_mode must be live")
     if spec.provider is not Provider.CODEX:
         raise LiveCodexError("Phase 3 live-codex requires provider=codex")
-    if spec.workflow is not Workflow.ONE_SHOT:
+    if spec.workflow is not Workflow.ONE_SHOT and not allow_workflow_campaign:
         raise LiveCodexError("Phase 3 live-codex supports workflow=one_shot only")
     if spec.live is None:
         raise LiveCodexError("Live settings are required")
@@ -896,6 +897,7 @@ def _recording_and_artifact(
     overall_status: LiveOverallStatus,
     failure_kind: LiveFailureKind,
     lifecycle: CodexLifecycleTracker,
+    workflow: Workflow,
 ) -> tuple[bytes, LiveRunArtifact]:
     spec = loaded_spec.spec
     assert spec.live is not None
@@ -916,7 +918,7 @@ def _recording_and_artifact(
             run_id=run_id,
             experiment_id=spec.experiment_id,
             task_id=task_id,
-            workflow=Workflow.ONE_SHOT,
+            workflow=workflow,
             provider=Provider.CODEX,
             repetition_index=repetition_index,
             execution_mode=ExecutionMode.LIVE,
@@ -968,7 +970,7 @@ def _recording_and_artifact(
             experiment_id=spec.experiment_id,
             task_id=task_id,
             repetition_index=repetition_index,
-            workflow=Workflow.ONE_SHOT,
+            workflow=workflow,
             provider=Provider.CODEX,
             execution_mode=ExecutionMode.LIVE,
             overall_status=overall_status,
@@ -1047,6 +1049,7 @@ def run_live_codex(
     force: bool = False,
     parent_environment: Mapping[str, str] | None = None,
     preflight: Callable[..., CodexPreflight] = preflight_codex,
+    _allow_workflow_campaign: bool = False,
 ) -> LiveCodexOutcome:
     """Execute one explicit Codex run; never call this from normal tests with real PATH."""
     if not confirm_live_codex:
@@ -1064,6 +1067,7 @@ def run_live_codex(
         spec,
         task_id=task_id,
         repetition_index=repetition_index,
+        allow_workflow_campaign=_allow_workflow_campaign,
     )
     assert spec.live is not None
     assert spec.runner is not None
@@ -1183,6 +1187,7 @@ def run_live_codex(
                 ),
                 failure_kind=error.failure_kind,
                 lifecycle=lifecycle,
+                workflow=spec.workflow,
             )
         except _StrictConstructionFailure as failure:
             _publish_failure_diagnostic_and_raise(
@@ -1480,6 +1485,7 @@ def run_live_codex(
             overall_status=overall_status,
             failure_kind=final_failure,
             lifecycle=lifecycle,
+            workflow=spec.workflow,
         )
     except _StrictConstructionFailure as construction_error:
         _publish_failure_diagnostic_and_raise(

@@ -39,10 +39,16 @@ WorkflowとProviderを同じSpecで同時に変更しない。複合効果を調
 
 ## Workflow実験
 
-同じProvider、課題、初期状態、品質Gateを使う。`one_shot`は要件を一度に渡す。
-`staged`は調査、計画、テスト、実装、自己レビューという段階と各段階の入出力契約を
-固定する。段階間で人間が追加判断を与えない。Workflow間で総timeoutや許可ツールが
-異なる場合は、差を事前登録して結果の制約として扱う。
+同じProvider、exact model ID、reasoning effort、課題、初期状態、品質Gate、sandbox、
+network設定、timeoutを使う。`one_shot`は共有Task要件を一度に渡し、詳細な作業順序を
+指定しない。`staged`は同じTask要件へ、調査、計画、テストの確認・追加、実装、
+自己レビューと必要な修正という固定手順だけを加える。
+
+両条件とも`1 run = 1 Provider turn = 1 agent call`である。`staged`の段階は一つのPromptと
+Provider turn内の論理段階で、複数process、複数turn、session resumeではない。段階間で
+人間の追加入力を受けない。内部の調査、計画、reasoning、agent message、stage出力は
+永続化せず、最終Workspace変更と既存の正規化Evidenceだけを評価する。Workflowごとに
+Provider、model、Fixture、Gate、sandbox、network、timeoutを変える設定は持たない。
 
 ## Provider実験
 
@@ -85,4 +91,3 @@ Phase 0は順序生成を実装せず、seedのデータ契約だけを定義す
 - Usage欠損を0とみなさない。推定値とProvider報告値を混在させない。
 - Harness障害とAgentによる課題失敗を分離する。
 - 本ベンチマーク結果から一般的なモデル性能を断定しない。
-

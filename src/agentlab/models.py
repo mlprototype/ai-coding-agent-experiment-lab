@@ -1714,14 +1714,14 @@ class LiveFailureDiagnostic(ContractModel):
 
 
 class LiveRunArtifact(ContractModel):
-    """Versioned Phase 3 Evidence with a one-way hash reference to its Recording."""
+    """Versioned Live Evidence with a one-way hash reference to its Recording."""
 
     schema_version: Literal["1.0"]
     run_id: StrictStr = Field(min_length=1)
     experiment_id: StrictStr = Field(min_length=1)
     task_id: StrictStr = Field(min_length=1)
     repetition_index: StrictInt = Field(ge=0)
-    workflow: Literal[Workflow.ONE_SHOT]
+    workflow: Workflow
     provider: Literal[Provider.CODEX]
     execution_mode: Literal[ExecutionMode.LIVE]
     overall_status: LiveOverallStatus

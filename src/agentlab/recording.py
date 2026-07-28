@@ -91,7 +91,7 @@ class LiveRunStartedEvent(ContractModel):
     run_id: StrictStr = Field(min_length=1)
     experiment_id: StrictStr = Field(min_length=1)
     task_id: StrictStr = Field(min_length=1)
-    workflow: Literal[Workflow.ONE_SHOT]
+    workflow: Workflow
     provider: Literal[Provider.CODEX]
     repetition_index: StrictInt = Field(ge=0)
     execution_mode: Literal[ExecutionMode.LIVE]
