@@ -28,6 +28,12 @@ class ReplayProvider:
     def create_result(self, recording: ReplayRecording) -> RunResult:
         started = recording.started
         completed = recording.completed
+        if completed is None:
+            assert recording.failed is not None
+            raise ReplayError(
+                "run_failed Recording cannot produce a RunResult because Metrics are absent "
+                f"({recording.failed.failure_kind.value})"
+            )
         return RunResult(
             schema_version="1.0",
             run_id=started.run_id,

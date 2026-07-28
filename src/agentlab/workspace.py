@@ -12,11 +12,20 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from agentlab.models import DiffEvidence
+from agentlab.models import DiffEvidence, WorkspaceLifecycle
 
 
 class WorkspaceError(ValueError):
     """Raised when a fixture or disposable workspace cannot be handled safely."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        lifecycle: WorkspaceLifecycle | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.lifecycle = lifecycle
 
 
 class SnapshotError(ValueError):
@@ -211,16 +220,36 @@ def _remove_temporary_root(path: Path) -> tuple[bool, str | None]:
                 "temporary workspace cleanup failed: "
                 f"{type(first_error).__name__}/{type(second_error).__name__}",
             )
+
+
+def remove_temporary_root(path: Path) -> tuple[bool, str | None]:
+    """Remove one exact temporary root using the bounded read-only recovery."""
+    return _remove_temporary_root(path)
+
+
 def prepare_disposable_workspace(
     source: Path,
     source_snapshot: DirectorySnapshot,
 ) -> DisposableWorkspace:
     """Copy a validated fixture and allocate isolated HOME/cache/temp directories."""
+    temporary_root: Path | None = None
     try:
-        temporary_root = Path(tempfile.mkdtemp(prefix="agentlab-run-")).resolve()
-    except OSError as error:
+        created_root = Path(tempfile.mkdtemp(prefix="agentlab-run-"))
+        temporary_root = created_root
+        temporary_root = created_root.resolve()
+    except (OSError, RuntimeError) as error:
+        if temporary_root is None:
+            lifecycle = WorkspaceLifecycle.NOT_CREATED
+        else:
+            removed, _cleanup_error = _remove_temporary_root(temporary_root)
+            lifecycle = (
+                WorkspaceLifecycle.REMOVED
+                if removed
+                else WorkspaceLifecycle.CLEANUP_FAILED
+            )
         raise WorkspaceError(
-            f"could not create temporary workspace: {type(error).__name__}"
+            f"could not create temporary workspace: {type(error).__name__}",
+            lifecycle=lifecycle,
         ) from error
 
     workspace = temporary_root / "workspace"
@@ -233,13 +262,25 @@ def prepare_disposable_workspace(
         for name in ("home", "tmp", "cache"):
             (environment_root / name).mkdir(parents=True, exist_ok=True)
     except (OSError, SnapshotError) as error:
-        _remove_temporary_root(temporary_root)
+        removed, _cleanup_error = _remove_temporary_root(temporary_root)
         raise WorkspaceError(
-            f"could not prepare disposable workspace: {type(error).__name__}: {error}"
+            f"could not prepare disposable workspace: {type(error).__name__}: {error}",
+            lifecycle=(
+                WorkspaceLifecycle.REMOVED
+                if removed
+                else WorkspaceLifecycle.CLEANUP_FAILED
+            ),
         ) from error
-    except WorkspaceError:
-        _remove_temporary_root(temporary_root)
-        raise
+    except WorkspaceError as error:
+        removed, _cleanup_error = _remove_temporary_root(temporary_root)
+        raise WorkspaceError(
+            str(error),
+            lifecycle=(
+                WorkspaceLifecycle.REMOVED
+                if removed
+                else WorkspaceLifecycle.CLEANUP_FAILED
+            ),
+        ) from error
 
     return DisposableWorkspace(
         temporary_root=temporary_root,

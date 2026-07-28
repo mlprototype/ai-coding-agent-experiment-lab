@@ -58,6 +58,17 @@ def test_validate_accepts_example() -> None:
     assert "valid ExperimentSpec" in result.stdout
 
 
+def test_validate_accepts_phase3_live_example() -> None:
+    result = runner.invoke(
+        app,
+        ["validate", "experiments/examples/codex-live-smoke.yaml"],
+    )
+
+    assert result.exit_code == 0
+    assert "codex-live-smoke" in result.stdout
+    assert "mode=live" in result.stdout
+
+
 def test_validate_rejects_invalid_spec_with_nonzero_exit(tmp_path: Path) -> None:
     invalid_path = tmp_path / "invalid.yaml"
     example = yaml.safe_load(
@@ -228,6 +239,41 @@ def test_run_gates_cli_requires_confirmation_without_spawning(
     assert result.exit_code == 2
     assert "confirm-execution" in result.stderr
     assert "Traceback" not in result.output
+    assert not output.exists()
+
+
+def test_live_codex_cli_requires_confirmation_before_any_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "live-evidence.json"
+
+    def blocked_subprocess(*_args: object, **_kwargs: object) -> NoReturn:
+        raise AssertionError("Live confirmation must be checked before preflight")
+
+    monkeypatch.setattr(subprocess, "run", blocked_subprocess)
+    monkeypatch.setattr(subprocess, "Popen", blocked_subprocess)
+    result = runner.invoke(
+        app,
+        [
+            "live-codex",
+            "experiments/examples/codex-live-smoke.yaml",
+            "--task-id",
+            "codex-live-smoke",
+            "--repetition-index",
+            "0",
+            "--run-id",
+            "codex-live-smoke-001",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "confirm-live-codex" in result.stderr
+    assert "Traceback" not in result.output
+    assert "raw Prompt persisted: no" in result.stdout
+    assert "raw Codex JSONL persisted: no" in result.stdout
     assert not output.exists()
 
 

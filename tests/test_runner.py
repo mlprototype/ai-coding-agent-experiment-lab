@@ -9,6 +9,7 @@ from typing import Any, NoReturn
 
 import pytest
 
+import agentlab.runner as runner_module
 from agentlab.models import (
     CommandStatus,
     FailureKind,
@@ -206,6 +207,57 @@ def test_output_selector_failure_is_collection_error(
     assert result.evidence.status is not CommandStatus.SPAWN_ERROR
     assert "output selector failed: OSError" in (result.evidence.error or "")
     assert result.harness_failure is FailureKind.EVIDENCE_ERROR
+
+
+def test_unexpected_collection_exception_cleans_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selector_factory = runner_module.selectors.DefaultSelector
+    popen = runner_module.subprocess.Popen
+    spawned_pids: list[int] = []
+
+    class UnexpectedCollectionSelector:
+        def __init__(self) -> None:
+            self._selector = selector_factory()
+
+        def register(self, *args: object, **kwargs: object):
+            return self._selector.register(*args, **kwargs)
+
+        def unregister(self, *args: object, **kwargs: object):
+            return self._selector.unregister(*args, **kwargs)
+
+        def get_map(self):
+            return self._selector.get_map()
+
+        def select(self, _timeout: float):
+            raise RuntimeError("synthetic unexpected collection failure")
+
+        def close(self) -> None:
+            self._selector.close()
+
+    def track_spawn(*args: object, **kwargs: object):
+        process = popen(*args, **kwargs)
+        spawned_pids.append(process.pid)
+        return process
+
+    monkeypatch.setattr(
+        "agentlab.runner.selectors.DefaultSelector",
+        UnexpectedCollectionSelector,
+    )
+    monkeypatch.setattr("agentlab.runner.subprocess.Popen", track_spawn)
+
+    result = _run(
+        tmp_path,
+        [sys.executable, "-c", "import signal; signal.pause()"],
+    )
+
+    assert len(spawned_pids) == 1
+    assert result.evidence.status is CommandStatus.COLLECTION_ERROR
+    assert result.harness_failure is FailureKind.EVIDENCE_ERROR
+    assert result.evidence.termination.process_group_cleared is True
+    with pytest.raises(ProcessLookupError):
+        os.kill(spawned_pids[0], 0)
 
 
 def test_large_stdout_and_stderr_are_drained_and_truncated(tmp_path: Path) -> None:

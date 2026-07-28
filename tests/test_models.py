@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from agentlab.models import (
     CapabilityReport,
     ExperimentSpec,
+    LiveSettings,
     RunMetrics,
     RunnerSettings,
     RunResult,
@@ -24,6 +25,103 @@ def test_valid_experiment_spec_can_be_loaded(
 
     assert spec.experiment_id == "workflow-smoke"
     assert spec.comparison_axis.value == "workflow"
+
+
+def test_phase0_live_settings_remain_backward_compatible(
+    valid_spec_data: Callable[[], dict[str, Any]],
+) -> None:
+    data = valid_spec_data()
+    data.update(
+        execution_mode="live",
+        replay=None,
+        live={
+            "record_to": "recordings/legacy-live.jsonl",
+            "require_explicit_confirmation": True,
+        },
+    )
+
+    spec = ExperimentSpec.model_validate(data)
+
+    assert spec.live is not None
+    assert spec.live.prompt_path is None
+
+
+def test_phase3_live_settings_are_strict_and_complete() -> None:
+    settings = {
+        "record_to": "recordings/live.jsonl",
+        "diagnostic_to": "diagnostics/live-failure.json",
+        "prompt_path": "prompts/task.md",
+        "model": "gpt-test-fixed",
+        "reasoning_effort": "high",
+        "provider_timeout_ms": 600000,
+        "max_prompt_bytes": 65536,
+        "max_event_line_bytes": 1048576,
+        "max_provider_output_bytes": 16777216,
+        "require_explicit_confirmation": True,
+    }
+
+    parsed = ExperimentSpec.model_validate(
+        {
+            "schema_version": "1.0",
+            "experiment_id": "live-test",
+            "title": "Live",
+            "research_question": "Can it run?",
+            "hypothesis": "It can.",
+            "comparison_axis": "workflow",
+            "workflow": "one_shot",
+            "provider": "codex",
+            "control": "one_shot",
+            "treatments": ["staged"],
+            "fixed_factors": {},
+            "task_ids": ["task"],
+            "repetitions": 1,
+            "random_seed": 1,
+            "quality_gate": {"acceptance": [["python3", "check.py"]]},
+            "stop_conditions": {},
+            "execution_mode": "live",
+            "live": settings,
+        }
+    )
+
+    assert parsed.live is not None
+    assert parsed.live.provider_timeout_ms == 600000
+    assert parsed.live.diagnostic_to == "diagnostics/live-failure.json"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("prompt_path", "../secret.md"),
+        ("record_to", "/tmp/live.jsonl"),
+        ("diagnostic_to", "../diagnostics/live.json"),
+        ("model", "latest"),
+        ("model", "gpt-5-latest"),
+        ("provider_timeout_ms", "600000"),
+        ("max_prompt_bytes", 0),
+        ("max_provider_output_bytes", 1024),
+        ("require_explicit_confirmation", 1),
+        ("require_explicit_confirmation", False),
+    ],
+)
+def test_phase3_live_settings_reject_unsafe_or_coerced_values(
+    field: str,
+    value: object,
+) -> None:
+    data: dict[str, object] = {
+        "record_to": "recordings/live.jsonl",
+        "prompt_path": "prompts/task.md",
+        "model": "gpt-test-fixed",
+        "reasoning_effort": "high",
+        "provider_timeout_ms": 600000,
+        "max_prompt_bytes": 65536,
+        "max_event_line_bytes": 1048576,
+        "max_provider_output_bytes": 16777216,
+        "require_explicit_confirmation": True,
+    }
+    data[field] = value
+
+    with pytest.raises(ValidationError):
+        LiveSettings.model_validate(data)
 
 
 def test_provider_comparison_can_be_loaded(

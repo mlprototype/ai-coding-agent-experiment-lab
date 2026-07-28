@@ -10,8 +10,8 @@
 
 ## Provider and execution safety
 
-- Live Providerを通常テストやCIから呼び出さない。Provider経路の通常テストはReplayを
-  使い、Runner統合テストは短時間の合成local helperだけを使う。
+- Live Providerを通常テストやCIから呼び出さない。Provider経路の通常テストはReplay
+  または短時間のfake executableを使い、Runner統合テストも合成local helperだけを使う。
 - Phase 1 Replayから外部AI、network、subprocess、品質Gateコマンドを呼び出さない。
 - 相対的なRecording pathはExperimentSpecファイルの親directoryを基準に解決する。
 - 合成RecordingをProvider性能の実験結果として扱わない。
@@ -30,6 +30,16 @@
 - signal終了、timeout、spawn、process回収、Evidence収集のHarness障害を品質不合格へ
   変換しない。
 - Phase 2 Safe Runnerをsecurity sandbox、network隔離、完全なfilesystem隔離と表現しない。
+- 通常テストとCIでLive Providerを呼ばず、短時間のfake executableだけを使う。
+- Live Codexは`--confirm-live-codex`による明示確認を必須とする。
+- 実装agentから実Codex CLIを再帰的に起動しない。version/helpのread-only確認だけを
+  preflightとして許可する。
+- Prompt本文をargv、Recording、Evidenceへ保存せず、stdinからだけ渡す。
+- raw Codex JSONL、raw stderr、agent message、reasoning、command outputを保存しない。
+- `OPENAI_API_KEY`と`CODEX_API_KEY`をProvider processへ渡さない。
+- Codex processとGate processの環境を分離し、Gateへ`CODEX_HOME`を渡さない。
+- Provider失敗、Gate通常不合格、Harness障害を異なるfailure kindとして扱う。
+- 実Codex Live smokeはレビュー後に手動で1回ずつ実行し、通常CIへ追加しない。
 
 ## Data and security
 
@@ -57,12 +67,14 @@ uv run mypy src
 uv run agentlab doctor --json
 uv run agentlab validate experiments/examples/workflow-smoke.yaml
 uv run agentlab replay experiments/examples/workflow-smoke.yaml \
-  --output .artifacts/runs/workflow-smoke-run-001.json
+  --output .artifacts/runs/workflow-smoke-run-001.json \
+  --force
 uv run agentlab run-gates experiments/examples/workflow-smoke.yaml \
   --task-id smoke-task \
   --run-id phase2-runner-smoke-001 \
   --output .artifacts/evidence/phase2-runner-smoke-001.json \
-  --confirm-execution
+  --confirm-execution \
+  --force
 ```
 
 - 完了時は変更ファイル、実行したテストと結果、未完了事項、環境制約を報告する。

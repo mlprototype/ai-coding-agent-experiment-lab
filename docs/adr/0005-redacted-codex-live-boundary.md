@@ -1,0 +1,47 @@
+# ADR 0005: Codex Liveは正規化summaryだけをRecordする
+
+- Status: Accepted
+- Date: 2026-07-26
+
+## Context
+
+Codex CLIへ渡すPrompt、JSONL event、stderr、agent message、reasoning、command outputには、
+実験に不要な機密情報、認証状態、session識別子、長大なpayloadが含まれうる。一方、
+再現性には実行条件、lifecycle、Usage、終了状態、品質Gate、diffの証跡が必要である。
+ProviderとGateが同じ親環境を継承すると、CLI認証情報が評価commandへ漏れる。
+
+## Decision
+
+Promptは通常fileから一度だけ読みstdinで渡し、本文を永続化対象へ入れない。SHA-256、
+UTF-8 byte数、redacted flagだけを保存する。Codex JSONLは上限付きで逐次parseし、raw
+payloadを破棄してevent件数、unknown件数、item type件数、terminal Usageだけを
+CodexExecutionEvidenceへ正規化する。thread/turn/terminalの各件数も保存し、総event数と
+照合する。raw stdout/stderr、thread/session IDは保存しない。
+
+Phase 3の認証は既存Codex CLIのChatGPT-managed authだけを対象とする。API keyを継承せず、
+auth fileをcopy/parseしない。Codex processにだけ明示された絶対pathかつ既存directoryの
+`CODEX_HOME`を渡し、暗黙fallbackしない。Gateは
+Phase 2 allowlist環境と別の一時HOME/TMP/cacheで起動する。
+
+実Codex smokeは通常テスト/CIから分離し、レビュー後の明示確認で1回だけ行う。通常テスト
+はfake executableだけを使う。
+
+現行の`codex exec`には`--ask-for-approval`がない。headless実装の初期`Never`は、解決後の
+`approvals_reviewer`に応じたconfig再構築で維持されない場合があるため、内部既定へ依存
+しない。`--config approval_policy="never"`を明示する契約を
+`headless_exec_explicit_never_v2` profileとして固定し、対応CLI versionをallowlistする。
+Evidenceへprofile、CLI version、`explicit_config_never`のapproval根拠を保存する。
+preflight未完了、preflight完了、Provider起動試行済みをexecution stageで分離する。
+preflight未完了時はprofileを`not_selected`とし、policy/basisをnullにする。選択完了後も
+Provider起動試行前はprofile/version/flagだけを保持し、policy/basisはnullにする。argvを
+使った起動試行時だけ`never`と根拠を記録する。将来別の設定方法やCLI versionへ対応する
+場合は新しいprofileを追加し、既存profileの意味を変更しない。
+
+## Consequences
+
+- Promptやraw eventから過剰な機密情報をArtifactへ持ち込まない。
+- Recording 1.1をoffline Replayできるが、agentの会話やreasoning自体は再現しない。
+- Provider schema追加は未知event件数として許容し、core lifecycle破壊だけをfail closed
+  できる。
+- ChatGPT-managed authがない環境や必須CLI flag不足ではLive実行できない。
+- Codex model API通信は必要であり、OS-levelの完全なnetwork遮断は保証しない。

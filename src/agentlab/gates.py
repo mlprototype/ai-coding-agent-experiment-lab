@@ -64,6 +64,24 @@ class GateRunOutcome:
     output_path: Path
 
 
+@dataclass(frozen=True)
+class GateExecutionResult:
+    commands: list[CommandEvidence]
+    evaluation_duration_ms: int
+    harness_failure: FailureKind | None
+    harness_detail: str | None
+
+
+@dataclass
+class GateExecutionTracker:
+    """Monotonic observation of whether any Gate command invocation was attempted."""
+
+    gate_executed: bool = False
+
+    def mark_command_invocation_attempted(self) -> None:
+        self.gate_executed = True
+
+
 class _DuplicateEvidenceKeyError(ValueError):
     pass
 
@@ -220,6 +238,65 @@ def _command_groups(spec: ExperimentSpec) -> tuple[tuple[GateKind, list[list[str
     )
 
 
+def execute_quality_gates_in_workspace(
+    spec: ExperimentSpec,
+    *,
+    workspace: Path,
+    environment_root: Path,
+    temporary_root: Path,
+    execution_tracker: GateExecutionTracker | None = None,
+) -> GateExecutionResult:
+    """Run only Phase 2 Gate argv inside an already-prepared disposable Workspace."""
+    assert spec.runner is not None
+    ensure_runner_platform_supported()
+    local_runner = LocalCommandRunner(spec.runner)
+    tracker = (
+        GateExecutionTracker()
+        if execution_tracker is None
+        else execution_tracker
+    )
+    commands: list[CommandEvidence] = []
+    harness_failure: FailureKind | None = None
+    harness_detail: str | None = None
+    gate_started = time.monotonic()
+    try:
+        should_stop = False
+        for gate, configured_commands in _command_groups(spec):
+            for command_index, argv in enumerate(configured_commands):
+                tracker.mark_command_invocation_attempted()
+                result = local_runner.run(
+                    gate=gate,
+                    command_index=command_index,
+                    argv=argv,
+                    workspace=workspace,
+                    environment_root=environment_root,
+                    temporary_root=temporary_root,
+                )
+                commands.append(result.evidence)
+                if result.harness_failure is not None:
+                    harness_failure = result.harness_failure
+                    harness_detail = (
+                        result.evidence.error
+                        or result.evidence.termination.error
+                        or result.harness_failure.value
+                    )
+                    should_stop = True
+                    break
+            if should_stop:
+                break
+    finally:
+        evaluation_duration_ms = max(
+            0,
+            int((time.monotonic() - gate_started) * 1000),
+        )
+    return GateExecutionResult(
+        commands=commands,
+        evaluation_duration_ms=evaluation_duration_ms,
+        harness_failure=harness_failure,
+        harness_detail=harness_detail,
+    )
+
+
 def _execute_in_workspace(
     *,
     spec: ExperimentSpec,
@@ -247,37 +324,16 @@ def _execute_in_workspace(
             harness_failure = FailureKind.UNSUPPORTED_PLATFORM
             harness_detail = str(error)
         else:
-            local_runner = LocalCommandRunner(spec.runner)
-            gate_started = time.monotonic()
-            try:
-                should_stop = False
-                for gate, configured_commands in _command_groups(spec):
-                    for command_index, argv in enumerate(configured_commands):
-                        result = local_runner.run(
-                            gate=gate,
-                            command_index=command_index,
-                            argv=argv,
-                            workspace=workspace.workspace,
-                            environment_root=workspace.environment_root,
-                            temporary_root=workspace.temporary_root,
-                        )
-                        commands.append(result.evidence)
-                        if result.harness_failure is not None:
-                            harness_failure = result.harness_failure
-                            harness_detail = (
-                                result.evidence.error
-                                or result.evidence.termination.error
-                                or result.harness_failure.value
-                            )
-                            should_stop = True
-                            break
-                    if should_stop:
-                        break
-            finally:
-                evaluation_duration_ms = max(
-                    0,
-                    int((time.monotonic() - gate_started) * 1000),
-                )
+            gate_result = execute_quality_gates_in_workspace(
+                spec,
+                workspace=workspace.workspace,
+                environment_root=workspace.environment_root,
+                temporary_root=workspace.temporary_root,
+            )
+            commands = gate_result.commands
+            evaluation_duration_ms = gate_result.evaluation_duration_ms
+            harness_failure = gate_result.harness_failure
+            harness_detail = gate_result.harness_detail
 
         try:
             final_snapshot = snapshot_directory(workspace.workspace)

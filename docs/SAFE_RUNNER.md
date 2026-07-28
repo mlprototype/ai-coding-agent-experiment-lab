@@ -90,7 +90,9 @@ command Evidenceはgate、group内index、argv、status、return code、UTC時�
 stdout/stderr、truncation、decode置換、termination結果を保持する。statusは`passed`、
 `failed`、`timed_out`、`signal_terminated`、`spawn_error`、`collection_error`である。
 `collection_error`は起動後のselector、pipe drainなどのEvidence収集障害であり、
-commandを起動できなかった`spawn_error`とは分離する。
+commandを起動できなかった`spawn_error`とは分離する。Popen成功後の未知例外も
+緊急cleanup境界でprocess groupを回収して`collection_error`へ変換する。Evidence収集と
+process回収が同時に失敗した場合は`process_cleanup_error`を優先する。
 
 Artifactはrun/experiment/task ID、Spec SHA-256、初期Fixture SHA-256、Runner設定、
 command配列、diff、overall status、failure kind、任意RunMetricsを保持する。Specは

@@ -11,6 +11,35 @@ RunResultを再構成するためのUTF-8 JSONL契約である。1行が1個のJ
 Phase 1で扱うeventは`run_started`と`run_completed`の2件だけである。途中event、tool
 call、stdout/stderr、diff、EvidenceはPhase 1の契約に含めない。
 
+Phase 3は既存1.0を変更せず、redaction済みLive Recording 1.1を追加する。1.1も2イベント
+だけで、開始後は成功なら`run_completed`、Metricsを生成できない失敗なら`run_failed`
+を持つ。Prompt本文、raw Provider JSONL、stderr、agent message、reasoning、command、
+file content、thread/session IDは含めない。
+
+## Live Recording 1.1
+
+`run_started`は既存ID/条件/時刻に加え、`execution_mode=live`、Prompt SHA-256とbyte数、
+`prompt_redacted=true`、requested model/reasoning effort、CLI versionを保持する。
+
+`run_completed`はProviderと全Gateが必要なEvidenceを残した場合に、Phase 3 RunMetrics、
+redaction済みCodexExecutionEvidence 1.1（profile選択とProvider起動試行を分けるstageを
+含む）、Gate種別ごとのcommand/pass/fail件数、
+evaluation duration、diff/Workspace lifecycle summaryを保持する。品質Gate通常不合格でも
+Metricsを生成できるためcompletedである。loaderはこのsummaryとMetricsを照合する。
+
+`run_failed`はfailure kind、redaction済みCodexExecutionEvidence、同じ評価summaryを保持し、
+`metrics_included=false`とする。Provider失敗、timeout、protocol/output上限、
+process/Gate Harness、diff/cleanup不完全を品質結果へ変換しない。
+loaderは`preflight_not_completed`と`workspace_lifecycle=not_created`、
+`provider_invocation_attempted`と作成済みWorkspaceの対応も検証する。
+
+1.1の開始、Provider、終了時刻はtimezone-aware UTCとし、開始条件のmodel、
+reasoning effort、CLI versionはterminal Codex Evidenceと一致しなければならない。
+
+1.1の成功記録は既存Replay経路で保存済みMetricsからRunResultを作る。Replay中にCodex、
+subprocess、network、Gateを呼ばない。`run_failed`はMetricsがないため、failure kindを
+示してReplay Result生成を拒否する。RunResultの`execution_mode`は`replay`のままである。
+
 ## `run_started`
 
 | Field | Type | 意味 |

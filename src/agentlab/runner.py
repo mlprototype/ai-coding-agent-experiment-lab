@@ -385,6 +385,38 @@ def _append_collection_error(existing: str | None, detail: str) -> str:
     return detail if existing is None else f"{existing}; {detail}"
 
 
+def process_group_exists(process_group_id: int) -> tuple[bool, str | None]:
+    """Expose the Phase 2 process-group inspection contract to Provider runners."""
+    return _group_exists(process_group_id)
+
+
+def terminate_process_group(
+    process: subprocess.Popen[bytes],
+    *,
+    reason: TerminationReason,
+    grace_seconds: float,
+    drain: Callable[[float], None],
+) -> TerminationEvidence:
+    """Use the same bounded SIGTERM/SIGKILL policy for Gate and Provider processes."""
+    return _terminate_process_group(
+        process,
+        reason=reason,
+        grace_seconds=grace_seconds,
+        drain=drain,
+    )
+
+
+def termination_without_signal() -> TerminationEvidence:
+    return _termination_without_signal()
+
+
+def merge_termination_error(
+    termination: TerminationEvidence,
+    error: str,
+) -> TerminationEvidence:
+    return _merge_termination_error(termination, error)
+
+
 class LocalCommandRunner:
     """Execute one already-validated argv in a disposable workspace."""
 
@@ -400,12 +432,16 @@ class LocalCommandRunner:
         workspace: Path,
         environment_root: Path,
         temporary_root: Path,
+        parent_environment: Mapping[str, str] | None = None,
     ) -> CommandRunResult:
         ensure_runner_platform_supported()
         command = list(argv)
         started_at = datetime.now(UTC)
         started_monotonic = time.monotonic()
-        child_environment = build_child_environment(environment_root)
+        child_environment = build_child_environment(
+            environment_root,
+            parent_environment=parent_environment,
+        )
 
         try:
             process = subprocess.Popen(
@@ -457,6 +493,12 @@ class LocalCommandRunner:
         internal_error: str | None = None
         termination = _termination_without_signal()
         return_code: int | None = None
+
+        def emergency_drain(timeout: float) -> None:
+            if drainer is not None:
+                with suppress(Exception):
+                    drainer.drain(timeout)
+
         try:
             drainer = _PipeDrainer(
                 process.stdout,
@@ -529,25 +571,53 @@ class LocalCommandRunner:
                 )
             if drainer.error is not None:
                 internal_error = _append_collection_error(internal_error, drainer.error)
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
+        except Exception as error:
             internal_error = f"runner collection failed: {type(error).__name__}"
             termination = _terminate_process_group(
                 process,
                 reason=TerminationReason.EMERGENCY_CLEANUP,
                 grace_seconds=self._settings.termination_grace_ms / 1000,
-                drain=(drainer.drain if drainer is not None else lambda _timeout: None),
+                drain=emergency_drain,
             )
             return_code = process.poll()
         finally:
             if drainer is not None:
-                drainer.close()
+                try:
+                    drainer.close()
+                except Exception as error:
+                    internal_error = _append_collection_error(
+                        internal_error,
+                        f"runner pipe cleanup failed: {type(error).__name__}",
+                    )
             else:
-                process.stdout.close()
-                process.stderr.close()
+                for stream in (process.stdout, process.stderr):
+                    try:
+                        stream.close()
+                    except Exception as error:
+                        internal_error = _append_collection_error(
+                            internal_error,
+                            f"runner pipe cleanup failed: {type(error).__name__}",
+                        )
 
         completed_at = datetime.now(UTC)
         harness_failure: FailureKind | None
-        if internal_error is not None:
+        if not termination.process_group_cleared:
+            status = (
+                CommandStatus.COLLECTION_ERROR
+                if internal_error is not None
+                else (
+                    CommandStatus.TIMED_OUT
+                    if timed_out
+                    else CommandStatus.SIGNAL_TERMINATED
+                    if return_code is not None and return_code < 0
+                    else CommandStatus.PASSED
+                    if return_code == 0
+                    else CommandStatus.FAILED
+                )
+            )
+            evidence_return_code = return_code
+            harness_failure = FailureKind.PROCESS_CLEANUP_ERROR
+        elif internal_error is not None:
             status = CommandStatus.COLLECTION_ERROR
             evidence_return_code = return_code
             harness_failure = FailureKind.EVIDENCE_ERROR

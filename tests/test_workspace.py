@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
+from agentlab.models import WorkspaceLifecycle
 from agentlab.workspace import (
     SnapshotError,
     WorkspaceError,
@@ -42,6 +44,146 @@ def test_fixture_is_copied_and_source_is_not_modified(tmp_path: Path) -> None:
     assert removed is True
     assert error is None
     assert not temporary_root.exists()
+
+
+def test_prepare_failure_reports_removed_workspace_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture = _fixture_case(tmp_path)
+    source, source_snapshot = validate_fixture_source(spec_path, "fixtures/sample")
+    temporary_root = tmp_path / "controlled-run-root"
+    temporary_root.mkdir()
+
+    monkeypatch.setattr(
+        "agentlab.workspace.tempfile.mkdtemp",
+        lambda **_kwargs: str(temporary_root),
+    )
+
+    def fail_copy(*_args: object, **_kwargs: object) -> NoReturn:
+        raise PermissionError("synthetic copy failure")
+
+    monkeypatch.setattr("agentlab.workspace.shutil.copytree", fail_copy)
+
+    with pytest.raises(WorkspaceError) as error:
+        prepare_disposable_workspace(source, source_snapshot)
+
+    assert error.value.lifecycle is WorkspaceLifecycle.REMOVED
+    assert not temporary_root.exists()
+
+
+def test_workspace_creation_failure_reports_not_created(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture = _fixture_case(tmp_path)
+    source, source_snapshot = validate_fixture_source(spec_path, "fixtures/sample")
+
+    def fail_create(*_args: object, **_kwargs: object) -> NoReturn:
+        raise PermissionError("synthetic create failure")
+
+    monkeypatch.setattr("agentlab.workspace.tempfile.mkdtemp", fail_create)
+
+    with pytest.raises(WorkspaceError) as error:
+        prepare_disposable_workspace(source, source_snapshot)
+
+    assert error.value.lifecycle is WorkspaceLifecycle.NOT_CREATED
+
+
+def test_workspace_resolve_failure_removes_created_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture = _fixture_case(tmp_path)
+    source, source_snapshot = validate_fixture_source(spec_path, "fixtures/sample")
+    temporary_root = tmp_path / "unresolved-run-root"
+    resolve = Path.resolve
+
+    monkeypatch.setattr(
+        "agentlab.workspace.tempfile.mkdtemp",
+        lambda **_kwargs: str(temporary_root.mkdir() or temporary_root),
+    )
+
+    def fail_created_root_resolve(
+        path: Path,
+        strict: bool = False,
+    ) -> Path:
+        if path == temporary_root:
+            raise OSError("synthetic workspace root resolve failure")
+        return resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", fail_created_root_resolve)
+
+    with pytest.raises(WorkspaceError) as error:
+        prepare_disposable_workspace(source, source_snapshot)
+
+    assert error.value.lifecycle is WorkspaceLifecycle.REMOVED
+    assert not temporary_root.exists()
+
+
+def test_workspace_resolve_and_cleanup_failure_reports_cleanup_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture = _fixture_case(tmp_path)
+    source, source_snapshot = validate_fixture_source(spec_path, "fixtures/sample")
+    temporary_root = tmp_path / "unresolved-uncleaned-run-root"
+    resolve = Path.resolve
+
+    monkeypatch.setattr(
+        "agentlab.workspace.tempfile.mkdtemp",
+        lambda **_kwargs: str(temporary_root.mkdir() or temporary_root),
+    )
+
+    def fail_created_root_resolve(
+        path: Path,
+        strict: bool = False,
+    ) -> Path:
+        if path == temporary_root:
+            raise OSError("synthetic workspace root resolve failure")
+        return resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", fail_created_root_resolve)
+    monkeypatch.setattr(
+        "agentlab.workspace._remove_temporary_root",
+        lambda _path: (False, "synthetic cleanup failure"),
+    )
+
+    with pytest.raises(WorkspaceError) as error:
+        prepare_disposable_workspace(source, source_snapshot)
+
+    assert error.value.lifecycle is WorkspaceLifecycle.CLEANUP_FAILED
+    assert temporary_root.is_dir()
+    temporary_root.rmdir()
+
+
+def test_prepare_cleanup_failure_reports_cleanup_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec_path, _fixture = _fixture_case(tmp_path)
+    source, source_snapshot = validate_fixture_source(spec_path, "fixtures/sample")
+    temporary_root = tmp_path / "uncleaned-run-root"
+    temporary_root.mkdir()
+    monkeypatch.setattr(
+        "agentlab.workspace.tempfile.mkdtemp",
+        lambda **_kwargs: str(temporary_root),
+    )
+
+    def fail_copy(*_args: object, **_kwargs: object) -> NoReturn:
+        raise PermissionError("synthetic copy failure")
+
+    monkeypatch.setattr("agentlab.workspace.shutil.copytree", fail_copy)
+    monkeypatch.setattr(
+        "agentlab.workspace._remove_temporary_root",
+        lambda _path: (False, "synthetic cleanup failure"),
+    )
+
+    with pytest.raises(WorkspaceError) as error:
+        prepare_disposable_workspace(source, source_snapshot)
+
+    assert error.value.lifecycle is WorkspaceLifecycle.CLEANUP_FAILED
+    temporary_root.rmdir()
 
 
 def test_root_symlink_is_rejected(tmp_path: Path) -> None:

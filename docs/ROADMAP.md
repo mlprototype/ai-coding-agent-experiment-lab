@@ -32,7 +32,7 @@ Recording。
 
 ## Phase 2: Safe Runner, Evidence and Quality Gate
 
-**Status: Current**
+**Status: Complete**
 
 **目的:** 信頼済みFixtureを使い捨てWorkspaceで実行し、変更と品質Gateの証跡を
 Harness障害と品質不合格を混同せず収集する。
@@ -50,15 +50,26 @@ Evidence不完全ではMetricsを生成しない。Phase 1 Replayのbyte決定�
 
 ## Phase 3: Codex CLI Provider
 
-**Status: Planned**
+**Status: Complete**
 
 **目的:** Codex CLIを共通Provider境界へ接続し、安全なLive Recordを実現する。
 
-**成果物:** Codex adapter、能力/版のpreflight、Prompt入力、構造化event変換、
-redaction付きrecording、明示的Live opt-in。
+**成果物:** Codex adapter、能力/版のread-only preflight、stdin Prompt、incremental
+JSONL parser、Provider process tree停止、正規化Codex Evidence、redaction済みRecording
+1.1、Live Evidence、成功RecordingのReplay、明示的Live opt-in、strict paired成果物を
+構築できない場合の独立Failure Diagnostic、fake CLI offline test。
 
 **受入条件:** 手動の隔離環境で一つのfixtureを実行・Recordでき、その記録をReplayして
-同じ正規化eventを得る。認証情報や機密Promptを成果物へ保存しない。通常CIは呼ばない。
+同じ正規化結果を得る。認証情報や機密Promptを成果物へ保存せず、通常CIからLiveを呼ばない。
+manual Liveは累計8試行である。006はProvider起動後の`model_access`境界、007は
+`inconclusive_prompt_delivery_failure`として履歴を保持し、成功へ変更しない。008は人間が
+selectable catalogから明示選択した`gpt-5.6-sol`をcommit
+`cc97e53bf0bac426b08346f63e6f527ed7d5be9e`のAgentLab製品経路で1回実行した。agent call 1、
+retry／fallback 0、Provider exit 0、`turn.completed` 1件、`turn.failed` 0件で、
+`task.txt`だけを期待どおり変更した。4種類のQuality Gateは全PASSし、Evidence 1.5／
+Recording 1.1のstrict再読込、offline Replay、Metrics一致、redaction、process group／
+Workspace cleanupを確認した。これによりPhase 3の最小vertical slice受入を完了した。
+この結果は一般的なモデル性能やProvider比較を示さず、Phase 4はPlannedのまま未着手である。
 
 ## Phase 4: Workflow A/B Experiment
 

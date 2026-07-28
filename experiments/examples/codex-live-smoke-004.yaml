@@ -1,0 +1,49 @@
+schema_version: "1.0"
+experiment_id: codex-live-smoke
+title: Synthetic Codex live vertical-slice smoke
+research_question: Can the redacted Codex Provider pipeline edit and evaluate one tiny fixture?
+hypothesis: A manually confirmed one-shot run can produce replayable redacted Evidence.
+comparison_axis: workflow
+workflow: one_shot
+provider: codex
+control: one_shot
+treatments:
+  - staged
+fixed_factors:
+  fixture_revision: synthetic-phase3-v1
+  provider_harness: codex-cli-phase3
+task_ids:
+  - codex-live-smoke
+repetitions: 1
+random_seed: 3103
+quality_gate:
+  acceptance:
+    - [python3, check.py, acceptance]
+  regression:
+    - [python3, check.py, regression]
+  lint:
+    - [python3, check.py, lint]
+  typecheck:
+    - [python3, check.py, typecheck]
+stop_conditions:
+  max_failures: 1
+  max_total_duration_ms: 900000
+  fail_fast: false
+execution_mode: live
+live:
+  record_to: .artifacts/recordings/codex-live-smoke-004.jsonl
+  diagnostic_to: .artifacts/diagnostics/codex-live-smoke-004.json
+  prompt_path: prompts/codex-live-smoke.md
+  model: gpt-5.6
+  reasoning_effort: high
+  provider_timeout_ms: 600000
+  max_prompt_bytes: 65536
+  max_event_line_bytes: 1048576
+  max_provider_output_bytes: 16777216
+  require_explicit_confirmation: true
+runner:
+  fixture_path: fixtures/codex-live-smoke
+  command_timeout_ms: 10000
+  termination_grace_ms: 1000
+  max_output_bytes: 65536
+  max_diff_bytes: 1048576
