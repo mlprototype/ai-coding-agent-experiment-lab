@@ -17,8 +17,12 @@ Antigravity CLI / Replay Provider）は分離します。一度に変える独�
 ## 現在の状態
 
 Phase 0〜3を完了しました。**Phase 4: Workflow A/B Experiment** はCurrentです。
-offline実装とfake Codexによる受入を完了し、レビュー済みcommitに対する事前登録済みの
-実Codex Live A/B受入は未実施です。Phase 4までに次を提供します。
+offline実装とfake Codexによる受入を完了し、レビュー済みcommit
+`2abd653a7b42f8932c0005e6d7d3fdd1252845e0`に対する事前登録済みの実Codex Live A/B
+Campaignを2026-07-28に1回だけ実行しました。予定6 run／6 Provider callsに対し、最初の
+`staged` runを1回／1 call実行後、`harness_failure`で安全停止し、残り5 runは
+`not_run`です。complete pairは0、reportは`not_estimable`なのでPhase 4はCurrentのままです。
+Phase 4までに次を提供します。
 
 - バージョン付きExperimentSpec、RunMetrics、UsageMetrics、CapabilityReport
 - YAML Specの検証
@@ -54,9 +58,9 @@ agent callは1、retry／fallbackは0で、`turn.completed` 1件、Provider exit
 `task.txt`の期待した1行変更、4種類のQuality Gate全PASS、Evidence 1.5／Recording 1.1の
 strict再読込、redaction、process／Workspace cleanup、成功Recordingのoffline Replay、
 Replay Metrics一致を確認しました。この最小vertical sliceの結果は、一般的なモデル性能や
-Provider比較結果を示すものではありません。Phase 4のoffline成果物も合成fake Providerの
-受入証跡であり、Provider性能やWorkflowの優劣を示しません。Antigravity、Provider比較、
-dashboard、notebook、統計的検定、並列schedulerは未実装です。
+Provider比較結果を示すものではありません。Phase 4のLive Campaignもpaired結果がないため
+Workflowの優劣を示しません。Antigravity、Provider比較、dashboard、notebook、統計的検定、
+並列schedulerは未実装です。
 
 ## Quick Start
 
@@ -92,7 +96,8 @@ Campaign開始時にTask Prompt bytesとFixture全file bytesを一度だけ固�
 そのin-memory snapshotから構築します。各run開始前のsource integrity checkで変更を検出した
 場合は、次のProvider callを開始せず`input_changed`で停止します。
 
-将来のLive Campaign形式は次です。今回は実行していません。`--confirm-live-codex`と、
+Live Campaignの形式は次です。事前登録済みCampaignは上記のとおり1回だけ実行し、再実行
+しません。`--confirm-live-codex`と、
 Planに表示された予定Provider call総数と一致する`--confirm-provider-calls`の両方がなければ、
 version/help preflightを含むsubprocessを起動しません。
 `experiments/examples/workflow-ab.yaml`のmodelはfake受入専用であり、実Codex Liveには
@@ -210,8 +215,8 @@ macOSはlocal process-tree testで検証済みです。Linux実装経路は有�
 - Phase 1: Replay Vertical Slice（完了）
 - Phase 2: Safe Runner, Evidence and Quality Gate（完了）
 - Phase 3: Codex CLI Provider（完了）
-- Phase 4: Workflow A/B Experiment（Current、offline/fake受入済み、Live A/B未実施）
-- Phase 5: Antigravity CLI Provider
+- Phase 4: Workflow A/B Experiment（Current、Live Campaignは安全停止、paired結果0）
+- Phase 5: Antigravity CLI Provider（Planned）
 - Phase 6: Multi-language Fixtures and Public Report
 - Phase 7: Optional Enhancements
 

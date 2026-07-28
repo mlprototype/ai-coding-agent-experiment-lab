@@ -123,7 +123,20 @@ notebook、parallel/distributed scheduler、retry/fallback、resume、multi-turn
 Prompt自動最適化、model自動選択、adaptive sampling、統計的検定、OS security sandbox、
 Phase 5以降を実装しない。
 
-offline実装とfake Provider受入後もPhase 4は`Current`である。`Complete`には別の人間の明示
-指示により、レビュー済みcommitへ事前登録した実Codex A/B（原則1 Task、両Workflow各3反復、
-最大6 Provider turns）を実行し、全run状態と最低1組のpaired結果をoffline集計する必要が
-ある。安全停止でpairが成立しなければ`Current`のままとし、失敗runを再実行しない。
+offline実装とfake Provider受入後、reviewed commit
+`2abd653a7b42f8932c0005e6d7d3fdd1252845e0`、canonical Plan SHA-256
+`9caf1847677adfcd6ef7aac59b2298bfbc9113577d75e49a7976de0b068e19de`のLive Campaignを
+2026-07-28T09:26:35Zに1回だけ実行した。予定6 run／6 Provider callsのうちPlan先頭の
+`staged` runだけをattemptし、actual call 1、unknown call 0だった。Provider turnと4種類の
+Gateは成功したが、lintの`py_compile`が作成したbytecode cacheをbinary diffとして検出し、
+完全な行数Evidenceを構築できなかったため、`harness_error`／`evidence_error`で停止した。
+Provider process group、Workspace、adapter cleanupは成功している。
+
+残り5 runは`not_run`、retry／fallback／resumeは0である。offline reportは1回だけ生成し、
+scheduled pair 3、complete pair 0、`pairing.status=not_estimable`となった。比較可能なpairが
+ないためWorkflowの優劣を述べない。ArtifactはGit管理外で保持し、Campaign、失敗run、
+reportを再実行しない。Phase 4は`Current`、Phase 5は`Planned`のままである。
+Workflow別には、`one_shot`がscheduled 3／attempted 0／completed 0／not_run 3、
+`staged`がscheduled 3／attempted 1／completed 0／harness_failed 1／not_run 2である。
+`staged`の4 Gate commandは4件ともPASSしたが、run自体はHarness障害のため
+quality-gate-passed runへ数えない。

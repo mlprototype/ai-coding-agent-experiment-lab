@@ -3,8 +3,9 @@
 ## Scope
 
 Phase 3は、1 task・1 Codex Provider・1 repetition・`one_shot`を人間が手動実行する最小
-vertical sliceである。scheduler、staged Workflow、比較実験、自動retryはPhase 4以降で
-あり、実装していない。通常テストはfake Codexだけを使う。manual Liveは累計8試行で、
+vertical sliceである。scheduler、staged Workflow、比較実験はPhase 4の独立契約として
+実装し、Phase 3 Providerの責務へ混在させない。自動retryは実装しない。通常テストはfake
+Codexだけを使う。manual Liveは累計8試行で、
 008のAgentLab製品経路とoffline ReplayによってPhase 3の最小vertical slice受入を完了した。
 過去runは再実行せず、新しいLiveにはレビュー済みcommit、新しいSpec／run-id／出力先、
 別の明示承認を必要とする。
@@ -339,4 +340,12 @@ Evidence／RecordingとMetricsが一致した。
 
 manual Live 006／007の失敗・不明履歴を上書きせず、008の成功だけを選別しない。Phase 3の
 最小vertical slice受入は完了したが、この結果は一般的な`gpt-5.6-sol`性能やProvider比較を
-示さない。Phase 4はPlannedのまま未着手である。
+示さない。Phase 3 manual Liveは累計8試行のままである。
+
+Phase 4はCurrentである。2026-07-28に事前登録済みWorkflow A/B Campaignを1回だけ開始し、
+予定6 Provider callsのうち1 callを実行した。最初の`staged` turnと4種類のGateは成功したが、
+`py_compile`が作成したbytecode cacheのbinary diffにより完全な行数Evidenceを構築できず、
+`harness_error`／`evidence_error`で安全停止した。残り5 runは`not_run`、complete pairは0、
+reportは`not_estimable`であり、Phase 4 Campaignや失敗run、reportは再実行しない。この1 call
+はPhase 3の累計へ加算せず、一般的なモデル性能またはWorkflowの優位性を示す結果として
+扱わない。Phase 5はPlannedのままである。

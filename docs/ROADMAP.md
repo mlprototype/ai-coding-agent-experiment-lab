@@ -88,6 +88,23 @@ Prompt、Gate、環境、実行時期へ限定する。Completeには、別の�
 実Codex Campaignを実行し、最低1組のpaired結果をoffline集計する必要がある。安全停止で
 pairが成立しない場合はCurrentのままとし、失敗runを再実行しない。
 
+2026-07-28T09:26:35Zに、事前登録commit
+`2abd653a7b42f8932c0005e6d7d3fdd1252845e0`、canonical Plan SHA-256
+`9caf1847677adfcd6ef7aac59b2298bfbc9113577d75e49a7976de0b068e19de`のLive Campaignを
+1回だけ開始した。予定6 run／6 Provider callsに対し、Plan先頭の`staged` runだけを
+attemptし、actual Provider callは1、call count unknownは0だった。Provider turnはexit 0、
+`turn_completed`で、4種類のGateも各1件PASSした。一方、lintの`py_compile`が作成した
+`__pycache__/tag_normalizer.cpython-313.pyc`をbinary diffとして検出し、行数Evidenceを
+完全に構築できなかったため、runは`harness_error`／`evidence_error`となった。Provider
+process group、Workspace、adapterはいずれも回収済みである。
+
+Campaignは`harness_failure`で停止し、残り5 runを`not_run`として記録した。retry、
+fallback、resumeは0で、offline reportは1回だけ生成した。scheduled pair 3に対しcomplete
+pairは0、`pairing.status=not_estimable`である。ArtifactはGit管理外で保持し、このCampaignや
+失敗run、reportを再実行しない。比較可能なpairがないためWorkflowの優劣を述べず、Phase 4は
+Current、Phase 5はPlannedのままとする。Phase 4の1 Provider callはPhase 3 manual Live
+累計8試行へ加算しない。
+
 ## Phase 5: Antigravity CLI Provider
 
 **Status: Planned**
