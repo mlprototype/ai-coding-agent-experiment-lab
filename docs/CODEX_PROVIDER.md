@@ -173,7 +173,8 @@ traceback、filesystem pathはDiagnosticへ保存しない。任意の例外clas
 
 既存CodexExecutionEvidence 1.1は`failure_stage`なし、1.2は1.3以降のlifecycle fieldなしで
 引き続きstrict loaderが受理する。1.1〜1.4のvalidatorを緩めず、新規Evidenceだけを
-1.5で保存する。保存済みCodex Evidence 1.1〜1.4、Recording 1.1、Live Artifact 1.0、
+1.5で保存する。新規Live Artifact 1.1は成功・失敗を問わず正確なevaluation durationを
+保持する。保存済みCodex Evidence 1.1〜1.4、Recording 1.1、Live Artifact 1.0、
 Failure Diagnostic 1.0を変換・上書きせず後方互換で読み込める。旧1.2の
 `provider_orchestration` fallbackはrunner内部の観測状態を保持しなかったため、そこから
 Provider起動、Prompt送信、model API到達、quota消費、process group回収の有無を確定しては
@@ -242,9 +243,11 @@ acceptance Gateが1件以上あることを要求して、矛盾をloaderで拒�
 `preflight_not_completed`は`not_created`だけ、
 `provider_invocation_attempted`は作成済みWorkspaceだけを許容する。
 
-EvidenceはRecording bytesのSHA-256を一方向参照する。成功Recording 1.1は外部CLI、
-subprocess、network、GateなしでReplay Resultへ変換できる。失敗RecordingはMetricsが
-ない理由を示して拒否する。Recording 1.0とPhase 1 Result bytesは変更しない。
+EvidenceはRecording bytesのSHA-256を一方向参照する。Live Artifact 1.1のGate Evidence、
+diff、Workspace lifecycle、evaluation durationからRecordingのevaluation summaryを完全に
+再構成できる。成功Recording 1.1は外部CLI、subprocess、network、GateなしでReplay Resultへ
+変換できる。失敗RecordingはMetricsがない理由を示して拒否する。Recording 1.0とPhase 1
+Result bytesは変更しない。
 
 ## 保証できないこととPhase 4境界
 

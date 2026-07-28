@@ -35,6 +35,8 @@ from agentlab.models import (
     CommandStatus,
     ContractModel,
     GateKind,
+    GateKindSummary,
+    LiveEvaluationSummary,
     LiveFailureKind,
     LiveOverallStatus,
     LiveRunArtifact,
@@ -342,6 +344,53 @@ def _artifact_outcome(artifact: LiveRunArtifact) -> CampaignOutcome:
     return CampaignOutcome.HARNESS_FAILURE
 
 
+def _evidence_evaluation_summary(
+    run: WorkflowPlanRun,
+    artifact: LiveRunArtifact,
+) -> LiveEvaluationSummary:
+    duration = artifact.evaluation_duration_ms
+    if duration is None and artifact.metrics is not None:
+        duration = artifact.metrics.evaluation_duration_ms
+    if duration is None and not artifact.gate_commands:
+        duration = 0
+    if duration is None:
+        raise WorkflowReportError(
+            f"failed Evidence lacks evaluation duration for {run.run_id}"
+        )
+
+    def gate_summary(gate: GateKind) -> GateKindSummary:
+        selected = [
+            command for command in artifact.gate_commands if command.gate is gate
+        ]
+        return GateKindSummary(
+            command_count=len(selected),
+            passed_count=sum(
+                command.status is CommandStatus.PASSED for command in selected
+            ),
+            failed_count=sum(
+                command.status is CommandStatus.FAILED for command in selected
+            ),
+        )
+
+    return LiveEvaluationSummary(
+        acceptance=gate_summary(GateKind.ACCEPTANCE),
+        regression=gate_summary(GateKind.REGRESSION),
+        lint=gate_summary(GateKind.LINT),
+        typecheck=gate_summary(GateKind.TYPECHECK),
+        all_commands_completed_normally=all(
+            command.status in {CommandStatus.PASSED, CommandStatus.FAILED}
+            and command.termination.process_group_cleared
+            for command in artifact.gate_commands
+        ),
+        evaluation_duration_ms=duration,
+        changed_files=artifact.diff.changed_files,
+        added_lines=artifact.diff.added_lines,
+        deleted_lines=artifact.diff.deleted_lines,
+        diff_line_counts_complete=artifact.diff.line_counts_complete,
+        workspace_lifecycle=artifact.workspace_lifecycle,
+    )
+
+
 def _validate_recording_relationships(
     plan: WorkflowPlan,
     run: WorkflowPlanRun,
@@ -386,6 +435,10 @@ def _validate_recording_relationships(
     if terminal.codex != artifact.codex:
         raise WorkflowReportError(
             f"Evidence and Recording Codex summaries differ for {run.run_id}"
+        )
+    if terminal.evaluation != _evidence_evaluation_summary(run, artifact):
+        raise WorkflowReportError(
+            f"Evidence and Recording evaluation summaries differ for {run.run_id}"
         )
     if isinstance(terminal, LiveRunCompletedEvent):
         if terminal.metrics != artifact.metrics:

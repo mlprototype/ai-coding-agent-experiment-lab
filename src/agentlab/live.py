@@ -965,7 +965,7 @@ def _recording_and_artifact(
         ) from error
     try:
         artifact = LiveRunArtifact(
-            schema_version="1.0",
+            schema_version="1.1",
             run_id=run_id,
             experiment_id=spec.experiment_id,
             task_id=task_id,
@@ -987,6 +987,7 @@ def _recording_and_artifact(
             gate_commands=commands,
             diff=diff,
             metrics=metrics,
+            evaluation_duration_ms=evaluation_duration_ms,
             workspace_lifecycle=workspace_lifecycle,
             recording_sha256=hashlib.sha256(recording_bytes).hexdigest(),
             raw_provider_output_persisted=False,

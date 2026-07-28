@@ -34,6 +34,7 @@ offline実装とfake Codexによる受入を完了し、レビュー済みcommit
 - read-only Codex CLI preflightと、明示確認が必要な`agentlab live-codex`
 - stdin Prompt、上限付きincremental JSONL parser、redaction済みCodex Evidence
 - 2イベントのLive Recording 1.1と、その成功記録のoffline Replay
+- 正確なevaluation durationを持つLive Artifact 1.1と、1.0のstrict読込互換
 - Provider成功後に同じ使い捨てWorkspaceで品質Gateを実行する最小vertical slice
 - strict paired成果物を構築できない場合だけの独立したFailure Diagnostic 1.0
 - 後方互換なExperimentSpec 1.0とは分離したstrict Workflow A/B Spec 2.0
@@ -120,9 +121,11 @@ network設定、timeout、停止条件はCampaign全体で固定します。詳�
 
 adapter用Prompt fileはArtifact root外のsystem temporary directoryだけに作成します。
 cleanup結果はCampaignへ`cleared`／`failed`として保存し、失敗時は`cleanup_failure`で即時停止
-してPrompt fileをbest-effortでredactします。offline reportはPlan、Campaign、Evidence、
-Recordingのrun identity、outcome、Provider call数、Prompt/Fixture fingerprint、model、
-reasoning effortを相互照合し、矛盾するpairを拒否します。
+してPrompt fileをbest-effortでredactします。cleanup中の`KeyboardInterrupt`／`SystemExit`も
+cleanup失敗としてCampaignを完結させてから元の中断を再送出します。offline reportはPlan、
+Campaign、Evidence、Recordingのrun identity、outcome、Provider call数、Prompt/Fixture
+fingerprint、model、reasoning effort、成功・失敗両方のevaluation summaryを相互照合し、
+矛盾するpairを拒否します。
 
 次はPhase 3で使用したmanual smokeのCLI形式です。実Codexを使うため、通常テストやCIでは
 実行しません。承認済みmanual smokeは累計8試行で、過去runを再実行しません。新しい実行は

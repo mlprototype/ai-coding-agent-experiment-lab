@@ -112,7 +112,9 @@ Provider報告Tokenと推定Tokenは分離する。paired結果がなければ`n
 集計前にPlan、Campaign、Evidence、Recordingのtask、Workflow、repetition、run ID、
 Campaign outcome、Provider call数、Evidence status/failure kind/execution stage、
 Prompt/Fixture fingerprint、exact model、reasoning effortを相互照合する。意味が矛盾する
-Artifactはestimableへ含めず、report生成自体を拒否する。
+Artifactはestimableへ含めず、report生成自体を拒否する。失敗RecordingについてもEvidenceの
+Gate件数・結果、diff、Workspace lifecycle、evaluation durationからevaluation summaryを
+再構成し、完全一致しないArtifactを拒否する。
 
 ## Non-goals and current acceptance
 

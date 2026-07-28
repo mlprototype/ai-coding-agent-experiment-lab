@@ -1716,7 +1716,7 @@ class LiveFailureDiagnostic(ContractModel):
 class LiveRunArtifact(ContractModel):
     """Versioned Live Evidence with a one-way hash reference to its Recording."""
 
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.0", "1.1"]
     run_id: StrictStr = Field(min_length=1)
     experiment_id: StrictStr = Field(min_length=1)
     task_id: StrictStr = Field(min_length=1)
@@ -1738,9 +1738,31 @@ class LiveRunArtifact(ContractModel):
     gate_commands: list[CommandEvidence]
     diff: DiffEvidence
     metrics: RunMetrics | None
+    evaluation_duration_ms: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        exclude_if=lambda value: value is None,
+    )
     workspace_lifecycle: WorkspaceLifecycle
     recording_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
     raw_provider_output_persisted: StrictBool
+
+    @model_validator(mode="before")
+    @classmethod
+    def evaluation_duration_is_versioned(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        schema_version = value.get("schema_version")
+        duration_present = "evaluation_duration_ms" in value
+        if schema_version == "1.0" and duration_present:
+            raise ValueError(
+                "Live Evidence 1.0 must not contain evaluation_duration_ms"
+            )
+        if schema_version == "1.1" and not duration_present:
+            raise ValueError(
+                "Live Evidence 1.1 requires evaluation_duration_ms"
+            )
+        return value
 
     @field_validator("started_at", "completed_at", mode="before")
     @classmethod
@@ -1765,6 +1787,12 @@ class LiveRunArtifact(ContractModel):
 
     @model_validator(mode="after")
     def live_status_metrics_and_evidence_must_match(self) -> LiveRunArtifact:
+        if self.schema_version == "1.0" and self.evaluation_duration_ms is not None:
+            raise ValueError(
+                "Live Evidence 1.0 must not contain evaluation_duration_ms"
+            )
+        if self.schema_version == "1.1" and self.evaluation_duration_ms is None:
+            raise ValueError("Live Evidence 1.1 requires evaluation_duration_ms")
         if not self.prompt_redacted or self.raw_provider_output_persisted:
             raise ValueError("Live Prompt/provider redaction flags must use required values")
         if (
@@ -1905,6 +1933,14 @@ class LiveRunArtifact(ContractModel):
         if metrics_permitted != (self.metrics is not None):
             raise ValueError("Live metrics presence is inconsistent with Evidence completeness")
         if self.metrics is not None:
+            if (
+                self.evaluation_duration_ms is not None
+                and self.metrics.evaluation_duration_ms
+                != self.evaluation_duration_ms
+            ):
+                raise ValueError(
+                    "Live evaluation duration must match RunMetrics"
+                )
             acceptance = [
                 command
                 for command in self.gate_commands

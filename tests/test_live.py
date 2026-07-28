@@ -385,7 +385,8 @@ def test_live_success_runs_provider_and_gates_in_same_workspace_and_replays(
         recording.completed.codex.provider_failure_hint
         is CodexProviderFailureHint.NOT_APPLICABLE
     )
-    assert artifact.schema_version == "1.0"
+    assert artifact.schema_version == "1.1"
+    assert artifact.evaluation_duration_ms == artifact.metrics.evaluation_duration_ms
     assert observed["prompt"].endswith(prompt_secret)
     assert observed["codex_home_present"] is True
     assert observed["openai_key"] is None
@@ -417,6 +418,45 @@ def test_live_success_runs_provider_and_gates_in_same_workspace_and_replays(
 
     assert result.execution_mode.value == "replay"
     assert result.metrics == artifact.metrics
+
+
+def test_live_artifact_1_0_remains_strict_loadable(tmp_path: Path) -> None:
+    spec_path, _fixture, _prompt_path, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(
+        tmp_path,
+        live_code=_success_code(),
+    )
+    artifact = _run(spec_path, output, environment).artifact
+    legacy_payload = artifact.model_dump(mode="json")
+    legacy_payload["schema_version"] = "1.0"
+    del legacy_payload["evaluation_duration_ms"]
+    legacy_path = tmp_path / "legacy-live-evidence.json"
+    legacy_path.write_text(
+        json.dumps(legacy_payload, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    legacy = load_live_artifact(legacy_path)
+    assert legacy.schema_version == "1.0"
+    assert legacy.evaluation_duration_ms is None
+    assert "evaluation_duration_ms" not in legacy.model_dump(mode="json")
+
+    legacy_payload["evaluation_duration_ms"] = 0
+    legacy_path.write_text(
+        json.dumps(legacy_payload, sort_keys=True),
+        encoding="utf-8",
+    )
+    with pytest.raises(LiveArtifactLoadError, match=r"1\.0"):
+        load_live_artifact(legacy_path)
+
+    current_payload = artifact.model_dump(mode="json")
+    del current_payload["evaluation_duration_ms"]
+    legacy_path.write_text(
+        json.dumps(current_payload, sort_keys=True),
+        encoding="utf-8",
+    )
+    with pytest.raises(LiveArtifactLoadError, match=r"1\.1"):
+        load_live_artifact(legacy_path)
 
 
 def test_live_pre_turn_warning_is_nonfatal_and_runs_gates(tmp_path: Path) -> None:

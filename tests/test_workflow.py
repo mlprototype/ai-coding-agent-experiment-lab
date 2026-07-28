@@ -427,12 +427,29 @@ def _fake_codex_environment(
     tmp_path: Path,
     *,
     usage: bool = True,
+    provider_failure: bool = False,
 ) -> tuple[dict[str, str], Path]:
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
     log = tmp_path / "calls.jsonl"
     supported = next(iter(CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS))
     script = fake_bin / "codex"
+    if provider_failure:
+        terminal_events = (
+            "    print(json.dumps({'type':'error','message':'discarded'}),flush=True)\n"
+            "    print(json.dumps({'type':'turn.failed','error':"
+            "{'message':'discarded'}}),flush=True)\n"
+        )
+    elif usage:
+        terminal_events = (
+            "    print(json.dumps({'type':'turn.completed','usage':{'input_tokens':7,"
+            "'cached_input_tokens':1,'output_tokens':3,'reasoning_output_tokens':1}}),"
+            "flush=True)\n"
+        )
+    else:
+        terminal_events = (
+            "    print(json.dumps({'type':'turn.completed'}),flush=True)\n"
+        )
     script.write_text(
         "#!/usr/bin/env python3\n"
         "import hashlib,json,os,pathlib,sys\n"
@@ -451,13 +468,7 @@ def _fake_codex_environment(
         "    pathlib.Path('task.txt').write_text('status=COMPLETE\\n',encoding='utf-8')\n"
         "    print(json.dumps({'type':'thread.started','thread_id':'discarded'}),flush=True)\n"
         "    print(json.dumps({'type':'turn.started'}),flush=True)\n"
-        + (
-            "    print(json.dumps({'type':'turn.completed','usage':{'input_tokens':7,"
-            "'cached_input_tokens':1,'output_tokens':3,'reasoning_output_tokens':1}}),"
-            "flush=True)\n"
-            if usage
-            else "    print(json.dumps({'type':'turn.completed'}),flush=True)\n"
-        ),
+        + terminal_events,
         encoding="utf-8",
     )
     script.chmod(0o755)
@@ -596,6 +607,69 @@ def test_adapter_cleanup_failure_is_explicit_and_redacts_prompt(
             shutil.rmtree(adapter_root, ignore_errors=True)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Codex runner is POSIX-only")
+@pytest.mark.parametrize("interrupt_name", ["keyboard_interrupt", "system_exit"])
+def test_adapter_cleanup_interruption_records_failure_redacts_and_reraises(
+    tmp_path: Path,
+    interrupt_name: str,
+) -> None:
+    spec_path = _case(tmp_path, repetitions=1)
+    plan_path = _plan_file(spec_path)
+    environment, call_log = _fake_codex_environment(tmp_path)
+    campaign_path = spec_path.parent / "campaign.jsonl"
+    adapter_roots: list[Path] = []
+
+    def interrupt_cleanup(path: Path) -> tuple[bool, str | None]:
+        adapter_roots.append(path)
+        if interrupt_name == "keyboard_interrupt":
+            raise KeyboardInterrupt
+        raise SystemExit(23)
+
+    expected_exception = (
+        KeyboardInterrupt
+        if interrupt_name == "keyboard_interrupt"
+        else SystemExit
+    )
+    try:
+        with pytest.raises(expected_exception) as raised:
+            run_workflow_campaign(
+                spec_path,
+                plan_path,
+                campaign_path,
+                confirm_live_codex=True,
+                confirm_provider_calls=2,
+                parent_environment=environment,
+                adapter_cleanup=interrupt_cleanup,
+            )
+        if interrupt_name == "system_exit":
+            assert raised.value.code == 23
+
+        events = load_campaign(campaign_path)
+        attempted_terminal = next(
+            event
+            for event in events
+            if getattr(event, "status", None) is CampaignRunStatus.FAILED
+        )
+        finished = events[-1]
+        assert finished.stop_reason is CampaignStopReason.CLEANUP_FAILURE
+        assert finished.provider_call_count == 1
+        assert len(call_log.read_text(encoding="utf-8").splitlines()) == 1
+        assert attempted_terminal.outcome is CampaignOutcome.CLEANUP_FAILURE
+        assert attempted_terminal.provider_call_count == 1
+        assert (
+            attempted_terminal.adapter_cleanup_state
+            is AdapterCleanupState.FAILED
+        )
+        assert len(adapter_roots) == 1
+        assert not (adapter_roots[0] / "prompt.md").exists()
+        report = aggregate_workflow_campaign(spec_path, plan_path, campaign_path)
+        assert report.pairing.status is Estimability.NOT_ESTIMABLE
+        assert sum(item.cleanup_failed_runs for item in report.workflows) == 1
+    finally:
+        for adapter_root in adapter_roots:
+            shutil.rmtree(adapter_root, ignore_errors=True)
+
+
 def _rewrite_campaign(
     campaign_path: Path,
     mutate: Any,
@@ -698,6 +772,86 @@ def test_report_rejects_evidence_recording_or_plan_condition_mismatch(
         encoding="utf-8",
     )
     with pytest.raises(WorkflowReportError):
+        aggregate_workflow_campaign(spec_path, plan_path, campaign_path)
+
+
+def _run_failed_fake_campaign(
+    tmp_path: Path,
+    *,
+    failure_mode: str,
+) -> tuple[Path, Path, Path]:
+    spec_path = _case(tmp_path, repetitions=1, stop_max_failures=3)
+    if failure_mode == "gate_harness":
+        raw = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
+        raw["quality_gate"] = {
+            "acceptance": [["phase4-gate-that-does-not-exist"]],
+            "regression": [],
+            "lint": [],
+            "typecheck": [],
+        }
+        spec_path.write_text(
+            yaml.safe_dump(raw, sort_keys=False),
+            encoding="utf-8",
+        )
+    plan_path = _plan_file(spec_path)
+    environment, _call_log = _fake_codex_environment(
+        tmp_path,
+        provider_failure=failure_mode == "provider",
+    )
+    campaign_path = spec_path.parent / "campaign.jsonl"
+    plan = load_workflow_plan(plan_path)
+    run_workflow_campaign(
+        spec_path,
+        plan_path,
+        campaign_path,
+        confirm_live_codex=True,
+        confirm_provider_calls=plan.planned_provider_call_count,
+        parent_environment=environment,
+    )
+    aggregate_workflow_campaign(spec_path, plan_path, campaign_path)
+    return spec_path, plan_path, campaign_path
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Codex runner is POSIX-only")
+@pytest.mark.parametrize("failure_mode", ["provider", "gate_harness"])
+def test_report_rejects_failed_recording_evaluation_mismatch(
+    tmp_path: Path,
+    failure_mode: str,
+) -> None:
+    spec_path, plan_path, campaign_path = _run_failed_fake_campaign(
+        tmp_path,
+        failure_mode=failure_mode,
+    )
+    plan = load_workflow_plan(plan_path)
+    run = next(
+        candidate
+        for candidate in plan.runs
+        if (spec_path.parent / candidate.evidence_path).exists()
+    )
+    evidence_path = spec_path.parent / run.evidence_path
+    recording_path = spec_path.parent / run.recording_path
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    recording = [
+        json.loads(line)
+        for line in recording_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert recording[1]["event_type"] == "run_failed"
+    if failure_mode == "provider":
+        recording[1]["evaluation"]["changed_files"] = []
+    else:
+        recording[1]["evaluation"]["evaluation_duration_ms"] += 1
+    recording_bytes = "".join(
+        json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+        for event in recording
+    ).encode()
+    recording_path.write_bytes(recording_bytes)
+    evidence["recording_sha256"] = hashlib.sha256(recording_bytes).hexdigest()
+    evidence_path.write_text(
+        json.dumps(evidence, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkflowReportError, match="evaluation summaries"):
         aggregate_workflow_campaign(spec_path, plan_path, campaign_path)
 
 

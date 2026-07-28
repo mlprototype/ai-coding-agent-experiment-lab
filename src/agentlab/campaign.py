@@ -254,9 +254,14 @@ AdapterCleanup = Callable[[Path], tuple[bool, str | None]]
 
 
 class _AdapterCleanupInterrupted(Exception):
-    def __init__(self, original: KeyboardInterrupt | SystemExit) -> None:
+    def __init__(
+        self,
+        original: KeyboardInterrupt | SystemExit,
+        execution: CampaignRunExecution | None,
+    ) -> None:
         super().__init__("adapter cleanup failed during interruption")
         self.original = original
+        self.execution = execution
 
 
 def _utc_timestamp(value: datetime) -> datetime:
@@ -666,15 +671,22 @@ def _default_run_executor(
         caught = error
 
     cleanup_cleared = True
+    cleanup_interrupt: KeyboardInterrupt | SystemExit | None = None
     if adapter_root is not None:
         try:
             cleanup_cleared, _cleanup_error = adapter_cleanup(adapter_root)
+        except (KeyboardInterrupt, SystemExit) as error:
+            cleanup_cleared = False
+            cleanup_interrupt = error
         except Exception:
             cleanup_cleared = False
         if not cleanup_cleared:
             _redact_adapter_prompt(adapter_root)
-            if isinstance(caught, (KeyboardInterrupt, SystemExit)):
-                raise _AdapterCleanupInterrupted(caught)
+            interrupted = cleanup_interrupt
+            if interrupted is None and isinstance(caught, (KeyboardInterrupt, SystemExit)):
+                interrupted = caught
+            if interrupted is not None:
+                raise _AdapterCleanupInterrupted(interrupted, execution)
             return CampaignRunExecution(
                 outcome=CampaignOutcome.CLEANUP_FAILURE,
                 provider_call_count=(
@@ -829,10 +841,19 @@ def run_workflow_campaign(
                     parent_environment,
                 )
             except _AdapterCleanupInterrupted as error:
+                interrupted_execution = error.execution
                 execution = CampaignRunExecution(
                     outcome=CampaignOutcome.CLEANUP_FAILURE,
-                    provider_call_count=None,
-                    live_failure_kind=None,
+                    provider_call_count=(
+                        None
+                        if interrupted_execution is None
+                        else interrupted_execution.provider_call_count
+                    ),
+                    live_failure_kind=(
+                        None
+                        if interrupted_execution is None
+                        else interrupted_execution.live_failure_kind
+                    ),
                     adapter_cleanup_state=AdapterCleanupState.FAILED,
                 )
                 pending_interrupt = error.original
