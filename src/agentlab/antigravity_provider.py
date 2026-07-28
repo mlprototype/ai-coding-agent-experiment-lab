@@ -14,6 +14,7 @@ import shutil
 import signal
 import subprocess
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -367,6 +368,27 @@ class StrictAntigravityStreamParser:
                     self.usage_metrics = UsageMetrics(source=UsageMetricSource.NOT_AVAILABLE)
 
 
+@dataclass(frozen=True)
+class AntigravityEvidenceDiagnostic:
+    """Fixed diagnostic returned when AntigravityExecutionEvidence construction fails."""
+
+    error_code: str = "EVIDENCE_CONSTRUCTION_FAILED"
+    failure_kind: LiveFailureKind = LiveFailureKind.EVIDENCE_ERROR
+
+
+def _is_process_group_alive(pgid: int) -> bool:
+    """Check if any process in the process group is still alive."""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
 def _run_preflight_subprocess(
     cmd: str,
     args: list[str],
@@ -407,77 +429,101 @@ def _run_preflight_subprocess(
     pgid = proc.pid
     start_time = time.monotonic()
     timed_out = False
+    collection_error = False
+    cleanup_failed = False
+    cleanup_exception = False
 
     pipes = [proc.stdout, proc.stderr]
     for pipe in pipes:
         if pipe is not None:
-            os.set_blocking(pipe.fileno(), False)
+            try:
+                os.set_blocking(pipe.fileno(), False)
+            except Exception:
+                collection_error = True
 
     try:
         while True:
             elapsed = time.monotonic() - start_time
-            if elapsed > timeout_seconds:
+            if elapsed >= timeout_seconds:
                 timed_out = True
                 break
 
             active_pipes = [p for p in pipes if p is not None and not p.closed]
-            rlist, _, _ = select.select(active_pipes, [], [], 0.1)
+            if not active_pipes:
+                break
+
+            remaining_timeout = max(0.001, timeout_seconds - elapsed)
+            select_wait = min(0.1, remaining_timeout)
+            rlist, _, _ = select.select(active_pipes, [], [], select_wait)
 
             for pipe in rlist:
-                data = pipe.read(4096)
+                buf = stdout_buf if pipe is proc.stdout else stderr_buf
+                max_read = min(4096, PREFLIGHT_MAX_BYTES - len(buf))
+                if max_read <= 0:
+                    continue
+
+                data = pipe.read(max_read)
                 if not data:
                     pipe.close()
                     continue
-                if pipe is proc.stdout and len(stdout_buf) < PREFLIGHT_MAX_BYTES:
-                    stdout_buf.extend(data)
-                elif pipe is proc.stderr and len(stderr_buf) < PREFLIGHT_MAX_BYTES:
-                    stderr_buf.extend(data)
+                buf.extend(data)
 
             if proc.poll() is not None:
-                # Read any remaining buffered data
+                # Read any remaining buffered data up to strict limit
                 for pipe in [proc.stdout, proc.stderr]:
                     if pipe is not None and not pipe.closed:
-                        data = pipe.read(PREFLIGHT_MAX_BYTES)
-                        if data:
-                            if pipe is proc.stdout and len(stdout_buf) < PREFLIGHT_MAX_BYTES:
-                                stdout_buf.extend(data)
-                            elif pipe is proc.stderr and len(stderr_buf) < PREFLIGHT_MAX_BYTES:
-                                stderr_buf.extend(data)
+                        buf = stdout_buf if pipe is proc.stdout else stderr_buf
+                        max_read = PREFLIGHT_MAX_BYTES - len(buf)
+                        if max_read > 0:
+                            data = pipe.read(max_read)
+                            if data:
+                                buf.extend(data)
                         pipe.close()
                 break
 
     except Exception:
-        pass
+        collection_error = True
 
-    # Cleanup phase
-    cleanup_failed = False
-    if timed_out or proc.poll() is None:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(pgid, signal.SIGTERM)
+    # Single mandatory cleanup block for process group and pipes
+    finally:
+        try:
+            # Terminate process group if timed out or still alive
+            if timed_out or _is_process_group_alive(pgid):
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(pgid, signal.SIGTERM)
 
-        grace_start = time.monotonic()
-        while time.monotonic() - grace_start < 0.5:
-            if proc.poll() is not None:
-                break
-            time.sleep(0.05)
+                grace_start = time.monotonic()
+                while time.monotonic() - grace_start < 0.5:
+                    if not _is_process_group_alive(pgid):
+                        break
+                    time.sleep(0.05)
 
-        if proc.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(pgid, signal.SIGKILL)
-            time.sleep(0.05)
+                if _is_process_group_alive(pgid):
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(pgid, signal.SIGKILL)
+                    time.sleep(0.05)
+                    if _is_process_group_alive(pgid):
+                        cleanup_failed = True
+
+            # Ensure direct child process is waited/reaped
             if proc.poll() is None:
-                cleanup_failed = True
+                with contextlib.suppress(Exception):
+                    proc.wait(timeout=0.5)
 
-    # Close pipe handles if still open
-    for pipe in (proc.stdout, proc.stderr):
-        if pipe is not None and not pipe.closed:
-            with contextlib.suppress(Exception):
-                pipe.close()
+        except Exception:
+            cleanup_exception = True
+
+        # Ensure pipes are closed
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None and not pipe.closed:
+                with contextlib.suppress(Exception):
+                    pipe.close()
 
     stdout_str = stdout_buf.decode("utf-8", errors="replace")
     stderr_str = stderr_buf.decode("utf-8", errors="replace")
 
-    if cleanup_failed:
+    # Priority ranking: Cleanup > Timeout > Collection error
+    if cleanup_failed or cleanup_exception:
         return (
             proc.returncode,
             stdout_str,
@@ -493,6 +539,15 @@ def _run_preflight_subprocess(
             stderr_str,
             AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
             LiveFailureKind.PROVIDER_TIMEOUT,
+        )
+
+    if collection_error:
+        return (
+            proc.returncode,
+            stdout_str,
+            stderr_str,
+            AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
+            LiveFailureKind.EVIDENCE_ERROR,
         )
 
     return proc.returncode, stdout_str, stderr_str, None, LiveFailureKind.NONE
@@ -539,11 +594,14 @@ def probe_antigravity_preflight(
 
     version_str: str | None = None
     if ret_v == 0:
-        # Check non-empty lines from stdout or stderr
-        out_lines = [line.strip() for line in (stdout_v or stderr_v).splitlines() if line.strip()]
-        if len(out_lines) == 1:
-            first_line = out_lines[0]
-            if match := re.fullmatch(r"^agy \d+\.\d+\.\d+$", first_line):
+        stdout_lines = [line.strip() for line in stdout_v.splitlines() if line.strip()]
+        stderr_lines = [line.strip() for line in stderr_v.splitlines() if line.strip()]
+        all_non_empty_lines = stdout_lines + stderr_lines
+
+        # Reject if total non-empty lines across stdout + stderr is not exactly 1
+        if len(all_non_empty_lines) == 1:
+            single_line = all_non_empty_lines[0]
+            if match := re.fullmatch(r"agy \d+\.\d+\.\d+", single_line):
                 version_str = match.group(0)
 
     # Help probe
@@ -576,6 +634,7 @@ def probe_antigravity_preflight(
         failure_stage,
         failure_kind,
     )
+
 
 
 def build_antigravity_evidence(
@@ -700,3 +759,17 @@ def build_antigravity_evidence(
         termination=term,
         failure_kind=final_failure_kind,
     )
+
+
+def safe_build_antigravity_evidence(
+    **kwargs: Any,
+) -> AntigravityExecutionEvidence | AntigravityEvidenceDiagnostic:
+    """Safely construct AntigravityExecutionEvidence or return typed Diagnostic."""
+    try:
+        return build_antigravity_evidence(**kwargs)
+    except Exception:
+        return AntigravityEvidenceDiagnostic(
+            error_code="EVIDENCE_CONSTRUCTION_FAILED",
+            failure_kind=LiveFailureKind.EVIDENCE_ERROR,
+        )
+

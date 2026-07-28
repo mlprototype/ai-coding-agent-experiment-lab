@@ -1916,6 +1916,115 @@ class AntigravityExecutionEvidence(ContractModel):
                 "unstarted process requires cleanup_state not_applicable"
             )
 
+        if (
+            self.invocation_state
+            in (
+                CodexInvocationState.PROCESS_STARTED,
+                CodexInvocationState.SPAWN_ATTEMPTED,
+            )
+            and self.execution_stage
+            is not AntigravityExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+        ):
+            raise ValueError(
+                "Process invocation attempted requires PROVIDER_INVOCATION_ATTEMPTED stage"
+            )
+
+        if (
+            self.execution_stage
+            is AntigravityExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+        ):
+            if self.profile is not AntigravityCliProfile.HEADLESS_STREAM_JSON_V1:
+                raise ValueError(
+                    "Invocation attempted requires HEADLESS_STREAM_JSON_V1 profile"
+                )
+            if self.cli_version is None or not re.fullmatch(
+                r"^agy \d+\.\d+\.\d+$", self.cli_version
+            ):
+                raise ValueError("Invocation attempted requires valid cli_version")
+            if self.preflight_checked_at is None:
+                raise ValueError(
+                    "Invocation attempted requires preflight_checked_at timestamp"
+                )
+
+        if (
+            self.profile is AntigravityCliProfile.NOT_SELECTED
+            and self.invocation_state is not CodexInvocationState.NOT_ATTEMPTED
+        ):
+            raise ValueError(
+                "Unselected profile cannot attempt process invocation"
+            )
+
+        if (
+            self.execution_stage
+            is AntigravityExecutionStage.PREFLIGHT_NOT_COMPLETED
+            and self.invocation_state is not CodexInvocationState.NOT_ATTEMPTED
+        ):
+            raise ValueError(
+                "Uncompleted preflight cannot attempt process invocation"
+            )
+
+        if (
+            self.failure_kind is LiveFailureKind.PROVIDER_TIMEOUT
+            and self.termination.reason is not TerminationReason.TIMEOUT
+        ):
+            raise ValueError(
+                "PROVIDER_TIMEOUT requires TIMEOUT termination reason"
+            )
+
+        if (
+            self.failure_kind is LiveFailureKind.PROVIDER_SIGNAL_TERMINATION
+            and (self.exit_code is None or self.exit_code >= 0)
+        ):
+            raise ValueError(
+                "PROVIDER_SIGNAL_TERMINATION requires negative exit_code"
+            )
+
+        if (
+            self.failure_kind is LiveFailureKind.PROVIDER_CLI_NONZERO
+            and (self.exit_code is None or self.exit_code <= 0)
+        ):
+            raise ValueError(
+                "PROVIDER_CLI_NONZERO requires positive exit_code"
+            )
+
+        if (
+            self.failure_kind is LiveFailureKind.PROVIDER_TURN_FAILED
+            and self.normalized_terminal_status
+            not in (
+                AntigravityTerminalStatus.ERROR,
+                AntigravityTerminalStatus.CANCELED,
+                AntigravityTerminalStatus.INTERRUPTED,
+            )
+        ):
+            raise ValueError(
+                "PROVIDER_TURN_FAILED requires ERROR, CANCELED, or INTERRUPTED status"
+            )
+
+        if (
+            self.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+            and self.cleanup_state is not CodexCleanupState.FAILED
+        ):
+            raise ValueError(
+                "PROCESS_CLEANUP_ERROR requires FAILED cleanup_state"
+            )
+
+        if (
+            self.usage_metrics.cached_input_tokens is not None
+            and self.usage_metrics.input_tokens is None
+        ):
+            raise ValueError(
+                "cached_input_tokens requires input_tokens to be present"
+            )
+
+        if (
+            self.usage_metrics.reasoning_output_tokens is not None
+            and self.usage_metrics.output_tokens is None
+        ):
+            raise ValueError(
+                "reasoning_output_tokens requires output_tokens to be present"
+            )
+
+
 
 
         if (
