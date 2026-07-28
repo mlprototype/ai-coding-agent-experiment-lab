@@ -145,9 +145,9 @@ Campaign 001のArtifact、report、上記失敗分類は変更しない。その
 Provider processと各Gate commandへHarness管理`PYTHONPYCACHEPREFIX`を設定し、Python
 bytecode cacheをrun専用system temporary root内かつ評価Workspace外へ隔離した。binary diff
 拒否やline count完全性は緩めず、Harness管理外のbinary変更は引き続き`evidence_error`である。
-Campaign 001は再実行しない。修正後のLiveを行う場合も、新experiment ID、新Artifact root、
-新canonical Plan、reviewed commit、別の人間による明示承認を必要とする。Phase 4は
-`Current`、Phase 5は`Planned`のままである。
+Campaign 001は再実行しない。修正後のLiveにも、新experiment ID、新Artifact root、
+新canonical Plan、reviewed commit、別の人間による明示承認を適用した。Campaign 002の
+実行前時点ではPhase 4は`Current`、Phase 5は`Planned`であった。
 
 bytecode cache修正commit
 `11dd86801bb9f87b49d51d351c736dd0667cb94e`の既存Task Prompt、Fixture、Workflow Prompt、
@@ -160,8 +160,23 @@ canonical Plan SHA-256は
 `375675a105b3de6b371551ab09c25014e3198d256bf09717e80fe20e747125ee`で、
 planned runs／Provider callsは6／6、retry／fallback／resumeは0である。
 
-Campaign 002のPlan／metadataはGit管理外に保持し、Campaign、Recording、Evidence、
-Diagnostic、reportは作成していない。全6 runは未実行であり、実行にはreviewed commit、
-Plan SHA-256、`CODEX_HOME`、CLI version、最大6 Provider callsを含む別の人間による明示承認を
-必要とする。Campaign 001は`harness_failure`、complete pair 0の履歴のまま再実行、resume、
-report再生成を行わない。Phase 4は`Current`、Phase 5は`Planned`のままである。
+reviewed commit `edd8c9e748998d056efa70fa43a26d10aa8ded12`に対する別の人間の明示承認後、
+Campaign 002を2026-07-28T11:00:21.701522Zから11:05:11.761906Zまで1回だけ実行した。
+planned／attempted／completed／failed／not_runは6／6／6／0／0、actual Provider callsは6、
+unknown callsは0、retry／fallback／resumeは0である。6 Provider terminalはすべて
+`turn_completed`、Campaign outcomeは全run `success`、stop reasonは`none`だった。
+`one_shot`／`staged`は各3 runを完了し、各Workflowでacceptance／regression／lint／
+typecheckが各3件PASSした。全runで変更fileは`tag_normalizer.py`だけ、完全なline countsを
+保持し、Provider process group、Workspace、adapter Prompt、Python bytecode cache rootを
+回収した。Harness／Evidence／cleanup／input_changed／interrupted failureは0である。
+
+scheduled／complete pairは3／3、`pairing.status=estimable`である。report JSON／Markdown
+SHA-256は
+`d819eb5a1403f623527dcf84c665e88f3ae0b49d6b0878d5dd9941c1f60f139a`／
+`936a44a9710d1dbd16ec815a97fac190f3bad4366b27b8b02cf11f7bc5d4af4a`である。Plan、Campaign、
+Recording、Evidence、reportはGit管理外に保持する。Campaign 001は`harness_failure`、
+complete pair 0の履歴のまま不変で、再実行、resume、report再生成を行っていない。
+Campaign 002も再実行しない。Phase 3 manual Live累計8試行は変更せず、Phase 4 Campaignの
+call数と分離する。Phase 4は`Complete`、Phase 5は`Planned`のままである。この結果は固定した
+1 Task、Prompt、Fixture、Gate、各3反復、当該環境・実行時期に限定し、一般的なモデル性能、
+統計的有意差、普遍的なWorkflow優位性を主張しない。

@@ -344,10 +344,17 @@ manual Live 006／007の失敗・不明履歴を上書きせず、008の成功�
 最小vertical slice受入は完了したが、この結果は一般的な`gpt-5.6-sol`性能やProvider比較を
 示さない。Phase 3 manual Liveは累計8試行のままである。
 
-Phase 4はCurrentである。2026-07-28に事前登録済みWorkflow A/B Campaignを1回だけ開始し、
-予定6 Provider callsのうち1 callを実行した。最初の`staged` turnと4種類のGateは成功したが、
-`py_compile`が作成したbytecode cacheのbinary diffにより完全な行数Evidenceを構築できず、
-`harness_error`／`evidence_error`で安全停止した。残り5 runは`not_run`、complete pairは0、
-reportは`not_estimable`であり、Phase 4 Campaignや失敗run、reportは再実行しない。この1 call
-はPhase 3の累計へ加算せず、一般的なモデル性能またはWorkflowの優位性を示す結果として
-扱わない。Phase 5はPlannedのままである。
+Phase 4 Campaign 001は2026-07-28に1回だけ開始し、予定6 Provider callsのうち1 call後、
+`py_compile` bytecode cacheのbinary diffによる`harness_error`／`evidence_error`で安全停止
+した。残り5 runは`not_run`、complete pair 0、report `not_estimable`の履歴を変更せず、
+Campaign、失敗run、reportを再実行しない。
+
+bytecode cache隔離修正後、reviewed commit
+`edd8c9e748998d056efa70fa43a26d10aa8ded12`、canonical Plan SHA-256
+`375675a105b3de6b371551ab09c25014e3198d256bf09717e80fe20e747125ee`のCampaign 002を
+1回だけ実行した。6 run／6 callsがすべて`turn_completed`かつ4 Gate PASSとなり、
+retry／fallback／resume、unknown call、Harness／cleanup failureは0だった。scheduled／
+complete pairは3／3、reportは`estimable`である。ArtifactはGit管理外に保持し、Campaign 002も
+再実行しない。Phase 3 manual Live累計8試行へPhase 4のcall数を加算しない。この固定Taskと
+各3反復の結果を一般的なモデル性能、統計的有意差、普遍的なWorkflow優位性として扱わない。
+Phase 4はComplete、Phase 5はPlannedのままである。

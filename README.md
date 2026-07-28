@@ -16,7 +16,7 @@ Antigravity CLI / Replay Provider）は分離します。一度に変える独�
 
 ## 現在の状態
 
-Phase 0〜3を完了しました。**Phase 4: Workflow A/B Experiment** はCurrentです。
+Phase 0〜4を完了しました。**Phase 5: Antigravity CLI Provider** はPlannedです。
 offline実装とfake Codexによる受入を完了し、レビュー済みcommit
 `2abd653a7b42f8932c0005e6d7d3fdd1252845e0`に対する事前登録済みの実Codex Live A/B
 Campaignを2026-07-28に1回だけ実行しました。予定6 run／6 Provider callsに対し、最初の
@@ -29,18 +29,22 @@ directory配下のHarness管理`PYTHONPYCACHEPREFIX`を明示し、bytecode cach
 Campaign 001は再実行しません。修正後の新しいLiveにも、新experiment ID、新Artifact root、
 新canonical Plan、reviewed commit、別の明示承認が必要です。
 
-bytecode cache修正commit
-`11dd86801bb9f87b49d51d351c736dd0667cb94e`を基準に、Campaign 002を新experiment ID
-`workflow-ab-codex-live-002`と新Artifact rootへoffline事前登録しました。canonical Plan
-SHA-256は`375675a105b3de6b371551ab09c25014e3198d256bf09717e80fe20e747125ee`で、
-planned runs／Provider callsは6／6、retry／fallback／resumeは0です。Campaign 002は未実行で、
-Campaign、Recording、Evidence、Diagnostic、reportは作成していません。Specは
-Codex／`gpt-5.6-sol`／reasoning effort `high`、Task `tag-normalizer`、
-`one_shot`／`staged`各3反復、seed 4401、既存Task Prompt／Fixture／4 Gate、
-Provider timeout 600000 ms、Campaign上限3600000 ms、`workspace-write`、network無効、
-最大失敗2、fail-fast無効を固定しています。PlanとmetadataはGit管理外です。実行には
-reviewed commit、Plan SHA-256、`CODEX_HOME`、CLI version、最大6 Provider callsを含む
-別の人間による明示承認が必要です。Phase 4はCurrent、Phase 5はPlannedのままです。
+bytecode cache修正後、reviewed commit
+`edd8c9e748998d056efa70fa43a26d10aa8ded12`、canonical Plan SHA-256
+`375675a105b3de6b371551ab09c25014e3198d256bf09717e80fe20e747125ee`のCampaign 002を、
+2026-07-28T11:00:21.701522Zから11:05:11.761906Zまで1回だけ実行しました。planned／
+attempted／completed／failed／not_runは6／6／6／0／0、actual Provider callsは6、
+unknown callsは0、retry／fallback／resumeは0、stop reasonは`none`です。`one_shot`と
+`staged`は各3 runが完了し、各runのacceptance／regression／lint／typecheckはすべてPASS
+しました。scheduled／complete pairは3／3で`pairing.status=estimable`です。
+report JSON／Markdown SHA-256はそれぞれ
+`d819eb5a1403f623527dcf84c665e88f3ae0b49d6b0878d5dd9941c1f60f139a`／
+`936a44a9710d1dbd16ec815a97fac190f3bad4366b27b8b02cf11f7bc5d4af4a`です。
+ArtifactはGit管理外に保持し、Campaign 001の`harness_failure`履歴は不変です。Campaign 001も
+Campaign 002も再実行しません。Phase 3 manual Live累計8試行は変更せず、Phase 4 Campaignの
+call数と分離します。この1 Task、固定Prompt／Fixture／Gate、各3反復、当該環境・実行時期の
+結果から、一般的なモデル性能、統計的有意差、普遍的なWorkflow優位性は主張しません。
+Phase 4はComplete、Phase 5はPlannedです。
 
 Phase 4までに次を提供します。
 
@@ -78,9 +82,9 @@ agent callは1、retry／fallbackは0で、`turn.completed` 1件、Provider exit
 `task.txt`の期待した1行変更、4種類のQuality Gate全PASS、Evidence 1.5／Recording 1.1の
 strict再読込、redaction、process／Workspace cleanup、成功Recordingのoffline Replay、
 Replay Metrics一致を確認しました。この最小vertical sliceの結果は、一般的なモデル性能や
-Provider比較結果を示すものではありません。Phase 4のLive Campaignもpaired結果がないため
-Workflowの優劣を示しません。Antigravity、Provider比較、dashboard、notebook、統計的検定、
-並列schedulerは未実装です。
+Provider比較結果を示すものではありません。Phase 4 Campaign 002では3組のpaired結果を
+得ましたが、固定した1 Taskと各3反復の結果から普遍的なWorkflow優劣を示しません。
+Antigravity、Provider比較、dashboard、notebook、統計的検定、並列schedulerは未実装です。
 
 ## Quick Start
 
@@ -235,7 +239,7 @@ macOSはlocal process-tree testで検証済みです。Linux実装経路は有�
 - Phase 1: Replay Vertical Slice（完了）
 - Phase 2: Safe Runner, Evidence and Quality Gate（完了）
 - Phase 3: Codex CLI Provider（完了）
-- Phase 4: Workflow A/B Experiment（Current、Live Campaignは安全停止、paired結果0）
+- Phase 4: Workflow A/B Experiment（完了、Campaign 002は3/3 complete pairs）
 - Phase 5: Antigravity CLI Provider（Planned）
 - Phase 6: Multi-language Fixtures and Public Report
 - Phase 7: Optional Enhancements

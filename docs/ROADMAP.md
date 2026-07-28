@@ -73,7 +73,7 @@ Workspace cleanupを確認した。これによりPhase 3の最小vertical slice
 
 ## Phase 4: Workflow A/B Experiment
 
-**Status: Current**
+**Status: Complete**
 
 **目的:** 同一Provider上で`one_shot`と`staged`を比較する最初の反復実験を行う。
 
@@ -105,19 +105,24 @@ pairは0、`pairing.status=not_estimable`である。ArtifactはGit管理外で�
 Current、Phase 5はPlannedのままとする。Phase 4の1 Provider callはPhase 3 manual Live
 累計8試行へ加算しない。
 
-Python bytecode cache隔離修正commit
-`11dd86801bb9f87b49d51d351c736dd0667cb94e`を基準に、Campaign 002を
-`workflow-ab-codex-live-002`と新Artifact rootへoffline事前登録した。Campaign 001の
-`harness_failure`、complete pair 0、`not_estimable`は変更せず、Campaign 001の再実行、
-resume、report再生成も行わない。Campaign 002はCodex／`gpt-5.6-sol`／reasoning effort
-`high`、既存Task Prompt／Fixture、`one_shot`／`staged`各3反復、同じ4 Gate、seed 4401、
-Provider timeout 600000 ms、Campaign上限3600000 ms、`workspace-write`、network無効、
-最大失敗2、fail-fast無効を固定した。canonical Plan SHA-256は
-`375675a105b3de6b371551ab09c25014e3198d256bf09717e80fe20e747125ee`、planned runs／
-Provider callsは6／6、retry／fallback／resumeは0である。Plan／metadataはGit管理外で、
-Campaign、Recording、Evidence、Diagnostic、reportは未作成、全6 runは未実行である。
-実行にはreviewed commit、Plan SHA-256、`CODEX_HOME`、CLI version、最大6 Provider callsを
-含む別の人間による明示承認が必要である。Phase 4は`Current`、Phase 5は`Planned`のままとする。
+Python bytecode cache隔離修正後、reviewed commit
+`edd8c9e748998d056efa70fa43a26d10aa8ded12`、canonical Plan SHA-256
+`375675a105b3de6b371551ab09c25014e3198d256bf09717e80fe20e747125ee`のCampaign 002を、
+2026-07-28T11:00:21.701522Zから11:05:11.761906Zまで1回だけ実行した。planned／attempted／
+completed／failed／not_runは6／6／6／0／0、actual Provider callsは6、unknown callsは0、
+retry／fallback／resumeは0、Campaign outcomeは全run `success`、stop reasonは`none`である。
+`one_shot`／`staged`は各3 runを完了し、acceptance／regression／lint／typecheckは各6件
+すべてPASSした。scheduled／complete pairは3／3、`pairing.status=estimable`である。
+report JSON／Markdown SHA-256は
+`d819eb5a1403f623527dcf84c665e88f3ae0b49d6b0878d5dd9941c1f60f139a`／
+`936a44a9710d1dbd16ec815a97fac190f3bad4366b27b8b02cf11f7bc5d4af4a`である。
+Plan、Campaign、Recording、Evidence、reportはGit管理外に保持する。Campaign 001は
+`harness_failure`、complete pair 0、`not_estimable`のまま不変で、再実行、resume、report
+再生成を行っていない。Campaign 002も再実行しない。Phase 3 manual Live累計8試行は変更せず、
+Phase 4 Campaignのcall数と分離する。この固定Task、Prompt、Fixture、Gate、各3反復、
+当該環境・実行時期に限定された結果であり、一般的なモデル性能、統計的有意差、普遍的な
+Workflow優位性を示さない。受入条件を満たしたためPhase 4は`Complete`、Phase 5は
+`Planned`のままとする。
 
 ## Phase 5: Antigravity CLI Provider
 
