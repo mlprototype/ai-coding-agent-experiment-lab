@@ -16,8 +16,37 @@ Antigravity CLI / Replay Provider）は分離します。一度に変える独�
 
 ## 現在の状態
 
-Phase 0〜3を完了しました。**Phase 4: Workflow A/B Experiment** はPlannedであり、
-まだ着手していません。Phase 3までに次を提供します。
+Phase 0〜4を完了しました。**Phase 5: Antigravity CLI Provider** はPlannedです。
+offline実装とfake Codexによる受入を完了し、レビュー済みcommit
+`2abd653a7b42f8932c0005e6d7d3fdd1252845e0`に対する事前登録済みの実Codex Live A/B
+Campaignを2026-07-28に1回だけ実行しました。予定6 run／6 Provider callsに対し、最初の
+`staged` runを1回／1 call実行後、`harness_failure`で安全停止し、残り5 runは
+`not_run`です。complete pairは0、reportは`not_estimable`なのでPhase 4はCurrentのままです。
+Campaign 001のArtifactと失敗履歴は変更せず、判明したPython bytecode cache混入だけを
+offlineで修正しました。Provider processとGate commandには、run専用system temporary
+directory配下のHarness管理`PYTHONPYCACHEPREFIX`を明示し、bytecode cacheを評価Workspace
+から分離します。未知のbinary変更は従来どおり不完全Evidenceとして拒否します。
+Campaign 001は再実行しません。修正後の新しいLiveにも、新experiment ID、新Artifact root、
+新canonical Plan、reviewed commit、別の明示承認が必要です。
+
+bytecode cache修正後、reviewed commit
+`edd8c9e748998d056efa70fa43a26d10aa8ded12`、canonical Plan SHA-256
+`375675a105b3de6b371551ab09c25014e3198d256bf09717e80fe20e747125ee`のCampaign 002を、
+2026-07-28T11:00:21.701522Zから11:05:11.761906Zまで1回だけ実行しました。planned／
+attempted／completed／failed／not_runは6／6／6／0／0、actual Provider callsは6、
+unknown callsは0、retry／fallback／resumeは0、stop reasonは`none`です。`one_shot`と
+`staged`は各3 runが完了し、各runのacceptance／regression／lint／typecheckはすべてPASS
+しました。scheduled／complete pairは3／3で`pairing.status=estimable`です。
+report JSON／Markdown SHA-256はそれぞれ
+`d819eb5a1403f623527dcf84c665e88f3ae0b49d6b0878d5dd9941c1f60f139a`／
+`936a44a9710d1dbd16ec815a97fac190f3bad4366b27b8b02cf11f7bc5d4af4a`です。
+ArtifactはGit管理外に保持し、Campaign 001の`harness_failure`履歴は不変です。Campaign 001も
+Campaign 002も再実行しません。Phase 3 manual Live累計8試行は変更せず、Phase 4 Campaignの
+call数と分離します。この1 Task、固定Prompt／Fixture／Gate、各3反復、当該環境・実行時期の
+結果から、一般的なモデル性能、統計的有意差、普遍的なWorkflow優位性は主張しません。
+Phase 4はComplete、Phase 5はPlannedです。
+
+Phase 4までに次を提供します。
 
 - バージョン付きExperimentSpec、RunMetrics、UsageMetrics、CapabilityReport
 - YAML Specの検証
@@ -33,8 +62,15 @@ Phase 0〜3を完了しました。**Phase 4: Workflow A/B Experiment** はPlann
 - read-only Codex CLI preflightと、明示確認が必要な`agentlab live-codex`
 - stdin Prompt、上限付きincremental JSONL parser、redaction済みCodex Evidence
 - 2イベントのLive Recording 1.1と、その成功記録のoffline Replay
+- 正確なevaluation durationを持つLive Artifact 1.1と、1.0のstrict読込互換
 - Provider成功後に同じ使い捨てWorkspaceで品質Gateを実行する最小vertical slice
 - strict paired成果物を構築できない場合だけの独立したFailure Diagnostic 1.0
+- 後方互換なExperimentSpec 1.0とは分離したstrict Workflow A/B Spec 2.0
+- Task要件を共有しWorkflow指示だけを変えるversion付きPrompt builder
+- SHA-256によるseed付きblock順序と、byte決定的なcanonical Plan 1.1
+- 1 run = 1 Provider turn = 1 agent callを維持する逐次Campaign scheduler
+- append-only Campaign 1.1、stop condition、固定run/failure/停止理由Enum
+- 保存済みPlan、Campaign、Recording、Evidenceだけを読むJSON/Markdown集計
 
 ReplayはRecording内の保存済みMetricsだけを再構成し、外部処理を呼びません。通常テストは
 短時間のfake Codex executableだけを使い、実Codex、外部AI、network、quotaを呼びません。
@@ -46,9 +82,9 @@ agent callは1、retry／fallbackは0で、`turn.completed` 1件、Provider exit
 `task.txt`の期待した1行変更、4種類のQuality Gate全PASS、Evidence 1.5／Recording 1.1の
 strict再読込、redaction、process／Workspace cleanup、成功Recordingのoffline Replay、
 Replay Metrics一致を確認しました。この最小vertical sliceの結果は、一般的なモデル性能や
-Provider比較結果を示すものではありません。
-scheduler、staged Workflow、Workflow A/B、Antigravity、Provider比較、比較レポートは
-未実装です。
+Provider比較結果を示すものではありません。Phase 4 Campaign 002では3組のpaired結果を
+得ましたが、固定した1 Taskと各3反復の結果から普遍的なWorkflow優劣を示しません。
+Antigravity、Provider比較、dashboard、notebook、統計的検定、並列schedulerは未実装です。
 
 ## Quick Start
 
@@ -60,6 +96,9 @@ uv run agentlab doctor
 uv run agentlab doctor --json
 uv run agentlab validate experiments/examples/workflow-smoke.yaml
 uv run agentlab validate experiments/examples/codex-live-smoke.yaml
+uv run agentlab validate-workflow experiments/examples/workflow-ab.yaml
+uv run agentlab plan-workflow experiments/examples/workflow-ab.yaml \
+  --output .artifacts/workflow-ab/plan.json
 uv run agentlab replay experiments/examples/workflow-smoke.yaml \
   --output .artifacts/runs/workflow-smoke-run-001.json
 uv run agentlab run-gates experiments/examples/workflow-smoke.yaml \
@@ -71,6 +110,51 @@ uv run pytest
 uv run ruff check .
 uv run mypy src
 ```
+
+`plan-workflow`は外部AI、Provider、network、Gateを呼びません。canonical Planには現在時刻を
+混入させず、同じSpec bytes、Task Prompt、Fixture、seedから同じbytesを生成します。作成時刻は
+Plan SHA-256を持つ`plan.metadata.json`へ分離します。Planと予約Artifact pathはcreate-onlyで、
+開始済みCampaignの変更や自動resumeは行いません。
+Plan 1.1は`one_shot`／`staged`それぞれの生成Prompt SHA-256とbyte数も事前登録します。
+Campaign開始時にTask Prompt bytesとFixture全file bytesを一度だけ固定し、全runのadapterを
+そのin-memory snapshotから構築します。各run開始前のsource integrity checkで変更を検出した
+場合は、次のProvider callを開始せず`input_changed`で停止します。
+
+Live Campaignの形式は次です。事前登録済みCampaignは上記のとおり1回だけ実行し、再実行
+しません。`--confirm-live-codex`と、
+Planに表示された予定Provider call総数と一致する`--confirm-provider-calls`の両方がなければ、
+version/help preflightを含むsubprocessを起動しません。
+`experiments/examples/workflow-ab.yaml`のmodelはfake受入専用であり、実Codex Liveには
+使用しません。Live前に人間がexact model IDを明示したレビュー済みSpecを別途事前登録します。
+
+```console
+uv run agentlab run-workflow-campaign <reviewed-phase4-spec.yaml> \
+  --plan .artifacts/workflow-ab/plan.json \
+  --campaign .artifacts/workflow-ab/campaign.jsonl \
+  --confirm-live-codex \
+  --confirm-provider-calls 6
+
+uv run agentlab report-workflow <reviewed-phase4-spec.yaml> \
+  --plan .artifacts/workflow-ab/plan.json \
+  --campaign .artifacts/workflow-ab/campaign.jsonl \
+  --output .artifacts/workflow-ab/report.json \
+  --markdown .artifacts/workflow-ab/report.md
+```
+
+`one_shot`と`staged`はいずれも単一Prompt、単一Provider process、単一turn、agent call 1です。
+`staged`の調査、計画、テスト確認・追加、実装、自己レビューは一つのturn内の論理段階で、
+内部の計画、reasoning、agent message、stage出力は保存・評価しません。比較軸はWorkflow
+Promptだけで、Provider、exact model ID、reasoning effort、Fixture、Gate、sandbox、
+network設定、timeout、停止条件はCampaign全体で固定します。詳細は
+[docs/WORKFLOW_AB.md](docs/WORKFLOW_AB.md)を参照してください。
+
+adapter用Prompt fileはArtifact root外のsystem temporary directoryだけに作成します。
+cleanup結果はCampaignへ`cleared`／`failed`として保存し、失敗時は`cleanup_failure`で即時停止
+してPrompt fileをbest-effortでredactします。cleanup中の`KeyboardInterrupt`／`SystemExit`も
+cleanup失敗としてCampaignを完結させてから元の中断を再送出します。offline reportはPlan、
+Campaign、Evidence、Recordingのrun identity、outcome、Provider call数、Prompt/Fixture
+fingerprint、model、reasoning effort、成功・失敗両方のevaluation summaryを相互照合し、
+矛盾するpairを拒否します。
 
 次はPhase 3で使用したmanual smokeのCLI形式です。実Codexを使うため、通常テストやCIでは
 実行しません。承認済みmanual smokeは累計8試行で、過去runを再実行しません。新しい実行は
@@ -155,8 +239,8 @@ macOSはlocal process-tree testで検証済みです。Linux実装経路は有�
 - Phase 1: Replay Vertical Slice（完了）
 - Phase 2: Safe Runner, Evidence and Quality Gate（完了）
 - Phase 3: Codex CLI Provider（完了）
-- Phase 4: Workflow A/B Experiment（Planned、未着手）
-- Phase 5: Antigravity CLI Provider
+- Phase 4: Workflow A/B Experiment（完了、Campaign 002は3/3 complete pairs）
+- Phase 5: Antigravity CLI Provider（Planned）
 - Phase 6: Multi-language Fixtures and Public Report
 - Phase 7: Optional Enhancements
 

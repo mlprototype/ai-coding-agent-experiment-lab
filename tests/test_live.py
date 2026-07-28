@@ -112,6 +112,7 @@ def _fake_codex(
         "PATH": f"{fake_directory}{os.pathsep}{os.environ.get('PATH', '')}",
         "HOME": str(tmp_path / "parent-home"),
         "CODEX_HOME": str(codex_home),
+        "PYTHONPYCACHEPREFIX": str(tmp_path / "parent-python-bytecode-cache"),
         "OPENAI_API_KEY": "synthetic-openai-api-key",
         "CODEX_API_KEY": "synthetic-codex-api-key",
         "AGENTLAB_PARENT_SECRET": "synthetic-parent-environment-secret",
@@ -204,7 +205,11 @@ def _success_code(*, binary: bool = False) -> str:
         "'openai_key':os.environ.get('OPENAI_API_KEY'),"
         "'codex_key':os.environ.get('CODEX_API_KEY'),"
         "'parent_secret':os.environ.get('AGENTLAB_PARENT_SECRET'),"
-        "'codex_home_present':'CODEX_HOME' in os.environ"
+        "'codex_home_present':'CODEX_HOME' in os.environ,"
+        "'cwd':str(pathlib.Path.cwd()),"
+        "'pycache_prefix':os.environ.get('PYTHONPYCACHEPREFIX'),"
+        "'pycache_exists':pathlib.Path("
+        "os.environ['PYTHONPYCACHEPREFIX']).is_dir()"
         "}),encoding='utf-8')\n"
         f"{change}\n"
         "print(json.dumps({'type':'thread.started','thread_id':'raw-thread-secret'}),flush=True)\n"
@@ -341,6 +346,19 @@ def test_live_success_runs_provider_and_gates_in_same_workspace_and_replays(
         tmp_path,
         prompt=f"Make the deterministic edit. {prompt_secret}",
     )
+    (fixture / "tag_normalizer.py").write_text(
+        "def normalize_tags(tags: list[str]) -> list[str]:\n"
+        "    return []\n",
+        encoding="utf-8",
+    )
+    raw_spec = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
+    raw_spec["quality_gate"]["lint"] = [
+        ["python3", "-m", "py_compile", "tag_normalizer.py"]
+    ]
+    spec_path.write_text(
+        yaml.safe_dump(raw_spec, sort_keys=False),
+        encoding="utf-8",
+    )
     environment, inspection = _fake_codex(
         tmp_path,
         live_code=_success_code(),
@@ -385,13 +403,23 @@ def test_live_success_runs_provider_and_gates_in_same_workspace_and_replays(
         recording.completed.codex.provider_failure_hint
         is CodexProviderFailureHint.NOT_APPLICABLE
     )
-    assert artifact.schema_version == "1.0"
+    assert artifact.schema_version == "1.1"
+    assert artifact.evaluation_duration_ms == artifact.metrics.evaluation_duration_ms
     assert observed["prompt"].endswith(prompt_secret)
     assert observed["codex_home_present"] is True
     assert observed["openai_key"] is None
     assert observed["codex_key"] is None
     assert observed["parent_secret"] is None
+    provider_pycache = Path(observed["pycache_prefix"])
+    assert observed["pycache_exists"] is True
+    assert provider_pycache.is_absolute()
+    assert not provider_pycache.is_relative_to(Path(observed["cwd"]))
+    assert provider_pycache != Path(environment["PYTHONPYCACHEPREFIX"])
+    assert not provider_pycache.exists()
+    assert str(provider_pycache) not in persisted
+    assert environment["PYTHONPYCACHEPREFIX"] not in persisted
     assert (fixture / "task.txt").read_text(encoding="utf-8") == "status=TODO\n"
+    assert not (fixture / "__pycache__").exists()
     assert not _diagnostic_path(output).exists()
     for secret in (
         prompt_secret,
@@ -417,6 +445,45 @@ def test_live_success_runs_provider_and_gates_in_same_workspace_and_replays(
 
     assert result.execution_mode.value == "replay"
     assert result.metrics == artifact.metrics
+
+
+def test_live_artifact_1_0_remains_strict_loadable(tmp_path: Path) -> None:
+    spec_path, _fixture, _prompt_path, output = _write_case(tmp_path)
+    environment, _inspection = _fake_codex(
+        tmp_path,
+        live_code=_success_code(),
+    )
+    artifact = _run(spec_path, output, environment).artifact
+    legacy_payload = artifact.model_dump(mode="json")
+    legacy_payload["schema_version"] = "1.0"
+    del legacy_payload["evaluation_duration_ms"]
+    legacy_path = tmp_path / "legacy-live-evidence.json"
+    legacy_path.write_text(
+        json.dumps(legacy_payload, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    legacy = load_live_artifact(legacy_path)
+    assert legacy.schema_version == "1.0"
+    assert legacy.evaluation_duration_ms is None
+    assert "evaluation_duration_ms" not in legacy.model_dump(mode="json")
+
+    legacy_payload["evaluation_duration_ms"] = 0
+    legacy_path.write_text(
+        json.dumps(legacy_payload, sort_keys=True),
+        encoding="utf-8",
+    )
+    with pytest.raises(LiveArtifactLoadError, match=r"1\.0"):
+        load_live_artifact(legacy_path)
+
+    current_payload = artifact.model_dump(mode="json")
+    del current_payload["evaluation_duration_ms"]
+    legacy_path.write_text(
+        json.dumps(current_payload, sort_keys=True),
+        encoding="utf-8",
+    )
+    with pytest.raises(LiveArtifactLoadError, match=r"1\.1"):
+        load_live_artifact(legacy_path)
 
 
 def test_live_pre_turn_warning_is_nonfatal_and_runs_gates(tmp_path: Path) -> None:

@@ -138,13 +138,16 @@ def test_parent_secret_is_not_inherited_and_temp_paths_are_normalized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     secret = "phase2-synthetic-secret-value"
+    parent_pycache = tmp_path / "parent-python-bytecode-cache"
     monkeypatch.setenv("AGENTLAB_SYNTHETIC_SECRET", secret)
+    monkeypatch.setenv("PYTHONPYCACHEPREFIX", str(parent_pycache))
     script = (
         "import os;"
         "print(os.environ.get('AGENTLAB_SYNTHETIC_SECRET','not_present'));"
         "print(os.environ['HOME']);"
         "print(os.environ['TMPDIR']);"
-        "print(os.environ['XDG_CACHE_HOME'])"
+        "print(os.environ['XDG_CACHE_HOME']);"
+        "print(os.environ['PYTHONPYCACHEPREFIX'])"
     )
 
     result = _run(tmp_path, [sys.executable, "-c", script])
@@ -155,6 +158,14 @@ def test_parent_secret_is_not_inherited_and_temp_paths_are_normalized(
     assert "<TEMP_HOME>" in result.evidence.stdout
     assert "<TEMP_DIR>" in result.evidence.stdout
     assert "<TEMP_CACHE>" in result.evidence.stdout
+    assert "<PYTHON_BYTECODE_CACHE>/acceptance-000" in result.evidence.stdout
+    assert str(parent_pycache) not in result.evidence.stdout
+    assert (
+        tmp_path
+        / "environment"
+        / "python-bytecode-cache"
+        / "acceptance-000"
+    ).is_dir()
 
 
 def test_invalid_utf8_output_uses_replacement_character(tmp_path: Path) -> None:

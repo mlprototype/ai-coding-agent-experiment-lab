@@ -69,19 +69,60 @@ retry／fallback 0、Provider exit 0、`turn.completed` 1件、`turn.failed` 0�
 `task.txt`だけを期待どおり変更した。4種類のQuality Gateは全PASSし、Evidence 1.5／
 Recording 1.1のstrict再読込、offline Replay、Metrics一致、redaction、process group／
 Workspace cleanupを確認した。これによりPhase 3の最小vertical slice受入を完了した。
-この結果は一般的なモデル性能やProvider比較を示さず、Phase 4はPlannedのまま未着手である。
+この結果は一般的なモデル性能やProvider比較を示さない。
 
 ## Phase 4: Workflow A/B Experiment
 
-**Status: Planned**
+**Status: Complete**
 
 **目的:** 同一Provider上で`one_shot`と`staged`を比較する最初の反復実験を行う。
 
-**成果物:** 二つのWorkflow定義、seed付き実行順生成、反復scheduler、事前登録Spec、
-内部分析notebookまたは集計データ。
+**成果物:** 二つの単一turn Workflow定義、後方互換なSpec 2.0、seed付きblock順序、
+byte決定的なcanonical Plan、逐次scheduler、append-only Campaign、JSON/Markdown集計。
 
-**受入条件:** Provider、fixture、Gateを固定し、順序と全runの状態を記録する。欠測と
-停止条件を説明でき、結論をベンチマーク範囲に限定する。
+**受入条件:** offline実装とfake Codex受入は完了した。Provider、exact model、fixture、
+Gate、sandbox、network、timeoutを固定し、両Workflowとも1 run = 1 Provider turn =
+1 agent callとする。順序と全run状態を記録し、欠測と停止条件を説明し、結論をFixture、
+Prompt、Gate、環境、実行時期へ限定する。Completeには、別の人間の明示指示により
+レビュー済みcommitへ事前登録した1 Task×2 Workflow×各3反復（最大6 Provider calls）の
+実Codex Campaignを実行し、最低1組のpaired結果をoffline集計する必要がある。安全停止で
+pairが成立しない場合はCurrentのままとし、失敗runを再実行しない。
+
+2026-07-28T09:26:35Zに、事前登録commit
+`2abd653a7b42f8932c0005e6d7d3fdd1252845e0`、canonical Plan SHA-256
+`9caf1847677adfcd6ef7aac59b2298bfbc9113577d75e49a7976de0b068e19de`のLive Campaignを
+1回だけ開始した。予定6 run／6 Provider callsに対し、Plan先頭の`staged` runだけを
+attemptし、actual Provider callは1、call count unknownは0だった。Provider turnはexit 0、
+`turn_completed`で、4種類のGateも各1件PASSした。一方、lintの`py_compile`が作成した
+`__pycache__/tag_normalizer.cpython-313.pyc`をbinary diffとして検出し、行数Evidenceを
+完全に構築できなかったため、runは`harness_error`／`evidence_error`となった。Provider
+process group、Workspace、adapterはいずれも回収済みである。
+
+Campaignは`harness_failure`で停止し、残り5 runを`not_run`として記録した。retry、
+fallback、resumeは0で、offline reportは1回だけ生成した。scheduled pair 3に対しcomplete
+pairは0、`pairing.status=not_estimable`である。ArtifactはGit管理外で保持し、このCampaignや
+失敗run、reportを再実行しない。比較可能なpairがないためWorkflowの優劣を述べず、Phase 4は
+Current、Phase 5はPlannedのままとする。Phase 4の1 Provider callはPhase 3 manual Live
+累計8試行へ加算しない。
+
+Python bytecode cache隔離修正後、reviewed commit
+`edd8c9e748998d056efa70fa43a26d10aa8ded12`、canonical Plan SHA-256
+`375675a105b3de6b371551ab09c25014e3198d256bf09717e80fe20e747125ee`のCampaign 002を、
+2026-07-28T11:00:21.701522Zから11:05:11.761906Zまで1回だけ実行した。planned／attempted／
+completed／failed／not_runは6／6／6／0／0、actual Provider callsは6、unknown callsは0、
+retry／fallback／resumeは0、Campaign outcomeは全run `success`、stop reasonは`none`である。
+`one_shot`／`staged`は各3 runを完了し、acceptance／regression／lint／typecheckは各6件
+すべてPASSした。scheduled／complete pairは3／3、`pairing.status=estimable`である。
+report JSON／Markdown SHA-256は
+`d819eb5a1403f623527dcf84c665e88f3ae0b49d6b0878d5dd9941c1f60f139a`／
+`936a44a9710d1dbd16ec815a97fac190f3bad4366b27b8b02cf11f7bc5d4af4a`である。
+Plan、Campaign、Recording、Evidence、reportはGit管理外に保持する。Campaign 001は
+`harness_failure`、complete pair 0、`not_estimable`のまま不変で、再実行、resume、report
+再生成を行っていない。Campaign 002も再実行しない。Phase 3 manual Live累計8試行は変更せず、
+Phase 4 Campaignのcall数と分離する。この固定Task、Prompt、Fixture、Gate、各3反復、
+当該環境・実行時期に限定された結果であり、一般的なモデル性能、統計的有意差、普遍的な
+Workflow優位性を示さない。受入条件を満たしたためPhase 4は`Complete`、Phase 5は
+`Planned`のままとする。
 
 ## Phase 5: Antigravity CLI Provider
 

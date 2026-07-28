@@ -35,6 +35,7 @@ _CHILD_ENV_ALLOWLIST = (
 )
 _READ_CHUNK_BYTES = 64 * 1024
 _POLL_INTERVAL_SECONDS = 0.01
+_PYTHON_BYTECODE_CACHE_DIRECTORY = "python-bytecode-cache"
 
 
 class UnsupportedRunnerPlatformError(RuntimeError):
@@ -145,13 +146,35 @@ def ensure_runner_platform_supported() -> None:
         )
 
 
+def prepare_python_bytecode_cache_root(
+    environment_root: Path,
+    *,
+    namespace: str,
+) -> Path:
+    """Create one Harness-owned Python bytecode cache below a run temp root."""
+    if (
+        not namespace
+        or Path(namespace).name != namespace
+        or namespace in {".", ".."}
+    ):
+        raise ValueError("Python bytecode cache namespace must be one path component")
+    cache_root = environment_root / _PYTHON_BYTECODE_CACHE_DIRECTORY / namespace
+    cache_root.mkdir(parents=True, exist_ok=True)
+    return cache_root
+
+
 def build_child_environment(
     environment_root: Path,
     *,
+    bytecode_cache_namespace: str = "command",
     parent_environment: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Build a minimal environment without inheriting arbitrary parent secrets."""
     parent = os.environ if parent_environment is None else parent_environment
+    bytecode_cache_root = prepare_python_bytecode_cache_root(
+        environment_root,
+        namespace=bytecode_cache_namespace,
+    )
     environment = {
         name: parent[name]
         for name in _CHILD_ENV_ALLOWLIST
@@ -163,6 +186,7 @@ def build_child_environment(
             "TMPDIR": str(environment_root / "tmp"),
             "XDG_CACHE_HOME": str(environment_root / "cache"),
             "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPYCACHEPREFIX": str(bytecode_cache_root),
         }
     )
     return environment
@@ -180,6 +204,9 @@ def _normalize_text(
         str(environment_root / "home"): "<TEMP_HOME>",
         str(environment_root / "tmp"): "<TEMP_DIR>",
         str(environment_root / "cache"): "<TEMP_CACHE>",
+        str(
+            environment_root / _PYTHON_BYTECODE_CACHE_DIRECTORY
+        ): "<PYTHON_BYTECODE_CACHE>",
         str(temporary_root): "<RUN_TEMP>",
     }
     normalized = value
@@ -440,6 +467,7 @@ class LocalCommandRunner:
         started_monotonic = time.monotonic()
         child_environment = build_child_environment(
             environment_root,
+            bytecode_cache_namespace=f"{gate.value}-{command_index:03d}",
             parent_environment=parent_environment,
         )
 

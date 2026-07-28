@@ -3,8 +3,9 @@
 ## Scope
 
 Phase 3は、1 task・1 Codex Provider・1 repetition・`one_shot`を人間が手動実行する最小
-vertical sliceである。scheduler、staged Workflow、比較実験、自動retryはPhase 4以降で
-あり、実装していない。通常テストはfake Codexだけを使う。manual Liveは累計8試行で、
+vertical sliceである。scheduler、staged Workflow、比較実験はPhase 4の独立契約として
+実装し、Phase 3 Providerの責務へ混在させない。自動retryは実装しない。通常テストはfake
+Codexだけを使う。manual Liveは累計8試行で、
 008のAgentLab製品経路とoffline ReplayによってPhase 3の最小vertical slice受入を完了した。
 過去runは再実行せず、新しいLiveにはレビュー済みcommit、新しいSpec／run-id／出力先、
 別の明示承認を必要とする。
@@ -87,7 +88,9 @@ API通信は必要で、Phase 3はfirewall、VM、containerによる完全なnet
 保存しない。未設定、相対path、存在しないpathはpreflight前に拒否し、`HOME/.codex`へ
 fallbackしない。品質Gateは別の
 Phase 2 allowlist環境と専用の一時HOME/TMP/cacheで起動するため、Provider側の一時環境や
-`CODEX_HOME`を受け取らない。
+`CODEX_HOME`を受け取らない。Provider processとGate commandにはそれぞれrun専用system
+temporary root配下のHarness管理`PYTHONPYCACHEPREFIX`を設定し、親の同名変数を継承しない。
+実値はEvidence、Recording、Diagnosticへ保存せず、run cleanupでcache rootも回収する。
 
 ## Incremental JSONL parser
 
@@ -173,7 +176,8 @@ traceback、filesystem pathはDiagnosticへ保存しない。任意の例外clas
 
 既存CodexExecutionEvidence 1.1は`failure_stage`なし、1.2は1.3以降のlifecycle fieldなしで
 引き続きstrict loaderが受理する。1.1〜1.4のvalidatorを緩めず、新規Evidenceだけを
-1.5で保存する。保存済みCodex Evidence 1.1〜1.4、Recording 1.1、Live Artifact 1.0、
+1.5で保存する。新規Live Artifact 1.1は成功・失敗を問わず正確なevaluation durationを
+保持する。保存済みCodex Evidence 1.1〜1.4、Recording 1.1、Live Artifact 1.0、
 Failure Diagnostic 1.0を変換・上書きせず後方互換で読み込める。旧1.2の
 `provider_orchestration` fallbackはrunner内部の観測状態を保持しなかったため、そこから
 Provider起動、Prompt送信、model API到達、quota消費、process group回収の有無を確定しては
@@ -242,9 +246,11 @@ acceptance Gateが1件以上あることを要求して、矛盾をloaderで拒�
 `preflight_not_completed`は`not_created`だけ、
 `provider_invocation_attempted`は作成済みWorkspaceだけを許容する。
 
-EvidenceはRecording bytesのSHA-256を一方向参照する。成功Recording 1.1は外部CLI、
-subprocess、network、GateなしでReplay Resultへ変換できる。失敗RecordingはMetricsが
-ない理由を示して拒否する。Recording 1.0とPhase 1 Result bytesは変更しない。
+EvidenceはRecording bytesのSHA-256を一方向参照する。Live Artifact 1.1のGate Evidence、
+diff、Workspace lifecycle、evaluation durationからRecordingのevaluation summaryを完全に
+再構成できる。成功Recording 1.1は外部CLI、subprocess、network、GateなしでReplay Resultへ
+変換できる。失敗RecordingはMetricsがない理由を示して拒否する。Recording 1.0とPhase 1
+Result bytesは変更しない。
 
 ## 保証できないこととPhase 4境界
 
@@ -336,4 +342,19 @@ Evidence／RecordingとMetricsが一致した。
 
 manual Live 006／007の失敗・不明履歴を上書きせず、008の成功だけを選別しない。Phase 3の
 最小vertical slice受入は完了したが、この結果は一般的な`gpt-5.6-sol`性能やProvider比較を
-示さない。Phase 4はPlannedのまま未着手である。
+示さない。Phase 3 manual Liveは累計8試行のままである。
+
+Phase 4 Campaign 001は2026-07-28に1回だけ開始し、予定6 Provider callsのうち1 call後、
+`py_compile` bytecode cacheのbinary diffによる`harness_error`／`evidence_error`で安全停止
+した。残り5 runは`not_run`、complete pair 0、report `not_estimable`の履歴を変更せず、
+Campaign、失敗run、reportを再実行しない。
+
+bytecode cache隔離修正後、reviewed commit
+`edd8c9e748998d056efa70fa43a26d10aa8ded12`、canonical Plan SHA-256
+`375675a105b3de6b371551ab09c25014e3198d256bf09717e80fe20e747125ee`のCampaign 002を
+1回だけ実行した。6 run／6 callsがすべて`turn_completed`かつ4 Gate PASSとなり、
+retry／fallback／resume、unknown call、Harness／cleanup failureは0だった。scheduled／
+complete pairは3／3、reportは`estimable`である。ArtifactはGit管理外に保持し、Campaign 002も
+再実行しない。Phase 3 manual Live累計8試行へPhase 4のcall数を加算しない。この固定Taskと
+各3反復の結果を一般的なモデル性能、統計的有意差、普遍的なWorkflow優位性として扱わない。
+Phase 4はComplete、Phase 5はPlannedのままである。

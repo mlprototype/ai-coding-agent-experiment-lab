@@ -1,0 +1,47 @@
+schema_version: "2.0"
+experiment_id: workflow-ab-codex-live-001
+title: Phase 4 final Codex Live Workflow A/B acceptance
+research_question: How do the two fixed Workflow Prompts behave on this tag normalization task?
+hypothesis: The Workflow Prompt structure may change observed outcomes under these fixed conditions.
+comparison_axis: workflow
+control: one_shot
+treatment: staged
+provider: codex
+model: gpt-5.6-sol
+reasoning_effort: high
+task_ids:
+  - tag-normalizer
+repetitions: 3
+random_seed: 4401
+task_prompt_path: prompts/tag-normalizer-v1.md
+task_prompt_revision: tag-normalizer-task-v1
+one_shot_revision: one-shot-v1
+staged_revision: staged-v1
+fixture_revision: python-tag-normalizer-v1
+provider_timeout_ms: 600000
+max_prompt_bytes: 65536
+max_event_line_bytes: 1048576
+max_provider_output_bytes: 16777216
+sandbox: workspace-write
+network_access: false
+quality_gate:
+  acceptance:
+    - [python3, check.py, acceptance]
+  regression:
+    - [python3, check.py, regression]
+  lint:
+    - [python3, -m, py_compile, tag_normalizer.py]
+  typecheck:
+    - [python3, check.py, typecheck]
+runner:
+  fixture_path: fixtures/tag-normalizer-v1
+  command_timeout_ms: 10000
+  termination_grace_ms: 1000
+  max_output_bytes: 65536
+  max_diff_bytes: 1048576
+stop_conditions:
+  max_failures: 2
+  max_total_duration_ms: 3600000
+  fail_fast: false
+artifacts:
+  root: .artifacts/workflow-ab-codex-live-001
