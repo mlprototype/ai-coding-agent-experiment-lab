@@ -28,6 +28,20 @@ directory配下のHarness管理`PYTHONPYCACHEPREFIX`を明示し、bytecode cach
 から分離します。未知のbinary変更は従来どおり不完全Evidenceとして拒否します。
 Campaign 001は再実行しません。修正後の新しいLiveにも、新experiment ID、新Artifact root、
 新canonical Plan、reviewed commit、別の明示承認が必要です。
+
+bytecode cache修正commit
+`11dd86801bb9f87b49d51d351c736dd0667cb94e`を基準に、Campaign 002を新experiment ID
+`workflow-ab-codex-live-002`と新Artifact rootへoffline事前登録しました。canonical Plan
+SHA-256は`375675a105b3de6b371551ab09c25014e3198d256bf09717e80fe20e747125ee`で、
+planned runs／Provider callsは6／6、retry／fallback／resumeは0です。Campaign 002は未実行で、
+Campaign、Recording、Evidence、Diagnostic、reportは作成していません。Specは
+Codex／`gpt-5.6-sol`／reasoning effort `high`、Task `tag-normalizer`、
+`one_shot`／`staged`各3反復、seed 4401、既存Task Prompt／Fixture／4 Gate、
+Provider timeout 600000 ms、Campaign上限3600000 ms、`workspace-write`、network無効、
+最大失敗2、fail-fast無効を固定しています。PlanとmetadataはGit管理外です。実行には
+reviewed commit、Plan SHA-256、`CODEX_HOME`、CLI version、最大6 Provider callsを含む
+別の人間による明示承認が必要です。Phase 4はCurrent、Phase 5はPlannedのままです。
+
 Phase 4までに次を提供します。
 
 - バージョン付きExperimentSpec、RunMetrics、UsageMetrics、CapabilityReport

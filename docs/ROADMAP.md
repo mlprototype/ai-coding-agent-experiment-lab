@@ -105,6 +105,20 @@ pairは0、`pairing.status=not_estimable`である。ArtifactはGit管理外で�
 Current、Phase 5はPlannedのままとする。Phase 4の1 Provider callはPhase 3 manual Live
 累計8試行へ加算しない。
 
+Python bytecode cache隔離修正commit
+`11dd86801bb9f87b49d51d351c736dd0667cb94e`を基準に、Campaign 002を
+`workflow-ab-codex-live-002`と新Artifact rootへoffline事前登録した。Campaign 001の
+`harness_failure`、complete pair 0、`not_estimable`は変更せず、Campaign 001の再実行、
+resume、report再生成も行わない。Campaign 002はCodex／`gpt-5.6-sol`／reasoning effort
+`high`、既存Task Prompt／Fixture、`one_shot`／`staged`各3反復、同じ4 Gate、seed 4401、
+Provider timeout 600000 ms、Campaign上限3600000 ms、`workspace-write`、network無効、
+最大失敗2、fail-fast無効を固定した。canonical Plan SHA-256は
+`375675a105b3de6b371551ab09c25014e3198d256bf09717e80fe20e747125ee`、planned runs／
+Provider callsは6／6、retry／fallback／resumeは0である。Plan／metadataはGit管理外で、
+Campaign、Recording、Evidence、Diagnostic、reportは未作成、全6 runは未実行である。
+実行にはreviewed commit、Plan SHA-256、`CODEX_HOME`、CLI version、最大6 Provider callsを
+含む別の人間による明示承認が必要である。Phase 4は`Current`、Phase 5は`Planned`のままとする。
+
 ## Phase 5: Antigravity CLI Provider
 
 **Status: Planned**

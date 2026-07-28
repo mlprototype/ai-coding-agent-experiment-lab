@@ -148,3 +148,20 @@ bytecode cacheをrun専用system temporary root内かつ評価Workspace外へ隔
 Campaign 001は再実行しない。修正後のLiveを行う場合も、新experiment ID、新Artifact root、
 新canonical Plan、reviewed commit、別の人間による明示承認を必要とする。Phase 4は
 `Current`、Phase 5は`Planned`のままである。
+
+bytecode cache修正commit
+`11dd86801bb9f87b49d51d351c736dd0667cb94e`の既存Task Prompt、Fixture、Workflow Prompt、
+Gateを変更せず、Campaign 002を新experiment ID `workflow-ab-codex-live-002`と新Artifact
+rootへoffline事前登録した。ProviderはCodex、exact modelは`gpt-5.6-sol`、reasoning effortは
+`high`、Taskは`tag-normalizer`、Workflowは`one_shot`／`staged`、各3反復、seedは4401である。
+acceptance／regression／lint／typecheckを各1件とし、Provider timeout 600000 ms、
+Campaign上限3600000 ms、`workspace-write`、network無効、最大失敗2、fail-fast無効を固定した。
+canonical Plan SHA-256は
+`375675a105b3de6b371551ab09c25014e3198d256bf09717e80fe20e747125ee`で、
+planned runs／Provider callsは6／6、retry／fallback／resumeは0である。
+
+Campaign 002のPlan／metadataはGit管理外に保持し、Campaign、Recording、Evidence、
+Diagnostic、reportは作成していない。全6 runは未実行であり、実行にはreviewed commit、
+Plan SHA-256、`CODEX_HOME`、CLI version、最大6 Provider callsを含む別の人間による明示承認を
+必要とする。Campaign 001は`harness_failure`、complete pair 0の履歴のまま再実行、resume、
+report再生成を行わない。Phase 4は`Current`、Phase 5は`Planned`のままである。
