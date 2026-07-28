@@ -126,15 +126,24 @@ Workflow優位性を示さない。受入条件を満たしたためPhase 4は`C
 
 ## Phase 5: Antigravity CLI Provider
 
-**Status: Planned**
+**Status: Current**
 
 **目的:** Antigravity CLIを同じProvider境界へ接続し、Provider比較を可能にする。
+
+**現在の範囲:** 2026-07-28に
+[offline設計](ANTIGRAVITY_PROVIDER.md)を確定した。最初のsliceはversion付き契約、
+strict `stream-json` parser、read-only version/help preflight、redaction済みEvidence、
+fake `agy`受入だけを実装する。実`agy -p`、認証、model catalog、quota利用、Live、
+Provider比較は承認していない。公式headless interfaceではPromptがargvへ載るため、
+Prompt transportの安全方針を別の人間判断で解決するまでLiveはfail closedとする。
 
 **成果物:** Antigravity adapter、能力/版preflight、event正規化、Record/Replay、
 Provider比較Spec。
 
 **受入条件:** Phase 3と同じ安全・証跡基準を満たす。Workflowを固定した反復比較ができ、
-Provider固有欠測を明示する。モデル単体比較と表現しない。
+Provider固有欠測を明示する。モデル単体比較と表現しない。offline sliceは外部AI、
+network、認証、quota、実Antigravity Provider callを0件に保ち、既存schemaとPhase 0〜4の
+互換性を維持する。
 
 ## Phase 6: Multi-language Fixtures and Public Report
 
