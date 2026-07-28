@@ -16,7 +16,11 @@ Antigravity CLI / Replay Provider）は分離します。一度に変える独�
 
 ## 現在の状態
 
-Phase 0〜4を完了しました。**Phase 5: Antigravity CLI Provider** はPlannedです。
+Phase 0〜4を完了しました。**Phase 5: Antigravity CLI Provider** はCurrentです。
+2026-07-28に[offline設計](docs/ANTIGRAVITY_PROVIDER.md)を確定し、Antigravityへ渡す最初の
+実装範囲をversion付き契約、strict stream parser、read-only preflight、redaction済み
+Evidence、fake `agy`受入へ限定しました。実Antigravity Provider call、認証、model catalog、
+quota利用、Live、Provider比較は未着手です。
 offline実装とfake Codexによる受入を完了し、レビュー済みcommit
 `2abd653a7b42f8932c0005e6d7d3fdd1252845e0`に対する事前登録済みの実Codex Live A/B
 Campaignを2026-07-28に1回だけ実行しました。予定6 run／6 Provider callsに対し、最初の
@@ -240,7 +244,7 @@ macOSはlocal process-tree testで検証済みです。Linux実装経路は有�
 - Phase 2: Safe Runner, Evidence and Quality Gate（完了）
 - Phase 3: Codex CLI Provider（完了）
 - Phase 4: Workflow A/B Experiment（完了、Campaign 002は3/3 complete pairs）
-- Phase 5: Antigravity CLI Provider（Planned）
+- Phase 5: Antigravity CLI Provider（Current、offline設計完了・実装未着手）
 - Phase 6: Multi-language Fixtures and Public Report
 - Phase 7: Optional Enhancements
 
