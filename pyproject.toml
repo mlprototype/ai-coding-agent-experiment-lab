@@ -9,7 +9,7 @@ description = "A reproducible R&D foundation for AI coding-agent experiments"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-  "pydantic>=2.10,<3",
+  "pydantic>=2.12,<3",
   "PyYAML>=6.0,<7",
   "typer>=0.15,<1",
 ]
