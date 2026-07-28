@@ -5,13 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import stat
 import tempfile
 import time
 from collections.abc import Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -44,7 +43,7 @@ from agentlab.models import (
     WorkspaceLifecycle,
 )
 from agentlab.workflow import (
-    BuiltWorkflowPrompt,
+    FixedWorkflowInputs,
     LoadedWorkflowSpec,
     WorkflowExperimentSpec,
     WorkflowPlan,
@@ -54,13 +53,19 @@ from agentlab.workflow import (
     _publish_create_only_pair,
     _reject_non_finite,
     _unique_object,
-    build_workflow_plan,
-    build_workflow_prompt,
+    build_workflow_plan_from_inputs,
+    capture_workflow_inputs,
     load_workflow_plan,
     load_workflow_spec,
+    workflow_inputs_unchanged,
     workflow_plan_bytes,
 )
-from agentlab.workspace import paths_refer_to_same_file, validate_fixture_source
+from agentlab.workspace import (
+    DirectorySnapshot,
+    paths_refer_to_same_file,
+    remove_temporary_root,
+    validate_fixture_source,
+)
 
 
 class CampaignError(ValueError):
@@ -95,10 +100,17 @@ class CampaignStopReason(StrEnum):
     HARNESS_FAILURE = "harness_failure"
     CLEANUP_FAILURE = "cleanup_failure"
     HUMAN_INTERRUPTION = "human_interruption"
+    INPUT_CHANGED = "input_changed"
+
+
+class AdapterCleanupState(StrEnum):
+    NOT_APPLICABLE = "not_applicable"
+    CLEARED = "cleared"
+    FAILED = "failed"
 
 
 class CampaignStartedEvent(ContractModel):
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.1"]
     sequence: Literal[0]
     event_type: Literal["campaign_started"]
     experiment_id: StrictStr
@@ -114,7 +126,7 @@ class CampaignStartedEvent(ContractModel):
 
 
 class CampaignRunEvent(ContractModel):
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.1"]
     sequence: StrictInt = Field(gt=0)
     event_type: Literal["run_state"]
     run_id: StrictStr
@@ -127,6 +139,7 @@ class CampaignRunEvent(ContractModel):
     provider_call_count: StrictInt | None = Field(default=None, ge=0, le=1)
     retry_count: Literal[0]
     live_failure_kind: LiveFailureKind | None
+    adapter_cleanup_state: AdapterCleanupState
     occurred_at: datetime
 
     @field_validator("occurred_at")
@@ -145,7 +158,7 @@ class CampaignRunEvent(ContractModel):
                     self.provider_call_count,
                     self.live_failure_kind,
                 )
-            ):
+            ) or self.adapter_cleanup_state is not AdapterCleanupState.NOT_APPLICABLE:
                 raise ValueError("started state must not predict a terminal result")
         elif self.status is CampaignRunStatus.NOT_RUN:
             if (
@@ -153,6 +166,8 @@ class CampaignRunEvent(ContractModel):
                 or self.stop_reason in {None, CampaignStopReason.NONE}
                 or self.provider_call_count != 0
                 or self.live_failure_kind is not None
+                or self.adapter_cleanup_state
+                is not AdapterCleanupState.NOT_APPLICABLE
             ):
                 raise ValueError("not_run requires a fixed stop reason and zero calls")
         elif self.status is CampaignRunStatus.INTERRUPTED:
@@ -174,11 +189,16 @@ class CampaignRunEvent(ContractModel):
                 raise ValueError("completed/failed state must match outcome taxonomy")
         else:
             raise ValueError("Campaign recording must not append planned states")
+        if (
+            self.adapter_cleanup_state is AdapterCleanupState.FAILED
+            and self.outcome is not CampaignOutcome.CLEANUP_FAILURE
+        ):
+            raise ValueError("failed adapter cleanup requires cleanup_failure")
         return self
 
 
 class CampaignFinishedEvent(ContractModel):
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.1"]
     sequence: StrictInt = Field(gt=0)
     event_type: Literal["campaign_finished"]
     experiment_id: StrictStr
@@ -207,6 +227,7 @@ class CampaignRunExecution:
     outcome: CampaignOutcome
     provider_call_count: int | None
     live_failure_kind: LiveFailureKind | None
+    adapter_cleanup_state: AdapterCleanupState = AdapterCleanupState.NOT_APPLICABLE
 
 
 @dataclass(frozen=True)
@@ -223,11 +244,19 @@ RunExecutor = Callable[
         Path,
         LoadedWorkflowSpec,
         WorkflowPlanRun,
-        BuiltWorkflowPrompt,
+        FixedWorkflowInputs,
         Mapping[str, str] | None,
     ],
     CampaignRunExecution,
 ]
+
+AdapterCleanup = Callable[[Path], tuple[bool, str | None]]
+
+
+class _AdapterCleanupInterrupted(Exception):
+    def __init__(self, original: KeyboardInterrupt | SystemExit) -> None:
+        super().__init__("adapter cleanup failed during interruption")
+        self.original = original
 
 
 def _utc_timestamp(value: datetime) -> datetime:
@@ -556,26 +585,49 @@ def _classify_artifact(artifact: LiveRunArtifact) -> CampaignRunExecution:
     return CampaignRunExecution(outcome, call_count, artifact.failure_kind)
 
 
+def _materialize_fixture_snapshot(
+    snapshot: DirectorySnapshot,
+    destination: Path,
+) -> None:
+    destination.mkdir()
+    for relative in snapshot.directories:
+        (destination / Path(relative)).mkdir(parents=True)
+    for relative, content in sorted(snapshot.files.items()):
+        path = destination / Path(relative)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+
+def _redact_adapter_prompt(adapter_root: Path) -> None:
+    prompt_path = adapter_root / "prompt.md"
+    with suppress(OSError):
+        prompt_path.write_bytes(b"")
+    with suppress(OSError):
+        prompt_path.unlink(missing_ok=True)
+
+
 def _default_run_executor(
     spec_path: Path,
     loaded: LoadedWorkflowSpec,
     run: WorkflowPlanRun,
-    prompt: BuiltWorkflowPrompt,
+    fixed: FixedWorkflowInputs,
     parent_environment: Mapping[str, str] | None,
+    *,
+    adapter_cleanup: AdapterCleanup,
 ) -> CampaignRunExecution:
     spec = loaded.spec
-    source, _snapshot = validate_fixture_source(spec_path, spec.runner.fixture_path)
+    prompt = fixed.prompts[run.workflow]
     evidence_path = _resolve_artifact(spec_path, run.evidence_path)
     recording_path = _resolve_artifact(spec_path, run.recording_path)
     diagnostic_path = _resolve_artifact(spec_path, run.diagnostic_path)
-    temporary_parent = spec_path.parent / Path(spec.artifacts.root)
-    temporary_parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(
-        prefix=f".{run.run_id}.",
-        dir=temporary_parent,
-    ) as temporary_name:
-        adapter_root = Path(temporary_name)
-        shutil.copytree(source, adapter_root / "fixture")
+    adapter_root: Path | None = None
+    execution: CampaignRunExecution | None = None
+    caught: BaseException | None = None
+    try:
+        unresolved_root = Path(tempfile.mkdtemp(prefix="agentlab-phase4-adapter-"))
+        adapter_root = unresolved_root
+        adapter_root = unresolved_root.resolve()
+        _materialize_fixture_snapshot(fixed.fixture, adapter_root / "fixture")
         (adapter_root / "prompt.md").write_bytes(prompt.content)
         adapter_path = adapter_root / "experiment.yaml"
         adapter_path.write_text(
@@ -609,7 +661,37 @@ def _default_run_executor(
             )
         except (OSError, WorkflowPlanError) as error:
             raise CampaignError("could not publish paired run Artifacts") from error
-        return _classify_artifact(outcome.artifact)
+        execution = _classify_artifact(outcome.artifact)
+    except BaseException as error:
+        caught = error
+
+    cleanup_cleared = True
+    if adapter_root is not None:
+        try:
+            cleanup_cleared, _cleanup_error = adapter_cleanup(adapter_root)
+        except Exception:
+            cleanup_cleared = False
+        if not cleanup_cleared:
+            _redact_adapter_prompt(adapter_root)
+            if isinstance(caught, (KeyboardInterrupt, SystemExit)):
+                raise _AdapterCleanupInterrupted(caught)
+            return CampaignRunExecution(
+                outcome=CampaignOutcome.CLEANUP_FAILURE,
+                provider_call_count=(
+                    None if execution is None else execution.provider_call_count
+                ),
+                live_failure_kind=(
+                    None if execution is None else execution.live_failure_kind
+                ),
+                adapter_cleanup_state=AdapterCleanupState.FAILED,
+            )
+    if caught is not None:
+        raise caught
+    assert execution is not None
+    return replace(
+        execution,
+        adapter_cleanup_state=AdapterCleanupState.CLEARED,
+    )
 
 
 def _run_event(
@@ -621,9 +703,10 @@ def _run_event(
     stop_reason: CampaignStopReason | None = None,
     provider_call_count: int | None = None,
     live_failure_kind: LiveFailureKind | None = None,
+    adapter_cleanup_state: AdapterCleanupState = AdapterCleanupState.NOT_APPLICABLE,
 ) -> CampaignRunEvent:
     return CampaignRunEvent(
-        schema_version="1.0",
+        schema_version="1.1",
         sequence=sequence,
         event_type="run_state",
         run_id=run.run_id,
@@ -636,6 +719,7 @@ def _run_event(
         provider_call_count=provider_call_count,
         retry_count=0,
         live_failure_kind=live_failure_kind,
+        adapter_cleanup_state=adapter_cleanup_state,
         occurred_at=datetime.now(UTC),
     )
 
@@ -649,6 +733,7 @@ def run_workflow_campaign(
     confirm_provider_calls: int | None,
     parent_environment: Mapping[str, str] | None = None,
     run_executor: RunExecutor | None = None,
+    adapter_cleanup: AdapterCleanup = remove_temporary_root,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> CampaignOutcomeSummary:
     """Run a preregistered Plan sequentially with no retry, fallback, or resume."""
@@ -660,6 +745,7 @@ def run_workflow_campaign(
     try:
         loaded = load_workflow_spec(spec_path)
         plan = load_workflow_plan(plan_path)
+        fixed = capture_workflow_inputs(spec_path, loaded.spec)
     except (WorkflowSpecError, WorkflowPlanError) as error:
         raise CampaignError(str(error)) from error
     if confirm_provider_calls != plan.planned_provider_call_count:
@@ -667,13 +753,13 @@ def run_workflow_campaign(
             "confirmed Provider call count does not match the preregistered Plan; "
             "no subprocess was started"
         )
-    rebuilt = build_workflow_plan(spec_path)
+    rebuilt = build_workflow_plan_from_inputs(spec_path, loaded, fixed)
     if workflow_plan_bytes(rebuilt) != workflow_plan_bytes(plan):
         raise CampaignError("Spec, Prompt, Fixture, or Plan changed after preregistration")
     _protect_campaign_outputs(spec_path, plan_path, campaign_path, plan)
 
     started = CampaignStartedEvent(
-        schema_version="1.0",
+        schema_version="1.1",
         sequence=0,
         event_type="campaign_started",
         experiment_id=plan.experiment_id,
@@ -683,7 +769,27 @@ def run_workflow_campaign(
         occurred_at=datetime.now(UTC),
     )
     _create_campaign(campaign_path, started)
-    executor = _default_run_executor if run_executor is None else run_executor
+    if run_executor is None:
+
+        def default_executor(
+            executor_spec_path: Path,
+            executor_loaded: LoadedWorkflowSpec,
+            executor_run: WorkflowPlanRun,
+            executor_fixed: FixedWorkflowInputs,
+            executor_environment: Mapping[str, str] | None,
+        ) -> CampaignRunExecution:
+            return _default_run_executor(
+                executor_spec_path,
+                executor_loaded,
+                executor_run,
+                executor_fixed,
+                executor_environment,
+                adapter_cleanup=adapter_cleanup,
+            )
+
+        executor: RunExecutor = default_executor
+    else:
+        executor = run_executor
     sequence = 1
     attempted = 0
     provider_calls = 0
@@ -692,10 +798,14 @@ def run_workflow_campaign(
     stop_reason = CampaignStopReason.NONE
     campaign_started = monotonic()
     next_index = 0
+    pending_interrupt: KeyboardInterrupt | SystemExit | None = None
 
     try:
         for index, run in enumerate(plan.runs):
             next_index = index
+            if not workflow_inputs_unchanged(spec_path, loaded.spec, fixed):
+                stop_reason = CampaignStopReason.INPUT_CHANGED
+                break
             maximum = loaded.spec.stop_conditions.max_total_duration_ms
             if maximum is not None and (monotonic() - campaign_started) * 1000 >= maximum:
                 stop_reason = CampaignStopReason.MAX_TOTAL_DURATION
@@ -710,15 +820,22 @@ def run_workflow_campaign(
             )
             sequence += 1
             attempted += 1
-            prompt = build_workflow_prompt(spec_path, loaded.spec, run.workflow)
             try:
                 execution = executor(
                     spec_path,
                     loaded,
                     run,
-                    prompt,
+                    fixed,
                     parent_environment,
                 )
+            except _AdapterCleanupInterrupted as error:
+                execution = CampaignRunExecution(
+                    outcome=CampaignOutcome.CLEANUP_FAILURE,
+                    provider_call_count=None,
+                    live_failure_kind=None,
+                    adapter_cleanup_state=AdapterCleanupState.FAILED,
+                )
+                pending_interrupt = error.original
             except (KeyboardInterrupt, SystemExit):
                 _append_campaign(
                     campaign_path,
@@ -761,6 +878,7 @@ def run_workflow_campaign(
                     outcome=execution.outcome,
                     provider_call_count=execution.provider_call_count,
                     live_failure_kind=execution.live_failure_kind,
+                    adapter_cleanup_state=execution.adapter_cleanup_state,
                 ),
             )
             sequence += 1
@@ -801,7 +919,7 @@ def run_workflow_campaign(
         _append_campaign(
             campaign_path,
             CampaignFinishedEvent(
-                schema_version="1.0",
+                schema_version="1.1",
                 sequence=sequence,
                 event_type="campaign_finished",
                 experiment_id=plan.experiment_id,
@@ -832,7 +950,7 @@ def run_workflow_campaign(
     _append_campaign(
         campaign_path,
         CampaignFinishedEvent(
-            schema_version="1.0",
+            schema_version="1.1",
             sequence=sequence,
             event_type="campaign_finished",
             experiment_id=plan.experiment_id,
@@ -844,6 +962,8 @@ def run_workflow_campaign(
             occurred_at=datetime.now(UTC),
         ),
     )
+    if pending_interrupt is not None:
+        raise pending_interrupt
     return CampaignOutcomeSummary(
         campaign_path=campaign_path,
         stop_reason=stop_reason,

@@ -35,21 +35,24 @@ Task/Prompt/Workflow/Fixture revision、品質Gate、反復数、seed、Provider
 conditions、Artifact rootを一つのCampaign条件として保持する。Workflow別のProvider、
 model、Fixture、Gate、sandbox、network、timeout設定は存在しない。
 
-`plan-workflow`は外部AI、Provider、network、subprocess、Gateを呼ばずPlan 1.0を作る。
+`plan-workflow`は外部AI、Provider、network、subprocess、Gateを呼ばずPlan 1.1を作る。
 task×repetition blockは`SHA-256(seed, "block", task_id, repetition)`で並べ、各block内の
 Workflow順は`SHA-256(seed, "workflow", task_id, repetition, workflow)`で決める。Pythonの
 暗黙hashは使わない。各blockはcontiguousで`one_shot`と`staged`を1件ずつ含む。
 
-canonical PlanはSpec SHA-256、Task Prompt/Fixture SHA-256、全run、run ID、初期
-`planned`状態、予定Provider call 1、revision、相対Artifact予約pathを持つ。現在時刻を
-含まないため、同一入力から同一bytesになる。作成時刻はcanonical Plan SHA-256付きの
-`*.metadata.json`へ分離する。両fileはcreate-onlyかつatomicに公開し、暗黙上書きしない。
+canonical PlanはSpec SHA-256、Task Prompt/Fixture SHA-256、Workflow別の生成Prompt
+SHA-256とbyte数、全run、run ID、初期`planned`状態、予定Provider call 1、revision、
+相対Artifact予約pathを持つ。現在時刻を含まないため、同一入力から同一bytesになる。
+作成時刻はcanonical Plan SHA-256付きの`*.metadata.json`へ分離する。両fileは
+create-onlyかつatomicに公開し、暗黙上書きしない。
 
-`run-workflow-campaign`はPlan順に逐次実行し、各runでsource Fixtureから独立した使い捨て
-Workspaceを作る。schedulerから`agentlab live-codex`を子process起動せず、Phase 3 core
-orchestrationを同じprocess内で再利用する。Campaign 1.0はrun前の`started`とrun後の
-terminal状態をappend-only JSONLへfsyncする。run状態は`planned`、`started`、`completed`、
-`failed`、`interrupted`、`not_run`を区別する。
+`run-workflow-campaign`はCampaign開始時にTask Prompt bytesとFixture全file bytesを一度だけ
+固定し、Plan順の全runを同じin-memory snapshotから逐次実行する。各run開始前にsourceの
+integrityを確認し、変更されていれば次のProvider call前に停止する。schedulerから
+`agentlab live-codex`を子process起動せず、Phase 3 core orchestrationを同じprocess内で
+再利用する。Campaign 1.1はrun前の`started`とrun後のterminal状態をappend-only JSONLへ
+fsyncする。run状態は`planned`、`started`、`completed`、`failed`、`interrupted`、
+`not_run`を区別する。
 
 結果は通常成功、Quality Gate不合格、Provider失敗、Provider timeout、Harness障害、
 cleanup失敗、人間中断、stop condition未実行を固定Enumで分離する。retry、fallback、
@@ -63,6 +66,7 @@ repositoryの`workflow-ab.yaml`はfake Provider受入専用の合成Specで、�
 - `fail_fast=true`: 最初のProvider失敗、Provider timeout、Quality Gate不合格後に停止する。
 - `max_failures`: Provider失敗、Provider timeout、Quality Gate不合格の累計へ適用する。
 - Harness障害、Provider process cleanup失敗、Workspace cleanup失敗: 件数によらず停止する。
+- PromptまたはFixture sourceの変更: 次runのProvider call前に`input_changed`で停止する。
 - `max_total_duration_ms`: 次run開始前にmonotonic elapsed timeを確認し、到達後は新しいrunを
   開始しない。実行中runには個別Provider timeoutを適用する。
 - 停止後のrun: Provider call 0の`not_run`として固定停止理由を保存する。
@@ -88,6 +92,11 @@ Prompt本文、raw JSONL、raw stderr、agent message、reasoning、command outp
 事故範囲を縮小するが、OS security sandbox、完全なfilesystem/
 network隔離、CPU/memory quotaを提供しない。
 
+adapter用Promptと固定Fixture copyはArtifact root外のsystem temporary directoryへだけ
+materializeする。cleanup結果をCampaignへ`cleared`または`failed`として保存し、失敗は
+`cleanup_failure`として即時停止する。cleanup失敗時もPrompt fileはbest-effortで
+redactまたはunlinkする。
+
 ## Offline report
 
 `report-workflow`は保存済みPlan、Campaign、Run Evidence、Recordingだけをstrict loadする。
@@ -99,6 +108,11 @@ interrupted/not_run、4種Gate command結果、duration、agent call、retry、�
 Usageを集計する。各metricはdenominator、observed、missingを保持し、欠測値を0へ変換しない。
 Provider報告Tokenと推定Tokenは分離する。paired結果がなければ`not_estimable`とし、自動winner、
 有意差検定、信頼区間、leaderboardは作らない。
+
+集計前にPlan、Campaign、Evidence、Recordingのtask、Workflow、repetition、run ID、
+Campaign outcome、Provider call数、Evidence status/failure kind/execution stage、
+Prompt/Fixture fingerprint、exact model、reasoning effortを相互照合する。意味が矛盾する
+Artifactはestimableへ含めず、report生成自体を拒否する。
 
 ## Non-goals and current acceptance
 

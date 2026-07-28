@@ -38,9 +38,9 @@ offline実装とfake Codexによる受入を完了し、レビュー済みcommit
 - strict paired成果物を構築できない場合だけの独立したFailure Diagnostic 1.0
 - 後方互換なExperimentSpec 1.0とは分離したstrict Workflow A/B Spec 2.0
 - Task要件を共有しWorkflow指示だけを変えるversion付きPrompt builder
-- SHA-256によるseed付きblock順序と、byte決定的なcanonical Plan 1.0
+- SHA-256によるseed付きblock順序と、byte決定的なcanonical Plan 1.1
 - 1 run = 1 Provider turn = 1 agent callを維持する逐次Campaign scheduler
-- append-only Campaign 1.0、stop condition、固定run/failure/停止理由Enum
+- append-only Campaign 1.1、stop condition、固定run/failure/停止理由Enum
 - 保存済みPlan、Campaign、Recording、Evidenceだけを読むJSON/Markdown集計
 
 ReplayはRecording内の保存済みMetricsだけを再構成し、外部処理を呼びません。通常テストは
@@ -86,6 +86,10 @@ uv run mypy src
 混入させず、同じSpec bytes、Task Prompt、Fixture、seedから同じbytesを生成します。作成時刻は
 Plan SHA-256を持つ`plan.metadata.json`へ分離します。Planと予約Artifact pathはcreate-onlyで、
 開始済みCampaignの変更や自動resumeは行いません。
+Plan 1.1は`one_shot`／`staged`それぞれの生成Prompt SHA-256とbyte数も事前登録します。
+Campaign開始時にTask Prompt bytesとFixture全file bytesを一度だけ固定し、全runのadapterを
+そのin-memory snapshotから構築します。各run開始前のsource integrity checkで変更を検出した
+場合は、次のProvider callを開始せず`input_changed`で停止します。
 
 将来のLive Campaign形式は次です。今回は実行していません。`--confirm-live-codex`と、
 Planに表示された予定Provider call総数と一致する`--confirm-provider-calls`の両方がなければ、
@@ -113,6 +117,12 @@ uv run agentlab report-workflow <reviewed-phase4-spec.yaml> \
 Promptだけで、Provider、exact model ID、reasoning effort、Fixture、Gate、sandbox、
 network設定、timeout、停止条件はCampaign全体で固定します。詳細は
 [docs/WORKFLOW_AB.md](docs/WORKFLOW_AB.md)を参照してください。
+
+adapter用Prompt fileはArtifact root外のsystem temporary directoryだけに作成します。
+cleanup結果はCampaignへ`cleared`／`failed`として保存し、失敗時は`cleanup_failure`で即時停止
+してPrompt fileをbest-effortでredactします。offline reportはPlan、Campaign、Evidence、
+Recordingのrun identity、outcome、Provider call数、Prompt/Fixture fingerprint、model、
+reasoning effortを相互照合し、矛盾するpairを拒否します。
 
 次はPhase 3で使用したmanual smokeのCLI形式です。実Codexを使うため、通常テストやCIでは
 実行しません。承認済みmanual smokeは累計8試行で、過去runを再実行しません。新しい実行は

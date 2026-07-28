@@ -21,6 +21,7 @@ from pydantic import (
 )
 
 from agentlab.campaign import (
+    AdapterCleanupState,
     CampaignError,
     CampaignOutcome,
     CampaignRunEvent,
@@ -30,22 +31,35 @@ from agentlab.campaign import (
 )
 from agentlab.live import LiveArtifactLoadError, load_live_artifact
 from agentlab.models import (
+    CodexExecutionStage,
     CommandStatus,
     ContractModel,
     GateKind,
+    LiveFailureKind,
+    LiveOverallStatus,
     LiveRunArtifact,
     UsageMetrics,
     UsageMetricSource,
     Workflow,
+    WorkspaceLifecycle,
 )
-from agentlab.recording import RecordingLoadError, load_replay_recording
+from agentlab.recording import (
+    LiveRunCompletedEvent,
+    LiveRunFailedEvent,
+    LiveRunStartedEvent,
+    RecordingLoadError,
+    ReplayRecording,
+    load_replay_recording,
+)
 from agentlab.workflow import (
+    WorkflowPlan,
     WorkflowPlanError,
     WorkflowPlanRun,
     _publish_create_only_pair,
     _strict_json,
     load_workflow_plan,
     workflow_plan_bytes,
+    workflow_prompt_fingerprint,
 )
 
 
@@ -304,33 +318,165 @@ def _usage(artifacts: list[LiveRunArtifact]) -> UsageAggregate:
     )
 
 
+def _artifact_provider_call_count(artifact: LiveRunArtifact) -> int:
+    return int(
+        artifact.codex.execution_stage
+        is CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+    )
+
+
+def _artifact_outcome(artifact: LiveRunArtifact) -> CampaignOutcome:
+    if artifact.overall_status is LiveOverallStatus.PASSED:
+        return CampaignOutcome.SUCCESS
+    if artifact.overall_status is LiveOverallStatus.FAILED:
+        return CampaignOutcome.QUALITY_GATE_FAILURE
+    if artifact.overall_status is LiveOverallStatus.PROVIDER_ERROR:
+        if artifact.failure_kind is LiveFailureKind.PROVIDER_TIMEOUT:
+            return CampaignOutcome.PROVIDER_TIMEOUT
+        return CampaignOutcome.PROVIDER_FAILURE
+    if (
+        artifact.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+        or artifact.workspace_lifecycle is WorkspaceLifecycle.CLEANUP_FAILED
+    ):
+        return CampaignOutcome.CLEANUP_FAILURE
+    return CampaignOutcome.HARNESS_FAILURE
+
+
+def _validate_recording_relationships(
+    plan: WorkflowPlan,
+    run: WorkflowPlanRun,
+    artifact: LiveRunArtifact,
+    recording: ReplayRecording,
+) -> None:
+    started = recording.started
+    if not isinstance(started, LiveRunStartedEvent):
+        raise WorkflowReportError(f"run {run.run_id} requires a Live Recording")
+    expected_prompt_sha, expected_prompt_bytes = workflow_prompt_fingerprint(
+        plan,
+        run.workflow,
+    )
+    if (
+        artifact.run_id != run.run_id
+        or artifact.experiment_id != plan.experiment_id
+        or artifact.task_id != run.task_id
+        or artifact.repetition_index != run.repetition_index
+        or artifact.workflow is not run.workflow
+        or artifact.fixture_sha256 != plan.fixture_sha256
+        or artifact.prompt_sha256 != expected_prompt_sha
+        or artifact.prompt_bytes != expected_prompt_bytes
+        or artifact.codex.requested_model != plan.model
+        or artifact.codex.requested_reasoning_effort is not plan.reasoning_effort
+        or started.run_id != run.run_id
+        or started.experiment_id != plan.experiment_id
+        or started.task_id != run.task_id
+        or started.repetition_index != run.repetition_index
+        or started.workflow is not run.workflow
+        or started.prompt_sha256 != expected_prompt_sha
+        or started.prompt_bytes != expected_prompt_bytes
+        or started.requested_model != plan.model
+        or started.requested_reasoning_effort is not plan.reasoning_effort
+    ):
+        raise WorkflowReportError(
+            f"Plan, Evidence, and Recording conditions differ for {run.run_id}"
+        )
+    terminal = recording.completed or recording.failed
+    assert terminal is not None
+    if not isinstance(terminal, (LiveRunCompletedEvent, LiveRunFailedEvent)):
+        raise WorkflowReportError(f"run {run.run_id} requires a Live terminal event")
+    if terminal.codex != artifact.codex:
+        raise WorkflowReportError(
+            f"Evidence and Recording Codex summaries differ for {run.run_id}"
+        )
+    if isinstance(terminal, LiveRunCompletedEvent):
+        if terminal.metrics != artifact.metrics:
+            raise WorkflowReportError(
+                f"Evidence and Recording Metrics differ for {run.run_id}"
+            )
+    elif isinstance(terminal, LiveRunFailedEvent) and (
+        terminal.failure_kind is not artifact.failure_kind
+        or artifact.metrics is not None
+    ):
+        raise WorkflowReportError(
+            f"Evidence and failed Recording differ for {run.run_id}"
+        )
+
+
+def _validate_campaign_artifact_relationship(
+    run: WorkflowPlanRun,
+    event: CampaignRunEvent,
+    artifact: LiveRunArtifact,
+) -> None:
+    if event.provider_call_count != _artifact_provider_call_count(artifact):
+        raise WorkflowReportError(
+            f"Campaign and Evidence Provider call counts differ for {run.run_id}"
+        )
+    if event.live_failure_kind is not artifact.failure_kind:
+        raise WorkflowReportError(
+            f"Campaign and Evidence failure kinds differ for {run.run_id}"
+        )
+    if event.adapter_cleanup_state is AdapterCleanupState.FAILED:
+        if event.outcome is not CampaignOutcome.CLEANUP_FAILURE:
+            raise WorkflowReportError(
+                f"adapter cleanup state is inconsistent for {run.run_id}"
+            )
+    elif event.outcome is not _artifact_outcome(artifact):
+        raise WorkflowReportError(
+            f"Campaign outcome and Evidence status differ for {run.run_id}"
+        )
+
+
 def _load_artifacts(
     spec_path: Path,
-    runs: list[WorkflowPlanRun],
+    plan: WorkflowPlan,
+    terminal_events: dict[str, CampaignRunEvent],
 ) -> dict[str, LiveRunArtifact]:
     artifacts: dict[str, LiveRunArtifact] = {}
-    for run in runs:
+    evidence_required = {
+        CampaignOutcome.SUCCESS,
+        CampaignOutcome.QUALITY_GATE_FAILURE,
+        CampaignOutcome.PROVIDER_FAILURE,
+        CampaignOutcome.PROVIDER_TIMEOUT,
+    }
+    for run in plan.runs:
+        event = terminal_events[run.run_id]
         evidence_path = spec_path.parent / Path(run.evidence_path)
         recording_path = spec_path.parent / Path(run.recording_path)
         if not os.path.lexists(evidence_path):
+            if os.path.lexists(recording_path):
+                raise WorkflowReportError(
+                    f"Recording exists without Evidence for {run.run_id}"
+                )
+            if event.outcome in evidence_required:
+                raise WorkflowReportError(
+                    f"Campaign outcome requires Evidence for {run.run_id}"
+                )
             continue
+        if event.status in {
+            CampaignRunStatus.INTERRUPTED,
+            CampaignRunStatus.NOT_RUN,
+        }:
+            raise WorkflowReportError(
+                f"unattempted or interrupted run has Evidence: {run.run_id}"
+            )
         if not os.path.lexists(recording_path):
             raise WorkflowReportError(f"Evidence for {run.run_id} has no Recording")
         try:
             artifact = load_live_artifact(evidence_path)
             recording = load_replay_recording(recording_path)
         except (LiveArtifactLoadError, RecordingLoadError) as error:
-            raise WorkflowReportError(f"invalid saved run Artifact for {run.run_id}") from error
+            raise WorkflowReportError(
+                f"invalid saved run Artifact for {run.run_id}"
+            ) from error
         recording_bytes = recording_path.read_bytes()
         if (
-            artifact.run_id != run.run_id
-            or artifact.task_id != run.task_id
-            or artifact.workflow is not run.workflow
-            or artifact.recording_sha256 != hashlib.sha256(recording_bytes).hexdigest()
-            or recording.started.run_id != run.run_id
-            or recording.started.workflow is not run.workflow
+            artifact.recording_sha256
+            != hashlib.sha256(recording_bytes).hexdigest()
         ):
-            raise WorkflowReportError(f"saved run Artifact does not match Plan for {run.run_id}")
+            raise WorkflowReportError(
+                f"Evidence Recording hash differs for {run.run_id}"
+            )
+        _validate_recording_relationships(plan, run, artifact, recording)
+        _validate_campaign_artifact_relationship(run, event, artifact)
         artifacts[run.run_id] = artifact
     return artifacts
 
@@ -441,7 +587,17 @@ def aggregate_workflow_campaign(
     expected_ids = {run.run_id for run in plan.runs}
     if set(terminal) != expected_ids:
         raise WorkflowReportError("Campaign must retain one terminal state for every planned run")
-    artifacts = _load_artifacts(spec_path, plan.runs)
+    for run in plan.runs:
+        event = terminal[run.run_id]
+        if (
+            event.task_id != run.task_id
+            or event.workflow is not run.workflow
+            or event.repetition_index != run.repetition_index
+        ):
+            raise WorkflowReportError(
+                f"Campaign run identity differs from Plan for {run.run_id}"
+            )
+    artifacts = _load_artifacts(spec_path, plan, terminal)
     blocks: dict[tuple[str, int], list[WorkflowPlanRun]] = {}
     for run in plan.runs:
         blocks.setdefault((run.task_id, run.repetition_index), []).append(run)

@@ -50,6 +50,10 @@ Provider turn内の論理段階で、複数process、複数turn、session resume
 永続化せず、最終Workspace変更と既存の正規化Evidenceだけを評価する。Workflowごとに
 Provider、model、Fixture、Gate、sandbox、network、timeoutを変える設定は持たない。
 
+Campaign開始時に共有Task Prompt bytesとFixture全file bytesを一度だけsnapshotし、両条件の
+全runを同じ固定入力から構築する。run間でsource PromptまたはFixtureが変わった場合は、
+次のProvider call前に検出してCampaignを停止し、変更後の入力をCampaignへ取り込まない。
+
 ## Provider実験
 
 Workflow、課題、要件、品質Gate、実行環境を固定する。ただしProvider固有のPrompt

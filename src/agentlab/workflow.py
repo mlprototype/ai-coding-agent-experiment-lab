@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import tempfile
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -24,7 +25,7 @@ from pydantic import (
     model_validator,
 )
 
-from agentlab.live import LiveCodexError, load_prompt
+from agentlab.live import LiveCodexError, PromptInput, load_prompt
 from agentlab.models import (
     ContractModel,
     Provider,
@@ -33,7 +34,11 @@ from agentlab.models import (
     RunnerSettings,
     Workflow,
 )
-from agentlab.workspace import paths_refer_to_same_file, validate_fixture_source
+from agentlab.workspace import (
+    DirectorySnapshot,
+    paths_refer_to_same_file,
+    validate_fixture_source,
+)
 
 
 class WorkflowSpecError(ValueError):
@@ -165,12 +170,16 @@ class WorkflowPlanRun(ContractModel):
 class WorkflowPlan(ContractModel):
     """Deterministic canonical Plan; publication time lives in a sidecar."""
 
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.1"]
     experiment_spec_schema_version: Literal["2.0"]
     experiment_id: StrictStr
     experiment_spec_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
     task_prompt_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
     fixture_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    one_shot_prompt_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    one_shot_prompt_bytes: StrictInt = Field(gt=0)
+    staged_prompt_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    staged_prompt_bytes: StrictInt = Field(gt=0)
     random_seed: StrictInt
     comparison_axis: Literal["workflow"]
     provider: Literal[Provider.CODEX]
@@ -248,6 +257,15 @@ class BuiltWorkflowPrompt:
     workflow_revision: str
 
 
+@dataclass(frozen=True)
+class FixedWorkflowInputs:
+    """Campaign inputs captured once before the first Provider call."""
+
+    fixture: DirectorySnapshot
+    task_prompt: PromptInput
+    prompts: Mapping[Workflow, BuiltWorkflowPrompt]
+
+
 class _DuplicateKeyError(ValueError):
     pass
 
@@ -317,19 +335,11 @@ def _workflow_instruction(spec: WorkflowExperimentSpec, workflow: Workflow) -> t
     )
 
 
-def build_workflow_prompt(
-    spec_path: Path,
+def _build_workflow_prompt_from_task(
     spec: WorkflowExperimentSpec,
     workflow: Workflow,
+    task: PromptInput,
 ) -> BuiltWorkflowPrompt:
-    try:
-        task = load_prompt(
-            spec_path,
-            spec.task_prompt_path,
-            max_prompt_bytes=spec.max_prompt_bytes,
-        )
-    except LiveCodexError as error:
-        raise WorkflowSpecError(str(error)) from error
     revision, instruction = _workflow_instruction(spec, workflow)
     separator = (
         f"\n\n---\n\nWorkflow template revision: {revision}\nWorkflow instructions:\n"
@@ -348,22 +358,91 @@ def build_workflow_prompt(
     )
 
 
+def build_workflow_prompt(
+    spec_path: Path,
+    spec: WorkflowExperimentSpec,
+    workflow: Workflow,
+) -> BuiltWorkflowPrompt:
+    try:
+        task = load_prompt(
+            spec_path,
+            spec.task_prompt_path,
+            max_prompt_bytes=spec.max_prompt_bytes,
+        )
+    except LiveCodexError as error:
+        raise WorkflowSpecError(str(error)) from error
+    return _build_workflow_prompt_from_task(spec, workflow, task)
+
+
+def capture_workflow_inputs(
+    spec_path: Path,
+    spec: WorkflowExperimentSpec,
+) -> FixedWorkflowInputs:
+    """Read Prompt and Fixture exactly once into immutable Campaign inputs."""
+    try:
+        task = load_prompt(
+            spec_path,
+            spec.task_prompt_path,
+            max_prompt_bytes=spec.max_prompt_bytes,
+        )
+        _source, fixture = validate_fixture_source(
+            spec_path,
+            spec.runner.fixture_path,
+        )
+    except (LiveCodexError, ValueError) as error:
+        raise WorkflowSpecError(str(error)) from error
+    prompts = {
+        workflow: _build_workflow_prompt_from_task(spec, workflow, task)
+        for workflow in (Workflow.ONE_SHOT, Workflow.STAGED)
+    }
+    return FixedWorkflowInputs(
+        fixture=fixture,
+        task_prompt=task,
+        prompts=prompts,
+    )
+
+
+def workflow_inputs_unchanged(
+    spec_path: Path,
+    spec: WorkflowExperimentSpec,
+    fixed: FixedWorkflowInputs,
+) -> bool:
+    """Re-read only for integrity; execution always uses the fixed bytes."""
+    try:
+        task = load_prompt(
+            spec_path,
+            spec.task_prompt_path,
+            max_prompt_bytes=spec.max_prompt_bytes,
+        )
+        _source, fixture = validate_fixture_source(
+            spec_path,
+            spec.runner.fixture_path,
+        )
+    except (LiveCodexError, ValueError):
+        return False
+    return (
+        task.sha256 == fixed.task_prompt.sha256
+        and task.byte_count == fixed.task_prompt.byte_count
+        and fixture.sha256 == fixed.fixture.sha256
+    )
+
+
 def _stable_digest(*parts: object) -> str:
     encoded = "\0".join(str(part) for part in parts).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
-def build_workflow_plan(spec_path: Path) -> WorkflowPlan:
-    loaded = load_workflow_spec(spec_path)
+def _build_workflow_plan_from_inputs(
+    spec_path: Path,
+    loaded: LoadedWorkflowSpec,
+    fixed: FixedWorkflowInputs,
+) -> WorkflowPlan:
     spec = loaded.spec
-    one_shot = build_workflow_prompt(spec_path, spec, Workflow.ONE_SHOT)
-    staged = build_workflow_prompt(spec_path, spec, Workflow.STAGED)
+    one_shot = fixed.prompts[Workflow.ONE_SHOT]
+    staged = fixed.prompts[Workflow.STAGED]
     if one_shot.task_sha256 != staged.task_sha256:
         raise WorkflowPlanError("Workflow task requirements are not identical")
-    try:
-        source, fixture = validate_fixture_source(spec_path, spec.runner.fixture_path)
-    except ValueError as error:
-        raise WorkflowPlanError(str(error)) from error
+    source = spec_path.parent / spec.runner.fixture_path
     artifact_root = spec_path.parent / spec.artifacts.root
     prompt_path = spec_path.parent / spec.task_prompt_path
     try:
@@ -425,12 +504,16 @@ def build_workflow_plan(spec_path: Path) -> WorkflowPlan:
                 )
             )
     return WorkflowPlan(
-        schema_version="1.0",
+        schema_version="1.1",
         experiment_spec_schema_version="2.0",
         experiment_id=spec.experiment_id,
         experiment_spec_sha256=loaded.sha256,
         task_prompt_sha256=one_shot.task_sha256,
-        fixture_sha256=fixture.sha256,
+        fixture_sha256=fixed.fixture.sha256,
+        one_shot_prompt_sha256=one_shot.sha256,
+        one_shot_prompt_bytes=one_shot.byte_count,
+        staged_prompt_sha256=staged.sha256,
+        staged_prompt_bytes=staged.byte_count,
         random_seed=spec.random_seed,
         comparison_axis="workflow",
         provider=Provider.CODEX,
@@ -445,6 +528,30 @@ def build_workflow_plan(spec_path: Path) -> WorkflowPlan:
         planned_provider_call_count=len(runs),
         runs=runs,
     )
+
+
+def build_workflow_plan_from_inputs(
+    spec_path: Path,
+    loaded: LoadedWorkflowSpec,
+    fixed: FixedWorkflowInputs,
+) -> WorkflowPlan:
+    """Build a Plan from the exact inputs captured for a Campaign."""
+    return _build_workflow_plan_from_inputs(spec_path, loaded, fixed)
+
+
+def build_workflow_plan(spec_path: Path) -> WorkflowPlan:
+    loaded = load_workflow_spec(spec_path)
+    fixed = capture_workflow_inputs(spec_path, loaded.spec)
+    return _build_workflow_plan_from_inputs(spec_path, loaded, fixed)
+
+
+def workflow_prompt_fingerprint(
+    plan: WorkflowPlan,
+    workflow: Workflow,
+) -> tuple[str, int]:
+    if workflow is Workflow.ONE_SHOT:
+        return plan.one_shot_prompt_sha256, plan.one_shot_prompt_bytes
+    return plan.staged_prompt_sha256, plan.staged_prompt_bytes
 
 
 def workflow_plan_bytes(plan: WorkflowPlan) -> bytes:

@@ -11,6 +11,7 @@ import pytest
 import yaml
 
 from agentlab.campaign import (
+    AdapterCleanupState,
     CampaignError,
     CampaignOutcome,
     CampaignRunExecution,
@@ -35,6 +36,7 @@ from agentlab.workflow import (
 )
 from agentlab.workflow_report import (
     Estimability,
+    WorkflowReportError,
     aggregate_workflow_campaign,
     create_workflow_report,
     load_workflow_report,
@@ -81,7 +83,11 @@ def test_plan_is_deterministic_blocked_and_unique(tmp_path: Path) -> None:
     second = build_workflow_plan(spec_path)
 
     assert workflow_plan_bytes(first) == workflow_plan_bytes(second)
+    assert first.schema_version == "1.1"
     assert first.planned_run_count == 4
+    assert first.one_shot_prompt_sha256 != first.staged_prompt_sha256
+    assert first.one_shot_prompt_bytes > 0
+    assert first.staged_prompt_bytes > 0
     assert len({run.run_id for run in first.runs}) == 4
     paths = {
         path
@@ -191,6 +197,71 @@ def test_scheduler_follows_plan_sequentially_without_retry(tmp_path: Path) -> No
     assert observed == [run.run_id for run in plan.runs]
     assert result.provider_call_count == len(plan.runs)
     assert all(getattr(event, "retry_count", 0) == 0 for event in events)
+
+
+@pytest.mark.parametrize("changed_input", ["prompt", "fixture"])
+def test_campaign_stops_before_next_call_when_fixed_input_changes(
+    tmp_path: Path,
+    changed_input: str,
+) -> None:
+    spec_path = _case(tmp_path)
+    plan_path = _plan_file(spec_path)
+    plan = load_workflow_plan(plan_path)
+    calls = 0
+
+    def executor(
+        _spec_path: object,
+        _loaded: object,
+        _run: object,
+        fixed: object,
+        _environment: object,
+    ) -> CampaignRunExecution:
+        nonlocal calls
+        calls += 1
+        assert fixed.fixture.sha256 == plan.fixture_sha256
+        if changed_input == "prompt":
+            (spec_path.parent / "prompts/task.md").write_text(
+                "changed after Campaign start\n",
+                encoding="utf-8",
+            )
+        else:
+            (spec_path.parent / "fixtures/task/task.txt").write_text(
+                "status=CHANGED\n",
+                encoding="utf-8",
+            )
+        return CampaignRunExecution(
+            CampaignOutcome.SUCCESS,
+            1,
+            LiveFailureKind.NONE,
+        )
+
+    campaign_path = spec_path.parent / "campaign.jsonl"
+    result = run_workflow_campaign(
+        spec_path,
+        plan_path,
+        campaign_path,
+        confirm_live_codex=True,
+        confirm_provider_calls=plan.planned_provider_call_count,
+        run_executor=executor,
+    )
+    terminal = [
+        event
+        for event in load_campaign(campaign_path)
+        if hasattr(event, "status") and event.status is not CampaignRunStatus.STARTED
+    ]
+
+    assert calls == 1
+    assert result.stop_reason is CampaignStopReason.INPUT_CHANGED
+    assert [event.status for event in terminal] == [
+        CampaignRunStatus.COMPLETED,
+        CampaignRunStatus.NOT_RUN,
+        CampaignRunStatus.NOT_RUN,
+        CampaignRunStatus.NOT_RUN,
+    ]
+    assert all(
+        event.stop_reason is CampaignStopReason.INPUT_CHANGED
+        for event in terminal[1:]
+    )
 
 
 def test_campaign_strict_loader_rejects_unknown_fields(tmp_path: Path) -> None:
@@ -400,16 +471,14 @@ def _fake_codex_environment(
     return environment, log
 
 
-@pytest.mark.skipif(os.name != "posix", reason="Codex runner is POSIX-only")
-def test_fake_campaign_has_one_call_per_run_independent_workspaces_and_offline_report(
+def _run_fake_campaign(
     tmp_path: Path,
-) -> None:
+) -> tuple[Path, Path, Path, Path]:
     spec_path = _case(tmp_path, repetitions=1)
     plan_path = _plan_file(spec_path)
     environment, call_log = _fake_codex_environment(tmp_path)
     campaign_path = spec_path.parent / "campaign.jsonl"
-
-    outcome = run_workflow_campaign(
+    run_workflow_campaign(
         spec_path,
         plan_path,
         campaign_path,
@@ -417,6 +486,16 @@ def test_fake_campaign_has_one_call_per_run_independent_workspaces_and_offline_r
         confirm_provider_calls=2,
         parent_environment=environment,
     )
+    return spec_path, plan_path, campaign_path, call_log
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Codex runner is POSIX-only")
+def test_fake_campaign_has_one_call_per_run_independent_workspaces_and_offline_report(
+    tmp_path: Path,
+) -> None:
+    spec_path, plan_path, campaign_path, call_log = _run_fake_campaign(tmp_path)
+    events = load_campaign(campaign_path)
+    outcome = events[-1]
     calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
 
     assert outcome.stop_reason is CampaignStopReason.NONE
@@ -463,6 +542,163 @@ def test_fake_campaign_has_one_call_per_run_independent_workspaces_and_offline_r
         content = path.read_text(encoding="utf-8")
         assert str(tmp_path) not in content
         assert "Edit only `task.txt`" not in content
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Codex runner is POSIX-only")
+def test_adapter_cleanup_failure_is_explicit_and_redacts_prompt(
+    tmp_path: Path,
+) -> None:
+    spec_path = _case(tmp_path, repetitions=1)
+    plan_path = _plan_file(spec_path)
+    environment, call_log = _fake_codex_environment(tmp_path)
+    campaign_path = spec_path.parent / "campaign.jsonl"
+    adapter_roots: list[Path] = []
+
+    def fail_cleanup(path: Path) -> tuple[bool, str | None]:
+        adapter_roots.append(path)
+        raise OSError("injected cleanup failure")
+
+    try:
+        outcome = run_workflow_campaign(
+            spec_path,
+            plan_path,
+            campaign_path,
+            confirm_live_codex=True,
+            confirm_provider_calls=2,
+            parent_environment=environment,
+            adapter_cleanup=fail_cleanup,
+        )
+        events = load_campaign(campaign_path)
+        attempted_terminal = next(
+            event
+            for event in events
+            if getattr(event, "status", None) is CampaignRunStatus.FAILED
+        )
+        calls = call_log.read_text(encoding="utf-8").splitlines()
+
+        assert outcome.stop_reason is CampaignStopReason.CLEANUP_FAILURE
+        assert len(calls) == 1
+        assert attempted_terminal.outcome is CampaignOutcome.CLEANUP_FAILURE
+        assert (
+            attempted_terminal.adapter_cleanup_state
+            is AdapterCleanupState.FAILED
+        )
+        assert len(adapter_roots) == 1
+        assert not adapter_roots[0].is_relative_to(
+            spec_path.parent / "artifacts"
+        )
+        assert not (adapter_roots[0] / "prompt.md").exists()
+        report = aggregate_workflow_campaign(spec_path, plan_path, campaign_path)
+        assert report.pairing.status is Estimability.NOT_ESTIMABLE
+        assert sum(item.cleanup_failed_runs for item in report.workflows) == 1
+    finally:
+        for adapter_root in adapter_roots:
+            shutil.rmtree(adapter_root, ignore_errors=True)
+
+
+def _rewrite_campaign(
+    campaign_path: Path,
+    mutate: Any,
+) -> None:
+    events = [
+        json.loads(line)
+        for line in campaign_path.read_text(encoding="utf-8").splitlines()
+    ]
+    mutate(events)
+    campaign_path.write_text(
+        "".join(
+            json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+            for event in events
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Codex runner is POSIX-only")
+@pytest.mark.parametrize(
+    "contradiction",
+    ["outcome", "provider_calls", "run_identity"],
+)
+def test_report_rejects_campaign_plan_evidence_contradictions(
+    tmp_path: Path,
+    contradiction: str,
+) -> None:
+    spec_path, plan_path, campaign_path, _call_log = _run_fake_campaign(tmp_path)
+
+    def mutate(events: list[dict[str, Any]]) -> None:
+        started = next(
+            event
+            for event in events
+            if event["event_type"] == "run_state"
+            and event["status"] == "started"
+        )
+        terminal = next(
+            event
+            for event in events
+            if event["event_type"] == "run_state"
+            and event["run_id"] == started["run_id"]
+            and event["status"] != "started"
+        )
+        if contradiction == "outcome":
+            terminal["outcome"] = "quality_gate_failure"
+            terminal["live_failure_kind"] = "quality_gate_failure"
+        elif contradiction == "provider_calls":
+            terminal["provider_call_count"] = 0
+            finished = events[-1]
+            finished["provider_call_count"] -= 1
+        else:
+            started["task_id"] = "different-task"
+            terminal["task_id"] = "different-task"
+
+    _rewrite_campaign(campaign_path, mutate)
+    with pytest.raises(WorkflowReportError):
+        aggregate_workflow_campaign(spec_path, plan_path, campaign_path)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Codex runner is POSIX-only")
+@pytest.mark.parametrize(
+    "contradiction",
+    ["evidence_model", "plan_model", "fixture", "prompt"],
+)
+def test_report_rejects_evidence_recording_or_plan_condition_mismatch(
+    tmp_path: Path,
+    contradiction: str,
+) -> None:
+    spec_path, plan_path, campaign_path, _call_log = _run_fake_campaign(tmp_path)
+    run = load_workflow_plan(plan_path).runs[0]
+    evidence_path = spec_path.parent / run.evidence_path
+    recording_path = spec_path.parent / run.recording_path
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    if contradiction in {"evidence_model", "plan_model"}:
+        evidence["codex"]["requested_model"] = "different-exact-model"
+    elif contradiction == "fixture":
+        evidence["fixture_sha256"] = "0" * 64
+    else:
+        evidence["prompt_sha256"] = "0" * 64
+
+    if contradiction in {"plan_model", "prompt"}:
+        recording = [
+            json.loads(line)
+            for line in recording_path.read_text(encoding="utf-8").splitlines()
+        ]
+        if contradiction == "plan_model":
+            recording[0]["requested_model"] = "different-exact-model"
+            recording[1]["codex"]["requested_model"] = "different-exact-model"
+        else:
+            recording[0]["prompt_sha256"] = "0" * 64
+        recording_bytes = "".join(
+            json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+            for event in recording
+        ).encode()
+        recording_path.write_bytes(recording_bytes)
+        evidence["recording_sha256"] = hashlib.sha256(recording_bytes).hexdigest()
+
+    evidence_path.write_text(
+        json.dumps(evidence, sort_keys=True),
+        encoding="utf-8",
+    )
+    with pytest.raises(WorkflowReportError):
+        aggregate_workflow_campaign(spec_path, plan_path, campaign_path)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Codex runner is POSIX-only")
