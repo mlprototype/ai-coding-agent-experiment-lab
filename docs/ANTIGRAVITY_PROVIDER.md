@@ -1,305 +1,292 @@
-# Antigravity CLI Provider Offline Design
+# Antigravity CLI Provider オフライン設計
 
-## Status
+## ステータス
 
 - Phase: 5
-- Phase status: Current
-- Slice 5A status: Implemented and offline-validated
-- Slice 5B status: Design only; implementation not authorized
-- Design date: 2026-07-28
-- Slice 5A correction and Slice 5B design update: 2026-07-29
-- Design base: `feature/phase5` at
+- Phaseステータス: 実施中
+- Slice 5Aステータス: 実装済み、オフライン検証済み
+- Slice 5Bステータス: 設計のみ。実装は未承認
+- 設計日: 2026-07-28
+- Slice 5A是正およびSlice 5B設計更新日: 2026-07-29
+- 設計ベース: `feature/phase5` の
   `d3a8cf814623ea0bdd071d12c948a582f38a827d`
-- Implementation owner: Antigravity
+- 実装担当: Antigravity
 
-This document is the implementation contract and completion boundary for the
-first offline slice of the Antigravity CLI Provider. It also records the design
-gates for Slice 5B, but does not authorize Slice 5B implementation, an actual
-Antigravity agent run, model request, authentication flow, quota use, provider
-comparison, or Live artifact creation.
+本書は、Antigravity CLI Providerの最初のオフラインSliceにおける実装契約と
+完了境界を定める。また、Slice 5Bの設計Gateも記録する。ただし、Slice 5Bの実装、
+実際のAntigravity agent実行、モデルへのリクエスト、認証フロー、quota使用、
+Provider比較、Live Artifact作成は承認しない。
 
-## Goal
+## 目的
 
-Connect Antigravity CLI to the existing Provider boundary without changing the
-meaning or compatibility of the completed Replay, Safe Runner, Codex Provider,
-or Workflow A/B paths.
+完了済みのReplay、Safe Runner、Codex Provider、Workflow A/B経路の意味や互換性を
+変更せず、Antigravity CLIを既存のProvider境界へ接続する。
 
-The first slice establishes only the parts that can be verified without an
-external AI call:
+最初のSliceでは、外部AI呼び出しなしで検証できる次の要素だけを確立する。
 
-1. versioned Antigravity contracts;
-2. a strict `stream-json` parser;
-3. bounded read-only `--version` and `--help` preflight;
-4. normalized, redacted Evidence construction;
-5. fake-`agy` offline tests;
-6. a fail-closed boundary for capabilities that are not yet verified.
+1. バージョン管理されたAntigravity契約
+2. 厳格な`stream-json` Parser
+3. 上限付き・read-onlyの`--version`および`--help` Preflight
+4. 正規化・redaction済みEvidenceの構築
+5. fake `agy`によるオフラインテスト
+6. 未検証能力に対するfail-closed境界
 
-## Authoritative product facts
+## 信頼できる製品仕様
 
-The following facts were checked against Google documentation on 2026-07-28.
-They are product documentation, not a replacement for a versioned local
-preflight.
+以下の仕様は、2026-07-28時点のGoogleドキュメントで確認した。これは製品
+ドキュメントの内容であり、バージョン管理されたローカルPreflightの代替ではない。
 
-- The executable is `agy`.
-- Headless mode is one prompt and one process invocation using `-p`,
-  `--print`, or `--prompt`.
-- `--output-format stream-json` emits NDJSON with one `init`, zero or more
-  `step_update`, and one terminal `result`.
-- `--model` pins a model slug. An unknown pinned model fails instead of silently
-  selecting another model.
-- `--effort` accepts `low`, `medium`, or `high`.
-- `--print-timeout` bounds the CLI's own wait, while AgentLab must still enforce
-  its independent process-group timeout.
-- `--sandbox` requests terminal sandbox restrictions.
-- Headless mode uses cached credentials. Without cached authentication, a
-  non-interactive run exits with an authentication error instead of waiting for
-  browser input.
-- `stdout` carries structured output; diagnostics and permission notices use
-  `stderr`.
-- In headless mode, a tool that needs an unavailable approval can be
-  soft-denied while the run continues and exits `0`.
-- Workspace file reads and writes are normally auto-allowed. Other operations,
-  including shell commands and web access, depend on the effective permission
-  policy.
-- The stream can contain conversation IDs, absolute paths, response text, tool
-  parameters, tool output, subagent metadata, and usage data. Raw stream content
-  is sensitive and must not be persisted.
+- 実行ファイルは`agy`である。
+- Headless modeは、`-p`、`--print`、または`--prompt`を使用する、1つのPromptと
+  1回のprocess起動である。
+- `--output-format stream-json`は、1つの`init`、0個以上の`step_update`、および
+  1つのterminal `result`から成るNDJSONを出力する。
+- `--model`はmodel slugを固定する。不明なmodelを指定した場合、別のmodelを
+  暗黙に選択せず失敗する。
+- `--effort`は`low`、`medium`、`high`のいずれかを受け付ける。
+- `--print-timeout`はCLI自身の待機時間を制限する。一方、AgentLabは独立した
+  process group timeoutを引き続き適用しなければならない。
+- `--sandbox`はterminal sandbox制限を要求する。
+- Headless modeはcache済みcredentialsを使用する。cache済み認証がない場合、
+  非対話実行はbrowser入力を待たず、認証errorで終了する。
+- 構造化出力は`stdout`へ、診断およびpermission通知は`stderr`へ出力される。
+- Headless modeでは、利用できない承認を必要とするtoolがsoft-denyされても、
+  実行を継続して終了コード`0`で終了する場合がある。
+- Workspace内のfile read/writeは通常、自動的に許可される。shell commandや
+  web accessを含むその他の操作は、実効permission policyに依存する。
+- streamにはconversation ID、絶対path、response text、tool parameter、
+  tool output、subagent metadata、usage dataが含まれ得る。raw stream内容は
+  機密情報であり、永続化してはならない。
 
-Primary sources:
+一次情報:
 
 - [Headless mode](https://antigravity.google/docs/cli/headless)
-- [Permissions](https://antigravity.google/docs/cli/permissions)
+- [Permission](https://antigravity.google/docs/cli/permissions)
 - [Sandbox](https://antigravity.google/docs/cli/sandbox)
-- [Installation and authentication](https://antigravity.google/docs/cli/install)
-- [CLI reference](https://antigravity.google/docs/cli/reference)
-- [Changelog](https://antigravity.google/changelog)
+- [Installと認証](https://antigravity.google/docs/cli/install)
+- [CLIリファレンス](https://antigravity.google/docs/cli/reference)
+- [変更履歴](https://antigravity.google/changelog)
 
-## Critical gaps and decisions
+## 重大な未解決点と判断
 
-### Prompt transport is unresolved for Live
+### Live用Prompt transportは未解決
 
-The documented Antigravity headless interface accepts the Prompt as the value
-of `-p`/`--prompt`. No documented stdin or `--prompt-file` transport was found.
-Passing the generated Prompt directly would therefore expose it in process argv.
+文書化されたAntigravityのHeadless interfaceは、`-p`/`--prompt`の値として
+Promptを受け取る。文書化されたstdinまたは`--prompt-file` transportは
+見つかっていない。そのため、生成したPromptを直接渡すとprocess argvへ露出する。
 
-The repository currently requires Provider Prompt content not to appear in argv.
-This requirement remains authoritative. The offline slice must not weaken
-`AGENTS.md`, introduce a Live exception, or claim that an undocumented `@file`
-form is equivalent to a Prompt-file API.
+現在のrepository契約は、Provider Promptの内容をargvへ含めないことを要求する。
+この要件を引き続き正とする。オフラインSliceで`AGENTS.md`を緩和したり、
+Live用の例外を導入したり、文書化されていない`@file`形式をPrompt-file APIと
+同等だと主張したりしてはならない。
 
-Consequences:
+したがって、次を境界とする。
 
-- no production `agy -p <generated-prompt>` invocation in this slice;
-- no `live-antigravity` CLI command in this slice;
-- no Antigravity call from tests or CI;
-- no attempt to prove Prompt delivery through a model call;
-- future Live work requires a separate human decision:
-  - wait for a documented non-argv transport; or
-  - explicitly accept argv exposure only for reviewed, non-secret synthetic
-    Prompts and update the repository security contract.
+- このSliceではproduction用`agy -p <generated-prompt>`を起動しない。
+- このSliceでは`live-antigravity` CLI commandを追加しない。
+- testまたはCIからAntigravityを呼び出さない。
+- model呼び出しによるPrompt deliveryの証明を試みない。
+- 将来のLive作業には、次のいずれかを選ぶ独立した人間の判断が必要である。
+  - 文書化された非argv transportを待つ。
+  - review済みで機密情報を含まない合成Promptに限ってargv露出を明示的に
+    受け入れ、repositoryのsecurity契約を更新する。
 
-### Exit code zero is not enough
+### 終了コード0だけでは不十分
 
-Because a headless permission request can be soft-denied, `exit_code == 0` and
-`result.status == SUCCESS` do not prove that all requested tools executed.
-Quality Gates remain the source of truth for the resulting Workspace. Evidence
-must not infer successful command, web, MCP, or subagent execution from the
-terminal status.
+Headless permission requestはsoft-denyされる場合があるため、
+`exit_code == 0`および`result.status == SUCCESS`は、要求したすべてのtoolが
+実行されたことを証明しない。結果Workspaceの正しさは引き続きQuality Gateを
+根拠とする。Evidenceはterminal statusからcommand、web、MCP、subagentの
+実行成功を推定してはならない。
 
-### Sandbox and permission claims must be observed separately
+### Sandboxとpermissionに関する主張は別々に観測する
 
-`--sandbox` is a request to the CLI. It is not proof that every Provider action
-was contained, and it does not by itself describe file, web, MCP, or approval
-policy. Persist requested settings and observable stream values separately.
-Never label AgentLab's process-group runner as the Antigravity sandbox.
+`--sandbox`はCLIへの要求である。すべてのProvider操作がsandbox内に収まった
+証明ではなく、file、web、MCP、approval policyを単独で説明するものでもない。
+要求した設定とstreamから観測した値を分けて永続化する。AgentLabのprocess group
+runnerをAntigravity sandboxと表現してはならない。
 
-### Provider-internal retries are opaque
+### Provider内部のretryは不透明
 
-AgentLab must perform no retry, fallback, conversation resume, or replacement
-run. Any retry internal to Antigravity's service or harness is Provider
-behavior, not an AgentLab retry. If the stream does not expose it with a stable
-typed field, record it as unavailable rather than `0`.
+AgentLabはretry、fallback、conversation resume、replacement runを行っては
+ならない。Antigravityのserviceまたはharness内部で行われるretryはProviderの
+挙動であり、AgentLabのretryではない。streamに安定した型付きfieldとして
+公開されない限り、`0`ではなくunavailableとして記録する。
 
-## Scope
+## スコープ
 
-### In scope: offline slice 5A
+### 対象範囲: オフラインSlice 5A
 
-- Antigravity-specific enums and Evidence models with a new schema version;
-- a versioned CLI profile model with no unverified production version selected;
-- strict NDJSON parsing from supplied bytes;
-- normalization of terminal state and Provider-reported token usage;
-- bounded version/help preflight;
-- lifecycle and failure mapping that reuse existing shared primitives where
-  their semantics match;
-- fake executable and parser fixtures;
-- compatibility tests proving no existing Artifact bytes or loaders change;
-- documentation of the later Live and Provider-comparison boundaries.
+- 新しいschema versionを持つAntigravity固有enumおよびEvidence model
+- 未検証のproduction versionを選択しない、バージョン管理されたCLI profile model
+- 渡されたbytesを対象とする厳格なNDJSON parsing
+- terminal stateおよびProvider報告token usageの正規化
+- 上限付きversion/help Preflight
+- 意味が一致する場合に既存の共通primitiveを再利用するlifecycle/failure mapping
+- fake executableおよびParser fixture
+- 既存Artifactのbytesまたはloaderが変化しないことを証明する互換性test
+- 後続のLive境界およびProvider比較境界の文書化
 
-### Out of scope
+### 対象外
 
-- actual `agy -p` execution;
-- interactive `agy`, login, browser OAuth, keyring inspection, logout, or account
-  modification;
-- `agy models`, `agy agents`, quota lookup, model catalog lookup, or any command
-  that may require a service request;
-- Antigravity subscription or API usage;
-- real model, Prompt, Fixture, Workspace, or Gate execution;
-- `--dangerously-skip-permissions`;
-- changes to global `~/.gemini` files;
-- a temporary HOME/authentication experiment;
-- Provider comparison Spec, scheduler, report, or winner selection;
-- Phase 4 Campaign modification or replay;
-- PR creation or main merge.
+- 実際の`agy -p`実行
+- 対話型`agy`、login、browser OAuth、keyring確認、logout、account変更
+- `agy models`、`agy agents`、quota参照、model catalog参照、またはservice requestを
+  必要とする可能性があるcommand
+- Antigravity subscriptionまたはAPIの使用
+- 実model、Prompt、Fixture、Workspace、Gateの実行
+- `--dangerously-skip-permissions`
+- global `~/.gemini` fileの変更
+- 一時HOMEまたは認証の実験
+- Provider比較Spec、scheduler、report、winner選択
+- Phase 4 Campaignの変更またはreplay
+- PR作成またはmainへのmerge
 
-## Architecture
+## アーキテクチャ
 
-Keep the Antigravity contract adjacent to, but independent from, Codex-specific
-contracts.
+Antigravity契約はCodex固有契約に隣接させつつ、独立させる。
 
-Suggested modules:
+推奨module:
 
 - `src/agentlab/antigravity_provider.py`
-  - version/help preflight;
-  - profile selection;
-  - strict stream parser;
-  - normalization helpers;
-  - no production Live process runner in slice 5A.
+  - version/help Preflight
+  - profile選択
+  - 厳格なstream Parser
+  - 正規化helper
+  - Slice 5Aではproduction用Live process runnerを追加しない
 - `src/agentlab/models.py`
-  - Antigravity enums and backward-compatible Evidence 1.0/1.1;
-  - shared `UsageMetrics` mapping only where semantics match;
-  - no change to existing Codex schema versions.
+  - Antigravity enumおよび後方互換なEvidence 1.0/1.1
+  - 意味が一致する場合に限った共通`UsageMetrics` mapping
+  - 既存Codex schema versionを変更しない
 - `tests/test_antigravity_provider.py`
-  - parser, preflight, Evidence, redaction, and failure matrix.
+  - Parser、Preflight、Evidence、redaction、failure matrix
 - `tests/fixtures/antigravity/`
-  - small synthetic NDJSON samples only when a fixture is clearer than inline
-    test data;
-  - no copied real conversation or user data.
+  - inline test dataよりfixtureの方が明確な場合に限り、小さな合成NDJSON sampleを置く
+  - 実conversationまたはuser dataをcopyしない
 
-Do not introduce an abstract Provider hierarchy only for symmetry. Reuse
-process-group, strict JSON, time, redaction, and atomic persistence helpers by
-composition when their current contract is truly provider-neutral. Do not
-rename Codex fields or relax Codex validators to make Antigravity fit.
+対称性だけを目的として抽象Provider hierarchyを導入してはならない。現在の契約が
+真にProvider-neutralである場合、process group、strict JSON、time、redaction、
+atomic persistence helperをcompositionで再利用する。Antigravityへ合わせるために
+Codex fieldをrenameしたり、Codex validatorを緩和したりしてはならない。
 
-## Versioned preflight
+## バージョン管理されたPreflight
 
-### Allowed operations
+### 許可する操作
 
-Offline preflight may execute only:
+オフラインPreflightで実行してよいのは次だけである。
 
 ```console
 agy --version
 agy --help
 ```
 
-The production implementation must use an argv array, `shell=False`, separated
-stdout/stderr, bounded bytes, strict timeout, a new process group, residual
-process cleanup, and a sanitized environment. A fake executable is mandatory in
-normal tests.
+production実装では、argv array、`shell=False`、分離されたstdout/stderr、bytes上限、
+厳格なtimeout、新しいprocess group、残存process cleanup、sanitized environmentを
+使用しなければならない。通常testではfake executableを必須とする。
 
-Preflight must not execute `agy -p`, `agy models`, authentication commands,
-model catalog calls, or a sample task.
+Preflightで`agy -p`、`agy models`、認証command、model catalog呼び出し、
+sample taskを実行してはならない。
 
-### Required help markers
+### 必須help marker
 
-The first selectable profile should require all of these documented
-capabilities:
+最初に選択可能とするprofileは、文書化された次の能力をすべて必須とする。
 
-- `--prompt` or an equivalent documented headless alias;
-- `--output-format`;
-- `stream-json`;
-- `--model`;
-- `--effort`;
-- `--print-timeout`;
-- `--sandbox`.
+- `--prompt`または文書化された同等のHeadless alias
+- `--output-format`
+- `stream-json`
+- `--model`
+- `--effort`
+- `--print-timeout`
+- `--sandbox`
 
-The presence of `--dangerously-skip-permissions` is neither required nor
-treated as a capability AgentLab will use.
+`--dangerously-skip-permissions`の存在は必須とせず、AgentLabが使用する能力としても
+扱わない。
 
-### Version policy
+### Version方針
 
-Do not copy a version number from a web page or codelab into a production
-allowlist. The user's local `agy --version` result must be reviewed later and
-registered with an exact profile in a separate commit.
+web pageまたはcodelabのversion番号をproduction allowlistへcopyしてはならない。
+userのローカル`agy --version`結果を後でreviewし、別commitで厳密なprofileとして
+登録しなければならない。
 
-Until then:
+それまでは次のように扱う。
 
-- command unavailable: `not_verified`;
-- version/help failure: preflight failure;
-- supported flags but unregistered version: profile `not_selected`;
-- no selected profile: Provider invocation prohibited.
+- commandを利用できない: `not_verified`
+- version/help失敗: Preflight失敗
+- 対応flagは存在するがversion未登録: profile `not_selected`
+- profile未選択: Provider起動禁止
 
-## Strict `stream-json` contract
+## 厳格な`stream-json`契約
 
-### Framing
+### フレーミング
 
-- Input is UTF-8 NDJSON.
-- Each non-empty line must be exactly one JSON object.
-- Reject invalid UTF-8, duplicate keys, non-finite numbers, non-object values,
-  an empty line, an oversized line, and total output above the configured bound.
-- Parse incrementally across arbitrary byte chunk boundaries.
-- Raw lines are discarded after bounded normalization.
+- inputはUTF-8 NDJSONとする。
+- 空でない各lineは、ちょうど1つのJSON objectでなければならない。
+- 不正なUTF-8、重複key、非有限数、object以外の値、空line、上限を超えるline、
+  設定した上限を超える総outputをrejectする。
+- 任意のbyte chunk境界をまたいでincrementalにparseする。
+- raw lineは、上限付き正規化の完了後に破棄する。
 
-### Event order
+### Eventの順序
 
-For the initial versioned profile:
+最初のバージョン管理profileでは、次の順序を必須とする。
 
-1. exactly one `init` event first;
-2. zero or more `step_update` events;
-3. exactly one `result` event last;
-4. no event after `result`.
+1. 最初に`init` eventがちょうど1つ
+2. `step_update` eventが0個以上
+3. 最後に`result` eventがちょうど1つ
+4. `result`の後にeventがない
 
-Unknown top-level events fail closed as `provider_protocol_error`. Unknown
-`step_type` values also fail closed for a selected version profile until
-explicitly reviewed and added. Do not silently map schema drift to success.
+不明なtop-level eventは`provider_protocol_error`としてfail-closedにする。
+不明な`step_type`値も、明示的にreviewして追加するまでは、選択済みversion profileで
+fail-closedにする。schema driftを暗黙にsuccessへmappingしてはならない。
 
-### Normalized fields
+### 正規化field
 
-Persist only bounded, non-content observations:
+上限付きで内容を含まない次の観測値だけを永続化する。
 
-- event counts by fixed enum;
-- step counts by fixed `step_type`;
-- `init.permission_mode`;
-- whether requested model and agent fields were present;
-- terminal status;
-- terminal `num_turns`;
-- terminal duration in milliseconds after finite/range validation;
-- Provider-reported usage;
-- stdout/stderr byte counts and truncation flags;
-- process lifecycle and cleanup result.
+- 固定enumごとのevent count
+- 固定`step_type`ごとのstep count
+- `init.permission_mode`
+- 要求したmodel fieldおよびagent fieldが存在したか
+- terminal status
+- terminal `num_turns`
+- 有限性と範囲を検証した後のterminal duration（milliseconds）
+- Provider報告usage
+- stdout/stderrのbyte countおよびtruncation flag
+- process lifecycleおよびcleanup結果
 
-Do not persist:
+次は永続化しない。
 
-- `conversation_id` or session identifiers;
-- `cwd` or any local absolute path;
-- tool list;
-- response or `text_delta`;
-- error message text;
-- tool name, parameters, output, or error text;
-- subagent role, conversation ID, log URI, or Workspace URI;
-- raw stdout/stderr or raw NDJSON;
-- reasoning or agent messages.
+- `conversation_id`またはsession identifier
+- `cwd`またはローカル絶対path
+- tool list
+- responseまたは`text_delta`
+- error message text
+- tool名、parameter、output、error text
+- subagent role、conversation ID、log URI、Workspace URI
+- raw stdout/stderrまたはraw NDJSON
+- reasoningまたはagent message
 
-### Terminal mapping
+### Terminalの対応付け
 
 - `SUCCESS`
-  - requires one terminal result, process exit `0`, and `num_turns == 1`;
-  - means the Provider produced a response, not that every tool ran.
+  - 1つのterminal result、process exit `0`、`num_turns == 1`を必須とする。
+  - Providerがresponseを生成したことを意味するが、すべてのtool実行を意味しない。
 - `ERROR`
-  - Provider failure; classify a bounded advisory hint only if a conservative
-    redaction-safe classifier is available.
-- `CANCELED` or `INTERRUPTED`
-  - Provider interruption, distinct from a Harness cleanup failure.
-- `INVALID`, `WAITING`, or `RUNNING`
-  - invalid terminal state for a completed one-shot run.
-- missing/multiple result, result not last, malformed fields, or schema drift
-  - protocol failure.
-- timeout, signal termination, spawn failure, output limit, collection failure,
-  and process cleanup failure
-  - remain separate Harness/Provider failure kinds as in the Codex boundary.
+  - Provider失敗。保守的でredaction-safeなclassifierを利用できる場合に限り、
+    上限付きの参考hintを分類する。
+- `CANCELED`または`INTERRUPTED`
+  - Provider interruption。Harness cleanup失敗とは区別する。
+- `INVALID`、`WAITING`、または`RUNNING`
+  - 完了済みone-shot runとして不正なterminal state。
+- resultの欠落・複数存在、resultが最後でない、不正field、schema drift
+  - protocol失敗。
+- timeout、signal termination、spawn失敗、output limit、collection失敗、
+  process cleanup失敗
+  - Codex境界と同様に、別々のHarness/Provider failure kindとして維持する。
 
 ### Usage mapping
 
-Map only Provider-reported integer values:
+Providerが報告したinteger値だけをmappingする。
 
 | Antigravity result | AgentLab |
 |---|---|
@@ -308,132 +295,126 @@ Map only Provider-reported integer values:
 | `output_tokens` | `output_tokens` |
 | `thinking_tokens` | `reasoning_output_tokens` |
 
-`total_tokens` is a cross-check field, not an additional AgentLab metric. The
-documented examples treat thinking tokens as part of output and cache-read
-tokens as part of input, so do not add all five fields together.
+`total_tokens`はcross-check fieldであり、AgentLabの追加metricではない。文書化された
+exampleではthinking tokenをoutputの一部、cache-read tokenをinputの一部として
+扱うため、5つのfieldをすべて加算してはならない。
 
-Reject booleans, strings, negative values, overflow, and inconsistent totals.
-If the terminal usage object is missing, persist `not_available` with null
-values. Never convert missing usage to zero.
+boolean、string、負数、overflow、不整合なtotalをrejectする。terminal usage objectが
+ない場合、null値とともに`not_available`を永続化する。欠落usageを0へ変換しては
+ならない。
 
-## Antigravity Evidence 1.0 and 1.1
+## Antigravity Evidence 1.0および1.1
 
-Define a dedicated strict model with `extra="forbid"`. At minimum it records:
+`extra="forbid"`を設定した専用のstrict modelを定義する。最低限、次を記録する。
 
-- schema version and `provider=antigravity`;
-- exact CLI version and selected profile;
-- preflight timestamp and verified flags;
-- requested model slug and effort;
-- requested output format;
-- prompt transport state;
-- whether Prompt argv exposure would occur;
-- execution, invocation, and cleanup stages;
-- requested sandbox flag;
-- observed permission mode when available;
-- raw stream persistence `false`;
-- Provider status and normalized terminal status;
-- event/step counts;
-- usage source and normalized values;
-- stdout/stderr byte counts and truncation;
-- timeout/signal/process-group termination result;
-- fixed failure kind and failure stage.
+- schema versionおよび`provider=antigravity`
+- 厳密なCLI versionおよび選択済みprofile
+- Preflight timestampおよびverified flag
+- 要求したmodel slugおよびeffort
+- 要求したoutput format
+- Prompt transport state
+- Promptのargv露出が発生するか
+- execution、invocation、cleanup stage
+- 要求したsandbox flag
+- 利用できる場合は観測したpermission mode
+- raw stream persistence `false`
+- Provider statusおよび正規化済みterminal status
+- event/step count
+- usage sourceおよび正規化済み値
+- stdout/stderrのbyte countおよびtruncation
+- timeout/signal/process group termination結果
+- 固定failure kindおよびfailure stage
 
-Evidence 1.0 remains loadable and forbids the fields introduced later.
-Evidence 1.1 is emitted only when a structured preflight result is supplied. It
-adds an ordered, redacted `preflight_commands` list containing `version` and,
-when attempted, `help`. Each entry records return code, stream-specific byte
-counts and truncation flags, failure stage/kind, and process-group termination
-evidence. It never records the raw version/help output.
+Evidence 1.0は引き続きload可能とし、後から導入したfieldを禁止する。
+Evidence 1.1は、構造化Preflight結果が渡された場合に限って出力する。
+`version`と、試行した場合は`help`を含む、順序付きでredaction済みの
+`preflight_commands` listを追加する。各entryにはreturn code、stream別byte countと
+truncation flag、failure stage/kind、process group termination evidenceを記録する。
+rawのversion/help outputは記録しない。
 
-Evidence must distinguish requested, observed, and unavailable values. It must
-not state that sandbox, authentication, Prompt delivery, model API receipt,
-quota consumption, tool execution, or network blocking succeeded unless a
-stable observation proves that exact fact.
+Evidenceは、要求値、観測値、利用不能値を区別しなければならない。安定した観測に
+よってその事実を証明できない限り、sandbox、認証、Prompt delivery、model API受信、
+quota消費、tool実行、network blockingが成功したと記載してはならない。
 
-Existing Recording 1.0/1.1, Codex Evidence 1.1-1.5, Live Artifact 1.0/1.1,
-Failure Diagnostic 1.0, Workflow Plan, Campaign, and report loaders must remain
-byte- and schema-compatible.
+既存のRecording 1.0/1.1、Codex Evidence 1.1-1.5、Live Artifact 1.0/1.1、
+Failure Diagnostic 1.0、Workflow Plan、Campaign、report loaderは、bytesおよび
+schemaの互換性を維持しなければならない。
 
-### Slice 5A correction closure
+### Slice 5A是正の完了条件
 
-The 2026-07-29 correction preserves the load contract for Antigravity Evidence
-1.0 and adds Evidence 1.1 for structured preflight observations:
+2026-07-29の是正では、Antigravity Evidence 1.0のload契約を維持し、構造化された
+Preflight観測用にEvidence 1.1を追加する。
 
-- a trailing NDJSON line without a final newline is cleared from the parser
-  buffer immediately after normalization, and failure paths clear any
-  unprocessed buffered bytes;
-- `provider_output_limit` can represent either stdout or stderr truncation,
-  including bounded preflight stderr, while requiring at least one truncated
-  stream and bytes on that same stream;
-- `PermissionError` during process-group liveness checks is treated as alive,
-  an unknown `OSError` remains a cleanup observation failure, and neither can
-  be reset to cleanup success by a later check;
-- cleanup failure remains higher priority than timeout, output limit, and
-  collection failure while the simultaneous observations remain nested in
-  `preflight_commands`.
+- 最終newlineのない末尾NDJSON lineは正規化直後にParser bufferからclearし、
+  failure pathでは未処理のbuffered bytesをすべてclearする。
+- `provider_output_limit`は、上限付きPreflight stderrを含むstdoutまたはstderrの
+  truncationを表現できる。ただし、少なくとも1つのstreamがtruncatedであり、
+  同じstreamにbytesが存在することを必須とする。
+- process groupのliveness確認中に発生した`PermissionError`は生存として扱う。
+  不明な`OSError`はcleanup観測失敗のまま維持し、いずれも後続確認でcleanup成功へ
+  戻してはならない。
+- cleanup失敗はtimeout、output limit、collection失敗より高いpriorityを維持する。
+  同時に観測した内容は`preflight_commands`内にnestedしたまま保持する。
 
-The production Antigravity CLI version allowlist remains empty. All selectable
-profile and stream acceptance tests use an injected version allowlist and
-synthetic local executable only.
+production用Antigravity CLI version allowlistは空のままとする。選択可能profileおよび
+streamの全acceptance testでは、注入したversion allowlistと合成local executableだけを
+使用する。
 
-## Offline acceptance tests
+## オフライン受入テスト
 
-The Antigravity implementation must add tests for at least:
+Antigravity実装では、少なくとも次のtestを追加しなければならない。
 
 ### Preflight
 
-- missing `agy`;
-- version/help success from stdout or stderr;
-- non-zero exit;
-- timeout;
-- spawn/collection/process cleanup failure;
-- missing each required flag;
-- unregistered exact version;
-- proof that only `--version` and `--help` were invoked;
-- secret parent environment not inherited by fake processes.
+- `agy`が存在しない場合
+- stdoutまたはstderrからversion/helpを正常取得する場合
+- 非0 exit
+- timeout
+- spawn/collection/process cleanup失敗
+- 各必須flagがそれぞれ欠落する場合
+- 厳密なversionが未登録の場合
+- `--version`と`--help`だけを起動したことの証明
+- fake processが親processのsecret environmentを継承しないこと
 
 ### Parser
 
-- valid `init` → `step_update`* → `result`;
-- arbitrary chunk boundaries and split multibyte UTF-8;
-- zero step updates;
-- multiple `agent_response` deltas without retaining their text;
-- tool and subagent payloads discarded;
-- duplicate keys, invalid UTF-8, blank line, non-object JSON;
-- oversized line and total output limit;
-- missing, duplicate, early, or non-final result;
-- event after result;
-- unknown event and unknown step type;
-- every terminal status;
-- `SUCCESS` with non-zero exit or `num_turns != 1`;
-- usage present, absent, malformed, negative, boolean, non-finite, overflow, and
-  inconsistent totals.
+- 正常な`init` → `step_update`* → `result`
+- 任意のchunk境界およびmultibyte UTF-8の分割
+- step updateが0個の場合
+- textを保持しない複数の`agent_response` delta
+- toolおよびsubagent payloadの破棄
+- 重複key、不正UTF-8、空line、object以外のJSON
+- 上限を超えるlineおよびtotal output limit
+- resultの欠落、重複、早すぎる出現、最後以外への出現
+- result後のevent
+- 不明eventおよび不明step type
+- すべてのterminal status
+- 非0 exitまたは`num_turns != 1`の`SUCCESS`
+- usageの存在、欠落、不正形式、負数、boolean、非有限数、overflow、不整合なtotal
 
-### Evidence and compatibility
+### Evidenceと互換性
 
-- no Prompt, response, error text, conversation ID, path, tool payload, raw
-  stream, auth value, or secret in serialized Evidence;
-- strict round-trip and unknown-field rejection;
-- missing usage remains missing;
-- fixed failure kinds remain distinct;
-- no external AI, network, auth, model catalog, Gate, or real `agy -p`;
-- all existing Replay/Codex/Workflow tests remain unchanged and pass.
+- serialize済みEvidenceにPrompt、response、error text、conversation ID、path、
+  tool payload、raw stream、auth値、secretが含まれないこと
+- strict round-tripおよび不明fieldのreject
+- 欠落usageが欠落のままであること
+- 固定failure kindが区別されたままであること
+- 外部AI、network、auth、model catalog、Gate、実際の`agy -p`を使用しないこと
+- 既存のReplay/Codex/Workflow testを変更せず、すべてpassすること
 
-The 2026-07-29 Slice 5A acceptance suite exercises the listed contract with
-synthetic bytes or a short-lived local fake executable. Its explicit boundary
-cases include actual 65,536/65,537-byte Parser and preflight streams,
-`os.set_blocking`, `select`, and pipe-read collection failures, direct-child and
-grandchild extinction, PermissionError and unknown-OSError cleanup
-observations, terminal numeric bounds, every terminal-status-to-failure-kind
-mapping, malformed usage classes, trailing-line raw-buffer removal, and
-preflight-stderr propagation into Evidence 1.1.
+2026-07-29のSlice 5A acceptance suiteは、合成bytesまたは短時間で終了するlocal fake
+executableを使用して、列挙した契約を検証する。明示的な境界caseには、実値
+65,536/65,537-byteのParserおよびPreflight stream、`os.set_blocking`、`select`、
+pipe readのcollection失敗、direct childおよびgrandchildの消滅、
+`PermissionError`および不明`OSError`のcleanup観測、terminal numeric bounds、
+すべてのterminal-status-to-failure-kind mapping、不正usage class、末尾lineの
+raw buffer除去、Preflight stderrからEvidence 1.1への伝播を含む。
 
-This is a scoped acceptance statement, not a claim that every possible OS,
-pipe, scheduler, or future CLI behavior is exhaustively covered. Test counts are
-reported from `pytest --collect-only` and the full suite rather than fixed as
-part of the contract.
+これは範囲を限定した受入表明であり、考え得るすべてのOS、pipe、scheduler、
+将来のCLI挙動を網羅したという主張ではない。test countは契約の一部として固定せず、
+`pytest --collect-only`およびfull suiteの実行結果から報告する。
 
-Required validation:
+必須検証:
 
 ```console
 uv run pytest
@@ -442,166 +423,153 @@ uv run mypy src
 uv run agentlab doctor --json
 ```
 
-`doctor --json` may use the existing read-only version/help probes. Tests must
-still fake them. If running doctor on a developer machine would touch a real
-`agy`, report that separately and do not use it as an offline test result.
+`doctor --json`は、既存のread-only version/help probeを使用する場合がある。testでは
+引き続きfakeを使用しなければならない。developer machineでdoctorを実行すると実際の
+`agy`へ触れる場合は、別途報告し、オフラインtest結果として扱わない。
 
-## Later slices
+## 後続Slice
 
-### Slice 5B: Headless Runner readiness and offline integration
+### Slice 5B: Headless Runner準備とオフライン統合
 
-**Status: design only; implementation is not authorized.**
+**ステータス: 設計のみ。実装は未承認。**
 
-Slice 5B prepares a Safe Subprocess runner boundary and proves it only with a
-short-lived synthetic local executable. It must not invoke a real `agy`, send a
-Prompt, authenticate, access a model catalog or quota, use external network, or
-create a Live artifact.
+Slice 5BはSafe Subprocess runner境界を準備し、短時間で終了する合成local
+executableだけで証明する。実際の`agy`を起動する、Promptを送信する、認証する、
+model catalogまたはquotaへaccessする、外部networkを使用する、Live Artifactを
+作成する、のいずれも行ってはならない。
 
-#### Blocking Prompt-transport decision
+#### BlockerとなるPrompt transport判断
 
-The documented CLI contract still places the Prompt value in argv. AgentLab's
-repository contract still forbids Prompt content in argv and permits Prompt
-delivery only through stdin. A fake executable accepting stdin would prove the
-AgentLab collector but would not prove that the real Antigravity CLI supports
-that transport.
+文書化されたCLI契約では、Prompt値を引き続きargvへ置く。AgentLabのrepository契約は
+Prompt内容のargv格納を引き続き禁止し、stdinだけでのPrompt deliveryを許可する。
+stdinを受け付けるfake executableはAgentLab collectorを証明できるが、実際の
+Antigravity CLIがそのtransportをsupportする証明にはならない。
 
-Therefore Slice 5B implementation remains fail-closed until a separate reviewed
-decision does one of the following:
+したがって、別途reviewした判断で次のいずれかを行うまで、Slice 5B実装は
+fail-closedのままとする。
 
-1. registers a documented, locally preflighted non-argv Prompt transport; or
-2. explicitly changes the repository security contract for a bounded,
-   non-secret synthetic Prompt and records the accepted argv exposure.
+1. 文書化され、ローカルPreflight済みの非argv Prompt transportを登録する。
+2. 上限付きで機密情報を含まない合成Promptについてrepositoryのsecurity契約を
+   明示的に変更し、受け入れたargv露出を記録する。
 
-No undocumented `@file`, stdin, environment-variable, shell-expansion, or
-temporary-file convention may be treated as a production Antigravity Prompt
-transport.
+文書化されていない`@file`、stdin、environment variable、shell expansion、
+temporary fileの規約を、production用Antigravity Prompt transportとして扱っては
+ならない。
 
-#### Entry criteria
+#### 開始条件
 
-- Slice 5A correction is reviewed and all offline validation passes;
-- the Prompt-transport decision above is recorded in a separate reviewed
-  design change;
-- an exact local `agy X.Y.Z` and its required help markers are reviewed and
-  registered to one immutable profile;
-- temporary HOME, cached authentication behavior, immutable run-local settings,
-  sandbox request, and web/MCP/approval policy are specified without claiming
-  stronger isolation than observed;
-- exact model slug, reasoning effort, CLI timeout, Harness timeout, byte limits,
-  and stop conditions are fixed;
-- create-only Recording/Evidence/Diagnostic paths and cleanup ownership are
-  defined.
+- Slice 5A是正がreview済みで、すべてのオフライン検証がpassしていること
+- 上記のPrompt transport判断が、別のreview済み設計変更として記録されていること
+- 厳密なローカル`agy X.Y.Z`と必須help markerがreviewされ、1つのimmutable profileに
+  登録されていること
+- 一時HOME、cache済み認証の挙動、immutableなrun-local settings、sandbox request、
+  web/MCP/approval policyについて、観測以上に強い隔離を主張せず仕様化していること
+- 厳密なmodel slug、reasoning effort、CLI timeout、Harness timeout、byte limit、
+  stop conditionが固定されていること
+- create-onlyのRecording/Evidence/Diagnostic pathおよびcleanup責任を定義していること
 
-#### Runner contract if separately authorized
+#### 別途承認された場合のRunner契約
 
-- selected profile is a mandatory precondition; `NOT_SELECTED` prohibits spawn;
-- one run is one fresh conversation, one process, one Prompt, and at most one
-  Provider call;
-- argv is an explicit array with `shell=False`; stdout and stderr stay separate;
-- the resolved Prompt adapter is the only Prompt transport and never logs or
-  persists Prompt content;
-- Provider and Gate environments are separate and secret parent variables are
-  not inherited;
-- stdout feeds `StrictAntigravityStreamParser` incrementally while stderr is
-  counted and discarded after bounded classification;
-- timeout, signal, output-limit, collection, spawn, and cleanup failures remain
-  exclusive failure kinds and never become a quality-gate failure;
-- raw JSONL, stderr, agent text, reasoning, tool input/output, and subagent
-  payloads are never persisted;
-- there is no retry, fallback, continuation, resume, replacement run, or
-  subagent delegation.
+- profile選択を必須の前提条件とし、`NOT_SELECTED`ではspawnを禁止する。
+- 1 runは1つの新規conversation、1 process、1 Prompt、最大1回のProvider呼び出しとする。
+- argvは`shell=False`を指定した明示的なarrayとし、stdoutとstderrを分離したままにする。
+- 解決済みPrompt adapterを唯一のPrompt transportとし、Prompt内容をlogまたは
+  永続化しない。
+- ProviderとGateのenvironmentを分離し、親processのsecret variableを継承しない。
+- stdoutは`StrictAntigravityStreamParser`へincrementalに渡す。stderrはcountし、
+  上限付きで分類した後に破棄する。
+- timeout、signal、output limit、collection、spawn、cleanupの失敗は互いに排他的な
+  failure kindとして維持し、quality-gate failureへ変換しない。
+- raw JSONL、stderr、agent text、reasoning、tool input/output、subagent payloadを
+  永続化しない。
+- retry、fallback、continuation、resume、replacement run、subagent delegationを
+  行わない。
 
-#### Offline acceptance if separately authorized
+#### 別途承認された場合のオフライン受入条件
 
-- only a synthetic local executable is used;
-- Prompt absence from argv, logs, Evidence, Recording, Diagnostic, and process
-  metadata is asserted for a non-argv transport;
-- exact argv, sanitized environments, stdin closure, separate pipes, arbitrary
-  JSONL chunking, byte boundaries, timeout, signal, and process-group extinction
-  are tested;
-- success, Provider failure, CLI non-zero, signal, timeout, protocol drift,
-  output limit, collection failure, spawn failure, and cleanup failure remain
-  distinct;
-- Provider success does not imply tool success; only subsequent quality Gates
-  assess the disposable Workspace;
-- the full Replay, Runner, Codex, Workflow, and Slice 5A suites remain
-  compatible.
+- 合成local executableだけを使用する。
+- 非argv transportでは、argv、log、Evidence、Recording、Diagnostic、process metadataに
+  Promptが存在しないことをassertする。
+- 厳密なargv、sanitized environment、stdin close、分離pipe、任意のJSONL chunking、
+  byte境界、timeout、signal、process group消滅をtestする。
+- success、Provider failure、CLI非0、signal、timeout、protocol drift、output limit、
+  collection失敗、spawn失敗、cleanup失敗を区別したままにする。
+- Provider successはtool successを意味しない。後続Quality Gateだけが使い捨てWorkspaceを
+  評価する。
+- Replay、Runner、Codex、Workflow、Slice 5Aのfull suiteとの互換性を維持する。
 
-### Slice 5C: Live Antigravity smoke and quality-gate verification
+### Slice 5C: Live Antigravity smokeおよびQuality Gate検証
 
-**Status: not designed or authorized for execution.**
+**ステータス: 未設計、実行未承認。**
 
-Slice 5C starts only after a reviewed Slice 5B implementation and a second
-explicit human approval. It must add `--confirm-live-antigravity`, use a new
-experiment and artifact root, and permit at most one Provider call for the
-first smoke. The run is manual, never part of normal tests or CI, and has no
-retry, fallback, resume, continuation, replacement, or subagent delegation.
+Slice 5Cは、review済みSlice 5B実装と2回目の明示的な人間の承認後に限って開始する。
+`--confirm-live-antigravity`を追加し、新しいexperimentおよびartifact rootを使用し、
+最初のsmokeで許可するProvider呼び出しは最大1回とする。runは手動で実行し、
+通常testまたはCIへ含めない。また、retry、fallback、resume、continuation、
+replacement、subagent delegationを行わない。
 
-The approval must separately cover real `agy` execution, cached authentication,
-network/API access, model and quota use, the exact non-secret Prompt, Workspace
-scope, Gate commands, timeouts, stop conditions, and cleanup. A successful
-terminal result does not prove tool execution; the disposable Workspace quality
-Gates remain authoritative.
+承認は、実際の`agy`実行、cache済み認証、network/API access、modelおよびquota使用、
+機密情報を含まない厳密なPrompt、Workspace scope、Gate command、timeout、
+stop condition、cleanupをそれぞれ対象としなければならない。terminal resultの
+successはtool実行を証明しない。使い捨てWorkspaceのQuality Gateを引き続き正とする。
 
-The first real run must not reuse any Phase 3 or Phase 4 Artifact.
+最初の実runでPhase 3またはPhase 4のArtifactを再利用してはならない。
 
-### Slice 5D: Provider comparison
+### Slice 5D: Provider比較
 
-Start only after a successful, replayable Slice 5C vertical smoke.
+成功しreplay可能なSlice 5C vertical smokeの後に限って開始する。
 
-Use a new strict Provider-comparison Spec rather than overloading Workflow Spec
-2.0 or changing ExperimentSpec 1.0. Fix:
+Workflow Spec 2.0へ詰め込んだりExperimentSpec 1.0を変更したりせず、新しいstrictな
+Provider comparison Specを使用する。次を固定する。
 
-- one Workflow;
-- Task, Fixture, Acceptance and all Gate commands;
-- generated Prompt intent and versioned provider adapters;
-- repetitions and seeded block order;
-- Workspace construction;
-- timeout and stop conditions;
-- network/tool policy as closely as each Provider permits.
+- 1つのWorkflow
+- Task、Fixture、Acceptance、すべてのGate command
+- 生成Promptのintentおよびバージョン管理されたProvider adapter
+- repetitionおよびseed付きblock order
+- Workspace構築
+- timeoutおよびstop condition
+- 各Providerが許す範囲で可能な限り近づけたnetwork/tool policy
 
-Models, tool implementations, authentication surface, Prompt transport, and
-Agent Harness are Provider-specific treatment components. Therefore the result
-is a Codex-system versus Antigravity-system comparison, not a base-model
-comparison. Different model IDs or reasoning-effort labels must be reported,
-not described as equivalent.
+model、tool実装、認証surface、Prompt transport、Agent Harnessは、Provider固有の
+treatment componentである。したがって結果はbase-model比較ではなく、Codex systemと
+Antigravity systemの比較である。model IDまたはreasoning effort labelが異なる場合は
+報告し、同等であると表現してはならない。
 
-Reuse the Phase 4 principles:
+Phase 4の原則を再利用する。
 
-- pre-register a canonical Plan;
-- execute sequentially;
-- one run = one Provider turn = one AgentLab Provider call;
-- no retry, fallback, resume, or failed-run replacement;
-- append-only Campaign;
-- safe stop with remaining runs recorded as `not_run`;
-- offline-only report;
-- preserve missing usage and Provider-specific missing observations;
-- no general model-performance or statistical-significance claim from the
-  initial small experiment.
+- canonical Planを事前登録する。
+- sequentialに実行する。
+- 1 run = 1 Provider turn = 1 AgentLab Provider callとする。
+- retry、fallback、resume、failed-run replacementを行わない。
+- append-only Campaignとする。
+- 残りのrunを`not_run`として記録するsafe stopを行う。
+- offline-only reportとする。
+- 欠落usageおよびProvider固有の欠落観測を維持する。
+- 最初の小規模実験から、一般的なmodel performanceまたはstatistical significanceを
+  主張しない。
 
-## Current maintenance handoff
+## 現在の保守引き継ぎ
 
-An agent maintaining Slice 5A or preparing a separately approved Slice 5B
-implementation must:
+Slice 5Aを保守するagent、または別途承認されたSlice 5B実装を準備するagentは、
+次を行わなければならない。
 
-1. verify `feature/phase5`, the design commit, remote parity, and a clean tracked
-   worktree before editing;
-2. read `AGENTS.md`, this document, `docs/ROADMAP.md`,
-   `docs/CODEX_PROVIDER.md`, `docs/REPLAY_FORMAT.md`,
-   `src/agentlab/models.py`, `src/agentlab/capabilities.py`, and the relevant
-   tests;
-3. preserve the completed offline Slice 5A contract and implement no Slice 5B
-   code without a separate approval after its entry criteria are resolved;
-4. preserve existing schemas and completed Phase behavior;
-5. use fake executables and synthetic streams only;
-6. stop rather than invoke real `agy -p` or another Provider task,
-   authenticate, inspect credentials, query models/quota, or weaken the Prompt
-   rule; only the bounded version/help probes are allowed;
-7. run the required offline validation;
-8. update documentation only for what is actually implemented;
-9. commit and push only reviewed Phase 5 files to `feature/phase5`;
-10. do not create a PR, merge main, invoke Live, or start Slice 5C/5D without
-    separate approval.
+1. 編集前に`feature/phase5`、設計commit、remote parity、追跡対象worktreeが
+   cleanであることを確認する。
+2. `AGENTS.md`、本書、`docs/ROADMAP.md`、
+   `docs/CODEX_PROVIDER.md`、`docs/REPLAY_FORMAT.md`、
+   `src/agentlab/models.py`、`src/agentlab/capabilities.py`、関連testを読む。
+3. 完了済みオフラインSlice 5A契約を維持する。開始条件を解決した後に別途承認を
+   得ない限り、Slice 5B codeを実装しない。
+4. 既存schemaおよび完了済みPhaseの挙動を維持する。
+5. fake executableおよび合成streamだけを使用する。
+6. 実際の`agy -p`または別のProvider taskの起動、認証、credentials確認、
+   models/quota照会、Prompt規則の緩和を行わず停止する。許可するのは上限付き
+   version/help probeだけである。
+7. 必須オフライン検証を実行する。
+8. 実際に実装された内容に限ってdocumentを更新する。
+9. review済みPhase 5 fileだけを`feature/phase5`へcommitおよびpushする。
+10. 別途承認なしにPRを作成する、mainへmergeする、Liveを起動する、
+    Slice 5C/5Dを開始する、のいずれも行わない。
 
-The completion report must list changed files, test counts, remaining
-unverified capabilities, and confirm that real Antigravity Provider calls and
-quota use were zero.
+完了reportには、変更file、test count、残存する未検証能力を記載し、実際の
+Antigravity Provider呼び出しとquota使用が0であったことを確認しなければならない。
