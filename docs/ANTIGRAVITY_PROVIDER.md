@@ -5,7 +5,8 @@
 - Phase: 5
 - Phaseステータス: 実施中
 - Slice 5Aステータス: 実装済み、オフライン検証済み
-- Slice 5Bステータス: 設計のみ。実装は未承認
+- Slice 5Bステータス: 設計のみ。Prompt transport判定: not_verified (Blocked / Deferred、実装は未承認)
+- Prompt Transport Decision: [SLICE_5B_PROMPT_TRANSPORT_DECISION.md](decisions/SLICE_5B_PROMPT_TRANSPORT_DECISION.md) (Status: Blocked / Deferred)
 - 設計日: 2026-07-28
 - Slice 5A是正およびSlice 5B設計更新日: 2026-07-29
 - 設計ベース: `feature/phase5` の
@@ -446,6 +447,8 @@ model catalogまたはquotaへaccessする、外部networkを使用する、Live
 作成する、のいずれも行ってはならない。
 
 #### BlockerとなるPrompt transport判断
+
+2026-07-29に調査結果と判断を [Slice 5B Prompt Transport Decision Record](decisions/SLICE_5B_PROMPT_TRANSPORT_DECISION.md) として記録した。一次情報源から公式な non-argv transport を確認できないため判定は `not_verified` とし、Slice 5B は Blocked / Deferred （実装保留）とする。
 
 文書化されたCLI契約では、Prompt値を引き続きargvへ置く。AgentLabのrepository契約は
 Prompt内容のargv格納を引き続き禁止し、stdinだけでのPrompt deliveryを許可する。

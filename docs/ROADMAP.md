@@ -136,7 +136,8 @@ strict `stream-json` parser、read-only version/help preflight、redaction済み
 fake `agy`受入を是正・補完した。Slice 5BはHeadless Runner readinessとoffline統合の
 設計だけを確定し、実装は承認していない。実`agy -p`、認証、model catalog、quota利用、
 Live、Provider比較も承認していない。公式headless interfaceではPromptがargvへ載るため、
-Prompt transportの安全方針を別の人間判断で解決するまでRunnerとLiveはfail closedとする。
+公式ドキュメントにおけるnon-argv transportの存在を調査した。確認できなかったため判定を `not_verified` とし、
+[Slice 5B Prompt Transport Decision Record](decisions/SLICE_5B_PROMPT_TRANSPORT_DECISION.md) に基づき Slice 5B 実装は Blocked / Deferred（保留・fail closed）とする。
 
 **実装済み成果物:** Antigravity Evidence 1.0/1.1、構造化version/help preflight、
 profile選択境界、event/usage正規化、raw非永続化、process-group回収、合成fake `agy`受入。
