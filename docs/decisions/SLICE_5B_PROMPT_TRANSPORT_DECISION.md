@@ -35,8 +35,8 @@ Prompt本文がプロセス引数 (argv) に含まれる（argv transport）場�
 
 | 情報源 | URL / タイトル | Version／日付 | 確認日 | 確認語／検索語 | 確認結果 | 個別判定 |
 | --- | --- | --- | --- | --- | --- | --- |
-| Headless mode | `https://antigravity.google/docs/cli/headless`<br>Google Antigravity Docs - Headless mode | CLI 1.1.8 | 2026-07-29 | `stdin`, `prompt-file`, `piped`, `-p` | `-p`/`--print`/`--prompt` による flag 形式の記載が中心。stdin や `--prompt-file` の明示的な実行構文は未記載。 | 部分確認 (flag形式中心) |
-| CLI Reference | `https://antigravity.google/docs/cli/reference`<br>Google Antigravity Docs - CLI Reference | CLI 1.1.8 | 2026-07-29 | `stdin`, `--prompt-file`, `file input`, `@file` | `-p`/`--prompt` flag のみ記載。stdin や file 伝送に関する具体的パラメータ仕様は未掲載。 | 部分確認 (flag形式中心) |
+| Headless mode | `https://antigravity.google/docs/cli/headless`<br>Google Antigravity Docs - Headless mode | CLI 1.1.8 | 2026-07-29 | `stdin`, `prompt-file`, `piped`, `-p` | `-p`/`--print`/`--prompt` による flag 形式の記載が中心。stdin や `--prompt-file` の明示的な実行構文は未掲載。 | 部分確認 (flag形式中心) |
+| CLI Reference | `https://antigravity.google/docs/cli/reference`<br>Google Antigravity Docs - CLI Reference | CLI 1.1.8 | 2026-07-29 | `stdin`, `--prompt-file`, `file input`, `@file` | Headless Prompt transportや-p／--promptの仕様は未掲載 | 確認不可 (transport対象外) |
 | Changelog 1.1.2 | `https://antigravity.google/changelog`<br>Google Antigravity Changelog | CLI 1.1.2<br>(2026-07-13) | 2026-07-29 | `stdin`, `piped prompt` | 「piped promptによってstdinが使用される場合への対応」についての記述を確認。piped Prompt 伝送経路の存在に公式言及。 | 対応への公式言及あり |
 | Changelog 1.1.1 | `https://antigravity.google/changelog`<br>Google Antigravity Changelog | CLI 1.1.1<br>(2026-07-10) | 2026-07-29 | `stdin`, `prompt flag` | 「Promptをflagで指定した場合はstdinを読まないよう修正」についての記述を確認。Prompt 伝送方式に応じた stdin 読み取り分岐の存在に公式言及。 | transport分岐への公式言及あり |
 | Permissions | `https://antigravity.google/docs/cli/permissions`<br>Google Antigravity Docs - Permissions | CLI 1.1.8 | 2026-07-29 | `stdin`, `prompt` | パーミッションモデルおよび Headless での soft-deny 仕様を記載。Prompt 伝送に関する記載なし。 | 確認不可 (対象外) |
@@ -82,13 +82,13 @@ Prompt本文がプロセス引数 (argv) に含まれる（argv transport）場�
 
 - Antigravity CLI Provider の Slice 5B コード実装は一切行われず、fail-closed の状態が維持される。
 - リポジトリ内のセキュリティ契約は堅牢に保護され、プロセス引数経由の Prompt 漏洩リスクは回避される。
-- 今後、公式ドキュメントで stdin 伝送の具体的な実行構文・フラグ・制約が明確に定義されるか、安全なローカル Preflight によって検証可能になるまで、Slice 5B 実装は保留される。
+- 公式ドキュメントで具体的な実行契約が明確になり、その対象version／help markerを別途承認されたread-only Preflightで確認できるまで、Slice 5B実装を保留する。
 
 ## Reconsideration Triggers
 
 本 Decision は以下のいずれかが発生した場合に限り再評価・再検討を行う。
 
-1. Antigravity 公式ドキュメントまたは CLI リファレンスにおいて、piped Prompt (stdin) や `--prompt-file` などの non-argv Prompt transport の具体的なコマンド構文・パラメータ・制約仕様が更新・公表された場合。
+1. Antigravity 公式ドキュメントにおいて、piped Prompt (stdin) や `--prompt-file` などの non-argv Prompt transport の具体的なコマンド構文・パラメータ・制約仕様が更新・公表され、かつその対象version／help markerを別途承認されたread-only Preflightで確認できる状態となった場合。
 2. プロジェクトオーナー／レビューアーにより、セキュリティ要件や Prompt 伝送アーキテクチャに関する明示的な方針変更・承認が行われた場合。
 
 ## Authorization Boundary for Slice 5B / Slice 5C
