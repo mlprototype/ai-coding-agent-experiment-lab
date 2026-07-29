@@ -490,6 +490,7 @@ class AntigravityPreflightCommandEvidence(ContractModel):
     stderr_bytes: StrictInt = Field(ge=0, le=64 * 1024)
     stdout_truncated: StrictBool
     stderr_truncated: StrictBool
+    collection_error_observed: StrictBool
     failure_stage: AntigravityFailureStage | None
     failure_kind: LiveFailureKind
     termination: AntigravityTerminationEvidence
@@ -505,6 +506,55 @@ class AntigravityPreflightCommandEvidence(ContractModel):
         if self.stderr_truncated and self.stderr_bytes == 0:
             raise ValueError(
                 "preflight stderr_truncated requires stderr_bytes > 0"
+            )
+
+        cleanup_failed = not self.termination.process_group_cleared
+        timed_out = self.termination.reason is TerminationReason.TIMEOUT
+        output_limit_exceeded = (
+            self.stdout_truncated or self.stderr_truncated
+        )
+        if cleanup_failed:
+            expected_failure_kind = LiveFailureKind.PROCESS_CLEANUP_ERROR
+            expected_failure_stage = (
+                AntigravityFailureStage.PREFLIGHT_PROCESS_CLEANUP
+            )
+        elif timed_out:
+            expected_failure_kind = LiveFailureKind.PROVIDER_TIMEOUT
+            expected_failure_stage = (
+                AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
+            )
+        elif output_limit_exceeded:
+            expected_failure_kind = LiveFailureKind.PROVIDER_OUTPUT_LIMIT
+            expected_failure_stage = (
+                AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
+            )
+        elif self.collection_error_observed:
+            expected_failure_kind = LiveFailureKind.EVIDENCE_ERROR
+            expected_failure_stage = (
+                AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
+            )
+        elif self.returncode is None:
+            expected_failure_kind = LiveFailureKind.PROVIDER_UNAVAILABLE
+            expected_failure_stage = (
+                AntigravityFailureStage.PREFLIGHT_PROCESS_SPAWN
+            )
+        elif self.returncode != 0:
+            expected_failure_kind = LiveFailureKind.PROVIDER_UNAVAILABLE
+            expected_failure_stage = (
+                AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
+            )
+        else:
+            expected_failure_kind = LiveFailureKind.NONE
+            expected_failure_stage = None
+
+        if self.failure_kind is not expected_failure_kind:
+            raise ValueError(
+                "preflight failure_kind does not match observed cleanup, "
+                "timeout, output-limit, collection, and returncode priority"
+            )
+        if self.failure_stage is not expected_failure_stage:
+            raise ValueError(
+                "preflight failure_stage does not match observed failure"
             )
 
         if self.failure_kind is LiveFailureKind.NONE:

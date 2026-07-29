@@ -416,6 +416,7 @@ class AntigravityPreflightProcessResult:
     stderr_bytes: int
     stdout_truncated: bool
     stderr_truncated: bool
+    collection_error_observed: bool
     termination: AntigravityTerminationEvidence
 
     @property
@@ -444,6 +445,7 @@ class AntigravityPreflightProcessResult:
             stderr_bytes=self.stderr_bytes,
             stdout_truncated=self.stdout_truncated,
             stderr_truncated=self.stderr_truncated,
+            collection_error_observed=self.collection_error_observed,
             failure_stage=self.failure_stage,
             failure_kind=self.failure_kind,
             termination=self.termination,
@@ -562,6 +564,7 @@ def _run_preflight_subprocess(
             stderr_bytes=0,
             stdout_truncated=False,
             stderr_truncated=False,
+            collection_error_observed=False,
             termination=_cleared_preflight_termination(),
         )
     except Exception:
@@ -575,6 +578,7 @@ def _run_preflight_subprocess(
             stderr_bytes=0,
             stdout_truncated=False,
             stderr_truncated=False,
+            collection_error_observed=False,
             termination=_cleared_preflight_termination(),
         )
 
@@ -846,6 +850,7 @@ def _run_preflight_subprocess(
             stderr_bytes=stderr_bytes,
             stdout_truncated=stdout_truncated,
             stderr_truncated=stderr_truncated,
+            collection_error_observed=collection_error,
             termination=termination,
         )
 
@@ -860,6 +865,7 @@ def _run_preflight_subprocess(
             stderr_bytes=stderr_bytes,
             stdout_truncated=stdout_truncated,
             stderr_truncated=stderr_truncated,
+            collection_error_observed=collection_error,
             termination=termination,
         )
 
@@ -874,6 +880,7 @@ def _run_preflight_subprocess(
             stderr_bytes=stderr_bytes,
             stdout_truncated=stdout_truncated,
             stderr_truncated=stderr_truncated,
+            collection_error_observed=collection_error,
             termination=termination,
         )
 
@@ -888,6 +895,7 @@ def _run_preflight_subprocess(
             stderr_bytes=stderr_bytes,
             stdout_truncated=stdout_truncated,
             stderr_truncated=stderr_truncated,
+            collection_error_observed=True,
             termination=termination,
         )
 
@@ -902,6 +910,7 @@ def _run_preflight_subprocess(
             stderr_bytes=stderr_bytes,
             stdout_truncated=False,
             stderr_truncated=False,
+            collection_error_observed=False,
             termination=termination,
         )
 
@@ -915,6 +924,7 @@ def _run_preflight_subprocess(
         stderr_bytes=stderr_bytes,
         stdout_truncated=False,
         stderr_truncated=False,
+        collection_error_observed=False,
         termination=termination,
     )
 
@@ -945,6 +955,7 @@ def probe_antigravity_preflight(
             stderr_bytes=0,
             stdout_truncated=False,
             stderr_truncated=False,
+            collection_error_observed=False,
             termination=_cleared_preflight_termination(),
         )
         return AntigravityPreflightResult(

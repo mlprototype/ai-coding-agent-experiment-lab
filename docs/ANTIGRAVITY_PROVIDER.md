@@ -329,8 +329,8 @@ Evidence 1.0は引き続きload可能とし、後から導入したfieldを禁�
 Evidence 1.1は、構造化Preflight結果が渡された場合に限って出力する。
 `version`と、試行した場合は`help`を含む、順序付きでredaction済みの
 `preflight_commands` listを追加する。各entryにはreturn code、stream別byte countと
-truncation flag、failure stage/kind、process group termination evidenceを記録する。
-rawのversion/help outputは記録しない。
+truncation flag、collection error観測、failure stage/kind、process group
+termination evidenceを記録する。rawのversion/help outputは記録しない。
 
 Evidenceは、要求値、観測値、利用不能値を区別しなければならない。安定した観測に
 よってその事実を証明できない限り、sandbox、認証、Prompt delivery、model API受信、
@@ -359,6 +359,9 @@ Preflight観測用にEvidence 1.1を追加する。
   successに正常な`version` → `help`の両commandを必須とする。nested commandが
   失敗した場合はこれらの状態を禁止し、cleanupを最優先とするfailure kind/stageを
   top-levelと一致させる。
+- nested commandのfailure kind/stageは自己申告値を正とせず、process group
+  cleanup、timeout reason、stream truncation、`collection_error_observed`、
+  return codeの観測値から、この順のpriorityで導出する。
 
 production用Antigravity CLI version allowlistは空のままとする。選択可能profileおよび
 streamの全acceptance testでは、注入したversion allowlistと合成local executableだけを

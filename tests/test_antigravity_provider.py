@@ -407,6 +407,7 @@ def test_preflight_set_blocking_failure_is_collection_error(
         result.failure_stage
         is AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
     )
+    assert result.collection_error_observed is True
     assert result.termination.process_group_cleared is True
 
 
@@ -455,6 +456,7 @@ def test_preflight_pipe_read_failure_is_collection_error() -> None:
         result.failure_stage
         is AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
     )
+    assert result.collection_error_observed is True
     assert result.termination.process_group_cleared is True
 
 
@@ -1214,6 +1216,135 @@ def test_evidence_v11_rejects_missing_help_with_provider_success(
         AntigravityExecutionEvidence.model_validate_json(json.dumps(payload))
 
 
+@pytest.mark.parametrize(
+    (
+        "command_updates",
+        "wrong_failure_kind",
+        "wrong_failure_stage",
+    ),
+    [
+        pytest.param(
+            {
+                "termination": {
+                    "reason": TerminationReason.TIMEOUT,
+                    "sigterm_sent": True,
+                    "sigkill_sent": True,
+                    "process_group_cleared": False,
+                    "error_code": (
+                        AntigravityCleanupErrorCode.CLEANUP_TIMEOUT
+                    ),
+                },
+            },
+            LiveFailureKind.PROVIDER_TIMEOUT,
+            AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
+            id="cleanup-over-timeout",
+        ),
+        pytest.param(
+            {
+                "stdout_truncated": True,
+                "termination": {
+                    "reason": TerminationReason.TIMEOUT,
+                    "sigterm_sent": True,
+                    "sigkill_sent": False,
+                    "process_group_cleared": True,
+                    "error_code": AntigravityCleanupErrorCode.NONE,
+                },
+            },
+            LiveFailureKind.PROVIDER_OUTPUT_LIMIT,
+            AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
+            id="timeout-over-output-limit",
+        ),
+        pytest.param(
+            {
+                "stdout_truncated": True,
+                "collection_error_observed": True,
+            },
+            LiveFailureKind.EVIDENCE_ERROR,
+            AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
+            id="output-limit-over-collection-error",
+        ),
+        pytest.param(
+            {
+                "returncode": None,
+                "collection_error_observed": True,
+            },
+            LiveFailureKind.PROVIDER_UNAVAILABLE,
+            AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
+            id="collection-error-over-unavailable",
+        ),
+    ],
+)
+def test_evidence_v11_rejects_failure_kind_against_observed_priority(
+    tmp_path: Path,
+    command_updates: dict[str, object],
+    wrong_failure_kind: LiveFailureKind,
+    wrong_failure_stage: AntigravityFailureStage,
+) -> None:
+    evidence = _build_successful_v11_evidence(tmp_path)
+    payload = json.loads(evidence.model_dump_json())
+    payload.update(
+        {
+            "profile": AntigravityCliProfile.NOT_SELECTED,
+            "preflight_verified_flags": [],
+            "execution_stage": (
+                AntigravityExecutionStage.PREFLIGHT_NOT_COMPLETED
+            ),
+            "invocation_state": CodexInvocationState.NOT_ATTEMPTED,
+            "cleanup_state": CodexCleanupState.NOT_APPLICABLE,
+            "provider_status": ProviderExecutionStatus.FAILED,
+            "failure_kind": wrong_failure_kind,
+            "failure_stage": wrong_failure_stage,
+        }
+    )
+    version_command = payload["preflight_commands"][0]
+    version_command.update(command_updates)
+    version_command["failure_kind"] = wrong_failure_kind
+    version_command["failure_stage"] = wrong_failure_stage
+    if version_command["stdout_truncated"]:
+        payload["stdout_truncated"] = True
+
+    with pytest.raises(
+        ValueError,
+        match=r"preflight failure_kind does not match observed",
+    ):
+        AntigravityExecutionEvidence.model_validate_json(json.dumps(payload))
+
+
+def test_evidence_v11_rejects_unavailable_collection_without_observation(
+    tmp_path: Path,
+) -> None:
+    evidence = _build_successful_v11_evidence(tmp_path)
+    payload = json.loads(evidence.model_dump_json())
+    payload.update(
+        {
+            "profile": AntigravityCliProfile.NOT_SELECTED,
+            "preflight_verified_flags": [],
+            "execution_stage": (
+                AntigravityExecutionStage.PREFLIGHT_NOT_COMPLETED
+            ),
+            "invocation_state": CodexInvocationState.NOT_ATTEMPTED,
+            "cleanup_state": CodexCleanupState.NOT_APPLICABLE,
+            "provider_status": ProviderExecutionStatus.FAILED,
+            "failure_kind": LiveFailureKind.PROVIDER_UNAVAILABLE,
+            "failure_stage": (
+                AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
+            ),
+        }
+    )
+    version_command = payload["preflight_commands"][0]
+    version_command["returncode"] = None
+    version_command["failure_kind"] = LiveFailureKind.PROVIDER_UNAVAILABLE
+    version_command["failure_stage"] = (
+        AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"preflight failure_stage does not match observed failure",
+    ):
+        AntigravityExecutionEvidence.model_validate_json(json.dumps(payload))
+
+
 def test_evidence_v11_load_enforces_nested_preflight_failure_priority(
     tmp_path: Path,
 ) -> None:
@@ -1241,6 +1372,7 @@ def test_evidence_v11_load_enforces_nested_preflight_failure_priority(
     version_command["failure_stage"] = (
         AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
     )
+    version_command["collection_error_observed"] = True
 
     help_command = payload["preflight_commands"][1]
     help_command["failure_kind"] = LiveFailureKind.PROCESS_CLEANUP_ERROR
