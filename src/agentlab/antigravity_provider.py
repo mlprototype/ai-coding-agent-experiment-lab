@@ -14,9 +14,10 @@ import shutil
 import signal
 import subprocess
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from agentlab.models import (
     ANTIGRAVITY_ALLOWLISTED_CLI_VERSIONS,
@@ -28,6 +29,8 @@ from agentlab.models import (
     AntigravityFailureStage,
     AntigravityHelpMarker,
     AntigravityPermissionMode,
+    AntigravityPreflightCommandEvidence,
+    AntigravityPreflightOperation,
     AntigravityPromptTransport,
     AntigravityReasoningEffort,
     AntigravityStepType,
@@ -400,15 +403,135 @@ class AntigravityEvidenceDiagnostic:
     failure_kind: LiveFailureKind = LiveFailureKind.EVIDENCE_ERROR
 
 
+@dataclass(frozen=True)
+class AntigravityPreflightProcessResult:
+    """Bounded in-memory result of one version/help subprocess."""
+
+    returncode: int | None
+    stdout: str
+    stderr: str
+    failure_stage: AntigravityFailureStage | None
+    failure_kind: LiveFailureKind
+    stdout_bytes: int
+    stderr_bytes: int
+    stdout_truncated: bool
+    stderr_truncated: bool
+    termination: AntigravityTerminationEvidence
+
+    @property
+    def output_limit_exceeded(self) -> bool:
+        return self.stdout_truncated or self.stderr_truncated
+
+    def __iter__(self) -> Iterator[object]:
+        """Keep the former private tuple shape available during Slice 5A."""
+        yield self.returncode
+        yield self.stdout
+        yield self.stderr
+        yield self.failure_stage
+        yield self.failure_kind
+        yield self.stdout_bytes
+        yield self.stderr_bytes
+        yield self.output_limit_exceeded
+
+    def to_evidence(
+        self,
+        operation: AntigravityPreflightOperation,
+    ) -> AntigravityPreflightCommandEvidence:
+        return AntigravityPreflightCommandEvidence(
+            operation=operation,
+            returncode=self.returncode,
+            stdout_bytes=self.stdout_bytes,
+            stderr_bytes=self.stderr_bytes,
+            stdout_truncated=self.stdout_truncated,
+            stderr_truncated=self.stderr_truncated,
+            failure_stage=self.failure_stage,
+            failure_kind=self.failure_kind,
+            termination=self.termination,
+        )
+
+
+@dataclass(frozen=True)
+class AntigravityPreflightResult:
+    """Structured, redaction-ready result of the complete preflight."""
+
+    profile: AntigravityCliProfile
+    cli_version: str | None
+    verified_flags: tuple[AntigravityHelpMarker, ...]
+    checked_at: datetime
+    failure_stage: AntigravityFailureStage | None
+    failure_kind: LiveFailureKind
+    version_probe: AntigravityPreflightProcessResult | None
+    help_probe: AntigravityPreflightProcessResult | None
+
+    def __iter__(self) -> Iterator[object]:
+        """Keep the former public tuple shape available during Slice 5A."""
+        yield self.profile
+        yield self.cli_version
+        yield list(self.verified_flags)
+        yield self.checked_at
+        yield self.failure_stage
+        yield self.failure_kind
+
+    @property
+    def process_results(self) -> tuple[AntigravityPreflightProcessResult, ...]:
+        return tuple(
+            result
+            for result in (self.version_probe, self.help_probe)
+            if result is not None
+        )
+
+    @property
+    def stdout_bytes(self) -> int:
+        return sum(result.stdout_bytes for result in self.process_results)
+
+    @property
+    def stderr_bytes(self) -> int:
+        return sum(result.stderr_bytes for result in self.process_results)
+
+    @property
+    def stdout_truncated(self) -> bool:
+        return any(result.stdout_truncated for result in self.process_results)
+
+    @property
+    def stderr_truncated(self) -> bool:
+        return any(result.stderr_truncated for result in self.process_results)
+
+    def command_evidence(self) -> list[AntigravityPreflightCommandEvidence]:
+        evidence: list[AntigravityPreflightCommandEvidence] = []
+        if self.version_probe is not None:
+            evidence.append(
+                self.version_probe.to_evidence(
+                    AntigravityPreflightOperation.VERSION
+                )
+            )
+        if self.help_probe is not None:
+            evidence.append(
+                self.help_probe.to_evidence(
+                    AntigravityPreflightOperation.HELP
+                )
+            )
+        return evidence
+
+
 def _is_process_group_alive(pgid: int) -> bool:
     """Check if any process in the process group is still alive."""
     try:
         os.killpg(pgid, 0)
         return True
-    except (ProcessLookupError, OSError):
+    except ProcessLookupError:
         return False
     except PermissionError:
         return True
+
+
+def _cleared_preflight_termination() -> AntigravityTerminationEvidence:
+    return AntigravityTerminationEvidence(
+        reason=TerminationReason.NONE,
+        sigterm_sent=False,
+        sigkill_sent=False,
+        process_group_cleared=True,
+        error_code=AntigravityCleanupErrorCode.NONE,
+    )
 
 
 def _run_preflight_subprocess(
@@ -416,16 +539,7 @@ def _run_preflight_subprocess(
     args: list[str],
     timeout_seconds: float,
     clean_env: dict[str, str],
-) -> tuple[
-    int | None,
-    str,
-    str,
-    AntigravityFailureStage | None,
-    LiveFailureKind,
-    int,
-    int,
-    bool,
-]:
+) -> AntigravityPreflightProcessResult:
     """Execute preflight subprocess with strict process group isolation and bounded collection."""
     try:
         proc = subprocess.Popen(
@@ -438,26 +552,30 @@ def _run_preflight_subprocess(
             env=clean_env,
         )
     except FileNotFoundError:
-        return (
-            None,
-            "",
-            "",
-            AntigravityFailureStage.PREFLIGHT_PROCESS_SPAWN,
-            LiveFailureKind.PROVIDER_UNAVAILABLE,
-            0,
-            0,
-            False,
+        return AntigravityPreflightProcessResult(
+            returncode=None,
+            stdout="",
+            stderr="",
+            failure_stage=AntigravityFailureStage.PREFLIGHT_PROCESS_SPAWN,
+            failure_kind=LiveFailureKind.PROVIDER_UNAVAILABLE,
+            stdout_bytes=0,
+            stderr_bytes=0,
+            stdout_truncated=False,
+            stderr_truncated=False,
+            termination=_cleared_preflight_termination(),
         )
     except Exception:
-        return (
-            None,
-            "",
-            "",
-            AntigravityFailureStage.PREFLIGHT_PROCESS_SPAWN,
-            LiveFailureKind.PROVIDER_UNAVAILABLE,
-            0,
-            0,
-            False,
+        return AntigravityPreflightProcessResult(
+            returncode=None,
+            stdout="",
+            stderr="",
+            failure_stage=AntigravityFailureStage.PREFLIGHT_PROCESS_SPAWN,
+            failure_kind=LiveFailureKind.PROVIDER_UNAVAILABLE,
+            stdout_bytes=0,
+            stderr_bytes=0,
+            stdout_truncated=False,
+            stderr_truncated=False,
+            termination=_cleared_preflight_termination(),
         )
 
     stdout_buf = bytearray()
@@ -467,9 +585,14 @@ def _run_preflight_subprocess(
     start_time = time.monotonic()
     timed_out = False
     collection_error = False
-    output_limit_exceeded = False
+    stdout_truncated = False
+    stderr_truncated = False
     cleanup_failed = False
     cleanup_exception = False
+    cleanup_observation_error = False
+    sigterm_sent = False
+    sigkill_sent = False
+    termination_reason = TerminationReason.NONE
 
     pipes = [proc.stdout, proc.stderr]
     for pipe in pipes:
@@ -501,11 +624,19 @@ def _run_preflight_subprocess(
 
                 for pipe in rlist:
                     buf = stdout_buf if pipe is proc.stdout else stderr_buf
-                    max_read = min(4096, (PREFLIGHT_MAX_BYTES + 1) - len(buf))
-                    if max_read <= 0:
-                        output_limit_exceeded = True
-                        pipe.close()
-                        continue
+                    stream_already_truncated = (
+                        stdout_truncated
+                        if pipe is proc.stdout
+                        else stderr_truncated
+                    )
+                    max_read = (
+                        4096
+                        if stream_already_truncated
+                        else min(
+                            4096,
+                            (PREFLIGHT_MAX_BYTES + 1) - len(buf),
+                        )
+                    )
 
                     try:
                         data = pipe.read(max_read)
@@ -517,11 +648,16 @@ def _run_preflight_subprocess(
                         pipe.close()
                         continue
 
+                    if stream_already_truncated:
+                        continue
+
                     buf.extend(data)
                     if len(buf) > PREFLIGHT_MAX_BYTES:
-                        output_limit_exceeded = True
+                        if pipe is proc.stdout:
+                            stdout_truncated = True
+                        else:
+                            stderr_truncated = True
                         del buf[PREFLIGHT_MAX_BYTES:]
-                        pipe.close()
 
                 if collection_error:
                     break
@@ -541,7 +677,10 @@ def _run_preflight_subprocess(
                                     collection_error = True
                                     break
                             if len(buf) > PREFLIGHT_MAX_BYTES:
-                                output_limit_exceeded = True
+                                if pipe is proc.stdout:
+                                    stdout_truncated = True
+                                else:
+                                    stderr_truncated = True
                                 del buf[PREFLIGHT_MAX_BYTES:]
                             pipe.close()
                     break
@@ -553,16 +692,42 @@ def _run_preflight_subprocess(
     finally:
         try:
             # Check if termination is required (timeout, alive pgid, or un-reaped child)
+            if (
+                not timed_out
+                and not collection_error
+                and proc.poll() is None
+            ):
+                try:
+                    proc.wait(timeout=0.1)
+                except subprocess.TimeoutExpired:
+                    pass
+                except Exception:
+                    cleanup_failed = True
+            # Poll first so a normally exited direct child is reaped before the
+            # process-group liveness check. On macOS an unreaped child can
+            # otherwise make killpg(..., 0) report an ambiguous permission
+            # state even though no residual process remains.
+            proc.poll()
             pg_alive = False
             try:
                 pg_alive = _is_process_group_alive(pgid)
             except Exception:
                 cleanup_failed = True
+                cleanup_observation_error = True
+                pg_alive = True
 
             if timed_out or pg_alive or (proc.poll() is None):
+                termination_reason = (
+                    TerminationReason.TIMEOUT
+                    if timed_out
+                    else TerminationReason.EMERGENCY_CLEANUP
+                )
                 if pg_alive:
-                    with contextlib.suppress(ProcessLookupError):
+                    try:
                         os.killpg(pgid, signal.SIGTERM)
+                        sigterm_sent = True
+                    except ProcessLookupError:
+                        pass
 
                 term_deadline = time.monotonic() + 0.5
                 while time.monotonic() < term_deadline:
@@ -579,6 +744,7 @@ def _run_preflight_subprocess(
                             break
                     except Exception:
                         cleanup_failed = True
+                        cleanup_observation_error = True
                         break
                     time.sleep(0.01)
 
@@ -586,11 +752,15 @@ def _run_preflight_subprocess(
                     pg_alive_after_term = _is_process_group_alive(pgid)
                 except Exception:
                     cleanup_failed = True
+                    cleanup_observation_error = True
                     pg_alive_after_term = True
 
                 if pg_alive_after_term:
-                    with contextlib.suppress(ProcessLookupError):
+                    try:
                         os.killpg(pgid, signal.SIGKILL)
+                        sigkill_sent = True
+                    except ProcessLookupError:
+                        pass
 
                     kill_deadline = time.monotonic() + 0.5
                     while time.monotonic() < kill_deadline:
@@ -607,6 +777,7 @@ def _run_preflight_subprocess(
                                 break
                         except Exception:
                             cleanup_failed = True
+                            cleanup_observation_error = True
                             break
                         time.sleep(0.01)
 
@@ -615,6 +786,7 @@ def _run_preflight_subprocess(
                             cleanup_failed = True
                     except Exception:
                         cleanup_failed = True
+                        cleanup_observation_error = True
 
             # Final reap attempt for direct child
             if proc.poll() is None:
@@ -627,12 +799,15 @@ def _run_preflight_subprocess(
             try:
                 proc_reaped = proc.poll() is not None
                 pg_extinct = not _is_process_group_alive(pgid)
-                cleanup_failed = not (proc_reaped and pg_extinct)
+                if not proc_reaped or not pg_extinct:
+                    cleanup_failed = True
             except Exception:
                 cleanup_failed = True
+                cleanup_observation_error = True
 
         except Exception:
             cleanup_exception = True
+            cleanup_failed = True
 
         # Ensure pipes are closed
         for pipe in (proc.stdout, proc.stderr):
@@ -644,65 +819,103 @@ def _run_preflight_subprocess(
     stderr_bytes = len(stderr_buf)
     stdout_str = stdout_buf.decode("utf-8", errors="replace")
     stderr_str = stderr_buf.decode("utf-8", errors="replace")
+    cleanup_error_code = AntigravityCleanupErrorCode.NONE
+    if cleanup_failed or cleanup_exception:
+        cleanup_error_code = (
+            AntigravityCleanupErrorCode.CLEANUP_PROCESS_ERROR
+            if cleanup_exception or cleanup_observation_error
+            else AntigravityCleanupErrorCode.CLEANUP_TIMEOUT
+        )
+    termination = AntigravityTerminationEvidence(
+        reason=termination_reason,
+        sigterm_sent=sigterm_sent,
+        sigkill_sent=sigkill_sent,
+        process_group_cleared=not (cleanup_failed or cleanup_exception),
+        error_code=cleanup_error_code,
+    )
 
     # Priority ranking: Cleanup failure > Timeout > Output limit > Collection error
     if cleanup_failed or cleanup_exception:
-        return (
-            proc.returncode,
-            stdout_str,
-            stderr_str,
-            AntigravityFailureStage.PREFLIGHT_PROCESS_CLEANUP,
-            LiveFailureKind.PROCESS_CLEANUP_ERROR,
-            stdout_bytes,
-            stderr_bytes,
-            output_limit_exceeded,
+        return AntigravityPreflightProcessResult(
+            returncode=proc.returncode,
+            stdout=stdout_str,
+            stderr=stderr_str,
+            failure_stage=AntigravityFailureStage.PREFLIGHT_PROCESS_CLEANUP,
+            failure_kind=LiveFailureKind.PROCESS_CLEANUP_ERROR,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
+            termination=termination,
         )
 
     if timed_out:
-        return (
-            None,
-            stdout_str,
-            stderr_str,
-            AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
-            LiveFailureKind.PROVIDER_TIMEOUT,
-            stdout_bytes,
-            stderr_bytes,
-            output_limit_exceeded,
+        return AntigravityPreflightProcessResult(
+            returncode=proc.returncode,
+            stdout=stdout_str,
+            stderr=stderr_str,
+            failure_stage=AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
+            failure_kind=LiveFailureKind.PROVIDER_TIMEOUT,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
+            termination=termination,
         )
 
-    if output_limit_exceeded:
-        return (
-            proc.returncode,
-            stdout_str,
-            stderr_str,
-            AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
-            LiveFailureKind.PROVIDER_OUTPUT_LIMIT,
-            stdout_bytes,
-            stderr_bytes,
-            True,
+    if stdout_truncated or stderr_truncated:
+        return AntigravityPreflightProcessResult(
+            returncode=proc.returncode,
+            stdout=stdout_str,
+            stderr=stderr_str,
+            failure_stage=AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
+            failure_kind=LiveFailureKind.PROVIDER_OUTPUT_LIMIT,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
+            termination=termination,
         )
 
     if collection_error:
-        return (
-            proc.returncode,
-            stdout_str,
-            stderr_str,
-            AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
-            LiveFailureKind.EVIDENCE_ERROR,
-            stdout_bytes,
-            stderr_bytes,
-            output_limit_exceeded,
+        return AntigravityPreflightProcessResult(
+            returncode=proc.returncode,
+            stdout=stdout_str,
+            stderr=stderr_str,
+            failure_stage=AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
+            failure_kind=LiveFailureKind.EVIDENCE_ERROR,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
+            termination=termination,
         )
 
-    return (
-        proc.returncode,
-        stdout_str,
-        stderr_str,
-        None,
-        LiveFailureKind.NONE,
-        stdout_bytes,
-        stderr_bytes,
-        False,
+    if proc.returncode != 0:
+        return AntigravityPreflightProcessResult(
+            returncode=proc.returncode,
+            stdout=stdout_str,
+            stderr=stderr_str,
+            failure_stage=AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION,
+            failure_kind=LiveFailureKind.PROVIDER_UNAVAILABLE,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            stdout_truncated=False,
+            stderr_truncated=False,
+            termination=termination,
+        )
+
+    return AntigravityPreflightProcessResult(
+        returncode=proc.returncode,
+        stdout=stdout_str,
+        stderr=stderr_str,
+        failure_stage=None,
+        failure_kind=LiveFailureKind.NONE,
+        stdout_bytes=stdout_bytes,
+        stderr_bytes=stderr_bytes,
+        stdout_truncated=False,
+        stderr_truncated=False,
+        termination=termination,
     )
 
 
@@ -716,26 +929,33 @@ def probe_antigravity_preflight(
     executable_path: str | None = None,
     timeout_seconds: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
     allowlist: frozenset[str] = ANTIGRAVITY_ALLOWLISTED_CLI_VERSIONS,
-) -> tuple[
-    AntigravityCliProfile,
-    str | None,
-    list[AntigravityHelpMarker],
-    datetime,
-    AntigravityFailureStage | None,
-    LiveFailureKind,
-]:
+) -> AntigravityPreflightResult:
     """Execute bounded agy --version and agy --help preflight."""
     checked_at = datetime.now(UTC)
     cmd = executable_path or shutil.which("agy")
 
     if cmd is None:
-        return (
-            AntigravityCliProfile.NOT_SELECTED,
-            None,
-            [],
-            checked_at,
-            AntigravityFailureStage.PREFLIGHT,
-            LiveFailureKind.PROVIDER_UNAVAILABLE,
+        missing_probe = AntigravityPreflightProcessResult(
+            returncode=None,
+            stdout="",
+            stderr="",
+            failure_stage=AntigravityFailureStage.PREFLIGHT_PROCESS_SPAWN,
+            failure_kind=LiveFailureKind.PROVIDER_UNAVAILABLE,
+            stdout_bytes=0,
+            stderr_bytes=0,
+            stdout_truncated=False,
+            stderr_truncated=False,
+            termination=_cleared_preflight_termination(),
+        )
+        return AntigravityPreflightResult(
+            profile=AntigravityCliProfile.NOT_SELECTED,
+            cli_version=None,
+            verified_flags=(),
+            checked_at=checked_at,
+            failure_stage=AntigravityFailureStage.PREFLIGHT_PROCESS_SPAWN,
+            failure_kind=LiveFailureKind.PROVIDER_UNAVAILABLE,
+            version_probe=missing_probe,
+            help_probe=None,
         )
 
     clean_env = {
@@ -745,33 +965,41 @@ def probe_antigravity_preflight(
     }
 
     # Version probe
-    ret_v, stdout_v, stderr_v, stage_v, kind_v, _b_v_out, _b_v_err, trunc_v = (
-        _run_preflight_subprocess(cmd, ["--version"], timeout_seconds, clean_env)
+    version_probe = _run_preflight_subprocess(
+        cmd,
+        ["--version"],
+        timeout_seconds,
+        clean_env,
     )
-    if kind_v is not LiveFailureKind.NONE or trunc_v:
-        final_kind = (
-            kind_v
-            if kind_v is not LiveFailureKind.NONE
-            else LiveFailureKind.PROVIDER_OUTPUT_LIMIT
-        )
+    if version_probe.failure_kind is not LiveFailureKind.NONE:
         final_stage = (
-            stage_v
-            if stage_v is not None
+            version_probe.failure_stage
+            if version_probe.failure_stage is not None
             else AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
         )
-        return (
-            AntigravityCliProfile.NOT_SELECTED,
-            None,
-            [],
-            checked_at,
-            final_stage,
-            final_kind,
+        return AntigravityPreflightResult(
+            profile=AntigravityCliProfile.NOT_SELECTED,
+            cli_version=None,
+            verified_flags=(),
+            checked_at=checked_at,
+            failure_stage=final_stage,
+            failure_kind=version_probe.failure_kind,
+            version_probe=version_probe,
+            help_probe=None,
         )
 
     version_str: str | None = None
-    if ret_v == 0:
-        stdout_lines = [line.strip() for line in stdout_v.splitlines() if line.strip()]
-        stderr_lines = [line.strip() for line in stderr_v.splitlines() if line.strip()]
+    if version_probe.returncode == 0:
+        stdout_lines = [
+            line.strip()
+            for line in version_probe.stdout.splitlines()
+            if line.strip()
+        ]
+        stderr_lines = [
+            line.strip()
+            for line in version_probe.stderr.splitlines()
+            if line.strip()
+        ]
         all_non_empty_lines = stdout_lines + stderr_lines
 
         # Reject if total non-empty lines across stdout + stderr is not exactly 1
@@ -781,32 +1009,32 @@ def probe_antigravity_preflight(
                 version_str = match.group(0)
 
     # Help probe
-    ret_h, stdout_h, stderr_h, stage_h, kind_h, _b_h_out, _b_h_err, trunc_h = (
-        _run_preflight_subprocess(cmd, ["--help"], timeout_seconds, clean_env)
+    help_probe = _run_preflight_subprocess(
+        cmd,
+        ["--help"],
+        timeout_seconds,
+        clean_env,
     )
-    if kind_h is not LiveFailureKind.NONE or trunc_h:
-        final_kind = (
-            kind_h
-            if kind_h is not LiveFailureKind.NONE
-            else LiveFailureKind.PROVIDER_OUTPUT_LIMIT
-        )
+    if help_probe.failure_kind is not LiveFailureKind.NONE:
         final_stage = (
-            stage_h
-            if stage_h is not None
+            help_probe.failure_stage
+            if help_probe.failure_stage is not None
             else AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
         )
-        return (
-            AntigravityCliProfile.NOT_SELECTED,
-            version_str,
-            [],
-            checked_at,
-            final_stage,
-            final_kind,
+        return AntigravityPreflightResult(
+            profile=AntigravityCliProfile.NOT_SELECTED,
+            cli_version=version_str,
+            verified_flags=(),
+            checked_at=checked_at,
+            failure_stage=final_stage,
+            failure_kind=help_probe.failure_kind,
+            version_probe=version_probe,
+            help_probe=help_probe,
         )
 
     verified_flags: list[AntigravityHelpMarker] = []
-    if ret_h == 0:
-        help_output = f"{stdout_h}\n{stderr_h}".lower()
+    if help_probe.returncode == 0:
+        help_output = f"{help_probe.stdout}\n{help_probe.stderr}".lower()
         for marker in AntigravityHelpMarker:
             if _matches_cli_flag(marker.value, help_output):
                 verified_flags.append(marker)
@@ -819,19 +1047,24 @@ def probe_antigravity_preflight(
         failure_stage = AntigravityFailureStage.PREFLIGHT
         failure_kind = LiveFailureKind.PROVIDER_UNAVAILABLE
 
-    return (
-        profile,
-        version_str,
-        sorted(verified_flags, key=lambda f: f.value),
-        checked_at,
-        failure_stage,
-        failure_kind,
+    return AntigravityPreflightResult(
+        profile=profile,
+        cli_version=version_str,
+        verified_flags=tuple(
+            sorted(verified_flags, key=lambda flag: flag.value)
+        ),
+        checked_at=checked_at,
+        failure_stage=failure_stage,
+        failure_kind=failure_kind,
+        version_probe=version_probe,
+        help_probe=help_probe,
     )
 
 
 
 def build_antigravity_evidence(
     *,
+    preflight_result: AntigravityPreflightResult | None = None,
     cli_version: str | None = None,
     profile: AntigravityCliProfile = AntigravityCliProfile.NOT_SELECTED,
     preflight_checked_at: datetime | None = None,
@@ -853,6 +1086,40 @@ def build_antigravity_evidence(
     initial_failure_kind: LiveFailureKind = LiveFailureKind.NONE,
 ) -> AntigravityExecutionEvidence:
     """Construct redacted AntigravityExecutionEvidence with exclusive failure taxonomy."""
+    schema_version: Literal["1.0", "1.1"] = "1.0"
+    preflight_commands: list[AntigravityPreflightCommandEvidence] | None = None
+    if preflight_result is not None:
+        schema_version = "1.1"
+        preflight_commands = preflight_result.command_evidence()
+        cli_version = preflight_result.cli_version
+        profile = preflight_result.profile
+        preflight_checked_at = preflight_result.checked_at
+        preflight_verified_flags = list(preflight_result.verified_flags)
+        if failure_stage is None:
+            failure_stage = preflight_result.failure_stage
+        if initial_failure_kind is LiveFailureKind.NONE:
+            initial_failure_kind = preflight_result.failure_kind
+        if stdout_bytes == 0:
+            stdout_bytes = preflight_result.stdout_bytes
+        if stderr_bytes == 0:
+            stderr_bytes = preflight_result.stderr_bytes
+        stdout_truncated = (
+            stdout_truncated or preflight_result.stdout_truncated
+        )
+        stderr_truncated = (
+            stderr_truncated or preflight_result.stderr_truncated
+        )
+        if (
+            execution_stage
+            is AntigravityExecutionStage.PREFLIGHT_NOT_COMPLETED
+            and (
+                preflight_result.failure_stage
+                is AntigravityFailureStage.PREFLIGHT
+                or preflight_result.failure_kind is LiveFailureKind.NONE
+            )
+        ):
+            execution_stage = AntigravityExecutionStage.PREFLIGHT_COMPLETED
+
     p = parser or StrictAntigravityStreamParser()
     term = termination or AntigravityTerminationEvidence(
         reason=TerminationReason.NONE,
@@ -921,10 +1188,12 @@ def build_antigravity_evidence(
     sorted_step_counts = {s: p.step_counts[s] for s in AntigravityStepType}
 
     return AntigravityExecutionEvidence(
+        schema_version=schema_version,
         cli_version=cli_version,
         profile=profile,
         preflight_checked_at=preflight_checked_at,
         preflight_verified_flags=preflight_verified_flags or [],
+        preflight_commands=preflight_commands,
         requested_model=requested_model,
         requested_reasoning_effort=requested_reasoning_effort,
         requested_output_format="stream-json",

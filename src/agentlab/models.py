@@ -262,6 +262,11 @@ class AntigravityFailureStage(StrEnum):
     EVIDENCE_CONSTRUCTION = "evidence_construction"
 
 
+class AntigravityPreflightOperation(StrEnum):
+    VERSION = "version"
+    HELP = "help"
+
+
 class AntigravityCleanupErrorCode(StrEnum):
     CLEANUP_TIMEOUT = "cleanup_timeout"
     CLEANUP_PROCESS_ERROR = "cleanup_process_error"
@@ -474,6 +479,93 @@ class LiveFailureKind(StrEnum):
     GATE_HARNESS_ERROR = "gate_harness_error"
     EVIDENCE_ERROR = "evidence_error"
     UNSUPPORTED_PLATFORM = "unsupported_platform"
+
+
+class AntigravityPreflightCommandEvidence(ContractModel):
+    """Redacted result of one bounded Antigravity version/help subprocess."""
+
+    operation: AntigravityPreflightOperation
+    returncode: StrictInt | None = Field(default=None, ge=-255, le=255)
+    stdout_bytes: StrictInt = Field(ge=0, le=64 * 1024)
+    stderr_bytes: StrictInt = Field(ge=0, le=64 * 1024)
+    stdout_truncated: StrictBool
+    stderr_truncated: StrictBool
+    failure_stage: AntigravityFailureStage | None
+    failure_kind: LiveFailureKind
+    termination: AntigravityTerminationEvidence
+
+    @model_validator(mode="after")
+    def preflight_streams_and_failure_must_be_consistent(
+        self,
+    ) -> AntigravityPreflightCommandEvidence:
+        if self.stdout_truncated and self.stdout_bytes == 0:
+            raise ValueError(
+                "preflight stdout_truncated requires stdout_bytes > 0"
+            )
+        if self.stderr_truncated and self.stderr_bytes == 0:
+            raise ValueError(
+                "preflight stderr_truncated requires stderr_bytes > 0"
+            )
+
+        if self.failure_kind is LiveFailureKind.NONE:
+            if self.failure_stage is not None:
+                raise ValueError(
+                    "successful preflight command requires failure_stage None"
+                )
+            if self.returncode != 0:
+                raise ValueError(
+                    "successful preflight command requires returncode 0"
+                )
+            if self.stdout_truncated or self.stderr_truncated:
+                raise ValueError(
+                    "successful preflight command forbids truncated streams"
+                )
+        elif self.failure_stage is None:
+            raise ValueError(
+                "failed preflight command requires a failure_stage"
+            )
+
+        if (
+            self.failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
+            and not self.stdout_truncated
+            and not self.stderr_truncated
+        ):
+            raise ValueError(
+                "preflight provider_output_limit requires a truncated stream"
+            )
+
+        if (
+            self.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+            and self.termination.process_group_cleared
+        ):
+            raise ValueError(
+                "preflight process_cleanup_error requires uncleared or "
+                "unverifiable process group"
+            )
+        if (
+            not self.termination.process_group_cleared
+            and self.failure_kind is not LiveFailureKind.PROCESS_CLEANUP_ERROR
+        ):
+            raise ValueError(
+                "uncleared preflight process group requires "
+                "process_cleanup_error"
+            )
+
+        if self.termination.reason is TerminationReason.TIMEOUT:
+            if self.failure_kind not in {
+                LiveFailureKind.PROVIDER_TIMEOUT,
+                LiveFailureKind.PROCESS_CLEANUP_ERROR,
+            }:
+                raise ValueError(
+                    "preflight timeout requires provider_timeout or "
+                    "process_cleanup_error"
+                )
+        elif self.failure_kind is LiveFailureKind.PROVIDER_TIMEOUT:
+            raise ValueError(
+                "preflight provider_timeout requires timeout termination"
+            )
+
+        return self
 
 
 class QualityGate(ContractModel):
@@ -1744,13 +1836,18 @@ class CodexExecutionEvidence(ContractModel):
 class AntigravityExecutionEvidence(ContractModel):
     """Redacted summary of one Antigravity CLI execution; raw stream is never persisted."""
 
-    schema_version: Literal["1.0"] = "1.0"
+    schema_version: Literal["1.0", "1.1"] = "1.0"
     provider: Literal[Provider.ANTIGRAVITY] = Provider.ANTIGRAVITY
     cli_version: StrictStr | None = None
     profile: AntigravityCliProfile = AntigravityCliProfile.NOT_SELECTED
     preflight_checked_at: datetime | None = None
     preflight_verified_flags: list[AntigravityHelpMarker] = Field(
         default_factory=list
+    )
+    preflight_commands: list[AntigravityPreflightCommandEvidence] | None = Field(
+        default=None,
+        max_length=2,
+        exclude_if=lambda value: value is None,
     )
     requested_model: StrictStr | None = None
     requested_reasoning_effort: AntigravityReasoningEffort | None = None
@@ -1826,6 +1923,37 @@ class AntigravityExecutionEvidence(ContractModel):
 
     @model_validator(mode="after")
     def validate_antigravity_evidence(self) -> AntigravityExecutionEvidence:
+        if (
+            self.schema_version == "1.0"
+            and self.preflight_commands is not None
+        ):
+            raise ValueError(
+                "Antigravity Evidence 1.0 forbids preflight_commands"
+            )
+        if self.schema_version == "1.1":
+            if self.preflight_commands is None:
+                raise ValueError(
+                    "Antigravity Evidence 1.1 requires preflight_commands"
+                )
+            operations = [
+                command.operation for command in self.preflight_commands
+            ]
+            if operations not in (
+                [AntigravityPreflightOperation.VERSION],
+                [
+                    AntigravityPreflightOperation.VERSION,
+                    AntigravityPreflightOperation.HELP,
+                ],
+            ):
+                raise ValueError(
+                    "preflight_commands must contain version followed "
+                    "optionally by help"
+                )
+            if self.preflight_checked_at is None:
+                raise ValueError(
+                    "Antigravity Evidence 1.1 requires preflight_checked_at"
+                )
+
         if (
             self.cli_version is not None
             and not re.fullmatch(r"^agy \d+\.\d+\.\d+$", self.cli_version)
@@ -2034,24 +2162,58 @@ class AntigravityExecutionEvidence(ContractModel):
             if self.terminal_num_turns is None or self.terminal_num_turns < 1:
                 raise ValueError("SUCCEEDED status requires terminal_num_turns >= 1")
 
-        # 6. cleanup_state == FAILED <=> failure_kind == PROCESS_CLEANUP_ERROR
+        preflight_cleanup_failed = any(
+            command.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+            for command in (self.preflight_commands or [])
+        )
+        preflight_timed_out = any(
+            command.termination.reason is TerminationReason.TIMEOUT
+            for command in (self.preflight_commands or [])
+        )
+
+        # 6. A Provider cleanup failure uses cleanup_state FAILED. A preflight
+        #    cleanup failure remains nested because Provider invocation was not
+        #    attempted.
         if self.cleanup_state is CodexCleanupState.FAILED:
             if self.failure_kind is not LiveFailureKind.PROCESS_CLEANUP_ERROR:
                 raise ValueError("FAILED cleanup_state requires PROCESS_CLEANUP_ERROR failure_kind")
-        elif self.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR:
-            raise ValueError("PROCESS_CLEANUP_ERROR failure_kind requires FAILED cleanup_state")
+        elif (
+            self.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+            and not preflight_cleanup_failed
+        ):
+            raise ValueError(
+                "PROCESS_CLEANUP_ERROR failure_kind requires FAILED "
+                "cleanup_state or failed preflight cleanup"
+            )
 
-        # 7. termination.reason == TIMEOUT <=> failure_kind == PROVIDER_TIMEOUT
+        # 7. A cleanup failure has priority over a simultaneous timeout.
         if self.termination.reason is TerminationReason.TIMEOUT:
-            if self.failure_kind is not LiveFailureKind.PROVIDER_TIMEOUT:
+            if self.failure_kind not in {
+                LiveFailureKind.PROVIDER_TIMEOUT,
+                LiveFailureKind.PROCESS_CLEANUP_ERROR,
+            }:
                 raise ValueError(
-                    "TIMEOUT termination reason requires PROVIDER_TIMEOUT failure_kind"
+                    "TIMEOUT termination reason requires PROVIDER_TIMEOUT "
+                    "or PROCESS_CLEANUP_ERROR failure_kind"
                 )
-        elif self.failure_kind is LiveFailureKind.PROVIDER_TIMEOUT:
-            raise ValueError("PROVIDER_TIMEOUT failure_kind requires TIMEOUT termination reason")
+        elif (
+            self.failure_kind is LiveFailureKind.PROVIDER_TIMEOUT
+            and not preflight_timed_out
+        ):
+            raise ValueError(
+                "PROVIDER_TIMEOUT failure_kind requires timeout termination"
+            )
 
         # 8. failure_kind == PROVIDER_OUTPUT_LIMIT => at least one truncated stream
         #    and at least one observed byte.
+        if self.stdout_truncated and self.stdout_bytes == 0:
+            raise ValueError(
+                "stdout_truncated requires stdout_bytes > 0"
+            )
+        if self.stderr_truncated and self.stderr_bytes == 0:
+            raise ValueError(
+                "stderr_truncated requires stderr_bytes > 0"
+            )
         if self.failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT:
             if not self.stdout_truncated and not self.stderr_truncated:
                 raise ValueError(

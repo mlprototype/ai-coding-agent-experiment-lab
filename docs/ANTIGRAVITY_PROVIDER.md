@@ -165,7 +165,7 @@ Suggested modules:
   - normalization helpers;
   - no production Live process runner in slice 5A.
 - `src/agentlab/models.py`
-  - Antigravity enums and Evidence 1.0;
+  - Antigravity enums and backward-compatible Evidence 1.0/1.1;
   - shared `UsageMetrics` mapping only where semantics match;
   - no change to existing Codex schema versions.
 - `tests/test_antigravity_provider.py`
@@ -316,7 +316,7 @@ Reject booleans, strings, negative values, overflow, and inconsistent totals.
 If the terminal usage object is missing, persist `not_available` with null
 values. Never convert missing usage to zero.
 
-## Antigravity Evidence 1.0
+## Antigravity Evidence 1.0 and 1.1
 
 Define a dedicated strict model with `extra="forbid"`. At minimum it records:
 
@@ -338,6 +338,13 @@ Define a dedicated strict model with `extra="forbid"`. At minimum it records:
 - timeout/signal/process-group termination result;
 - fixed failure kind and failure stage.
 
+Evidence 1.0 remains loadable and forbids the fields introduced later.
+Evidence 1.1 is emitted only when a structured preflight result is supplied. It
+adds an ordered, redacted `preflight_commands` list containing `version` and,
+when attempted, `help`. Each entry records return code, stream-specific byte
+counts and truncation flags, failure stage/kind, and process-group termination
+evidence. It never records the raw version/help output.
+
 Evidence must distinguish requested, observed, and unavailable values. It must
 not state that sandbox, authentication, Prompt delivery, model API receipt,
 quota consumption, tool execution, or network blocking succeeded unless a
@@ -349,15 +356,21 @@ byte- and schema-compatible.
 
 ### Slice 5A correction closure
 
-The 2026-07-29 correction closes two review findings without changing the
-Antigravity Evidence 1.0 schema:
+The 2026-07-29 correction preserves the load contract for Antigravity Evidence
+1.0 and adds Evidence 1.1 for structured preflight observations:
 
 - a trailing NDJSON line without a final newline is cleared from the parser
   buffer immediately after normalization, and failure paths clear any
   unprocessed buffered bytes;
 - `provider_output_limit` can represent either stdout or stderr truncation,
   including bounded preflight stderr, while requiring at least one truncated
-  stream and at least one observed byte.
+  stream and bytes on that same stream;
+- `PermissionError` during process-group liveness checks is treated as alive,
+  an unknown `OSError` remains a cleanup observation failure, and neither can
+  be reset to cleanup success by a later check;
+- cleanup failure remains higher priority than timeout, output limit, and
+  collection failure while the simultaneous observations remain nested in
+  `preflight_commands`.
 
 The production Antigravity CLI version allowlist remains empty. All selectable
 profile and stream acceptance tests use an injected version allowlist and
@@ -406,13 +419,19 @@ The Antigravity implementation must add tests for at least:
 - no external AI, network, auth, model catalog, Gate, or real `agy -p`;
 - all existing Replay/Codex/Workflow tests remain unchanged and pass.
 
-The 2026-07-29 Slice 5A acceptance suite covers every class above with synthetic
-bytes or a short-lived local fake executable. Parameterized malformed-usage
-cases independently cover negative, boolean, string, non-finite, overflow,
-missing dependency, and inconsistent-total values. Tests also reproduce the
-trailing-line raw-buffer and preflight-stderr output-limit corrections. Test
-counts are reported from `pytest --collect-only` and the full suite rather than
-being fixed as part of the contract.
+The 2026-07-29 Slice 5A acceptance suite exercises the listed contract with
+synthetic bytes or a short-lived local fake executable. Its explicit boundary
+cases include actual 65,536/65,537-byte Parser and preflight streams,
+`os.set_blocking`, `select`, and pipe-read collection failures, direct-child and
+grandchild extinction, PermissionError and unknown-OSError cleanup
+observations, terminal numeric bounds, every terminal-status-to-failure-kind
+mapping, malformed usage classes, trailing-line raw-buffer removal, and
+preflight-stderr propagation into Evidence 1.1.
+
+This is a scoped acceptance statement, not a claim that every possible OS,
+pipe, scheduler, or future CLI behavior is exhaustively covered. Test counts are
+reported from `pytest --collect-only` and the full suite rather than fixed as
+part of the contract.
 
 Required validation:
 

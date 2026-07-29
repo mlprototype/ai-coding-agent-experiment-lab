@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -13,7 +14,9 @@ import pytest
 
 from agentlab.antigravity_provider import (
     AntigravityEvidenceDiagnostic,
+    AntigravityPreflightProcessResult,
     StrictAntigravityStreamParser,
+    _is_process_group_alive,
     _run_preflight_subprocess,
     build_antigravity_evidence,
     probe_antigravity_preflight,
@@ -29,6 +32,7 @@ from agentlab.models import (
     AntigravityFailureStage,
     AntigravityHelpMarker,
     AntigravityPermissionMode,
+    AntigravityPreflightOperation,
     AntigravityStepType,
     AntigravityTerminalStatus,
     AntigravityTerminationEvidence,
@@ -212,7 +216,7 @@ def test_preflight_nonzero_and_unregistered_versions_fail_closed(
     )
     assert profile_nonzero is AntigravityCliProfile.NOT_SELECTED
     assert version_nonzero is None
-    assert stage is AntigravityFailureStage.PREFLIGHT
+    assert stage is AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
     assert kind is LiveFailureKind.PROVIDER_UNAVAILABLE
 
     fake_agy.write_text(
@@ -233,17 +237,213 @@ def test_preflight_nonzero_and_unregistered_versions_fail_closed(
     assert kind is LiveFailureKind.PROVIDER_UNAVAILABLE
 
 
-def test_parser_output_limit_64kb_and_64kb_plus_1byte() -> None:
-    # 1. 65,536 bytes exactly passes
-    parser_ok = StrictAntigravityStreamParser(max_output_bytes=65536)
-    padding_ok = "X" * 60000
-    line_ok = f'{{"event": "init", "pad": "{padding_ok}"}}\n'.encode()
-    parser_ok.parse_chunk(line_ok)
-    assert not parser_ok.output_limit_exceeded
+def test_process_group_liveness_distinguishes_permission_and_unknown_errors() -> None:
+    with patch("os.killpg", side_effect=PermissionError("denied")):
+        assert _is_process_group_alive(12345) is True
 
-    # 2. Exceeding limit triggers output_limit_exceeded and protocol_error
-    parser_overflow = StrictAntigravityStreamParser(max_output_bytes=100)
-    parser_overflow.parse_chunk(b'{"event": "init", "pad": "' + b"X" * 150 + b'"}\n')
+    with (
+        patch("os.killpg", side_effect=OSError("unknown liveness error")),
+        pytest.raises(OSError, match="unknown liveness error"),
+    ):
+        _is_process_group_alive(12345)
+
+
+@pytest.mark.parametrize(
+    "liveness_error",
+    [
+        PermissionError("permission denied"),
+        OSError("unknown process-group state"),
+    ],
+)
+def test_preflight_liveness_errors_become_cleanup_error(
+    liveness_error: OSError,
+    tmp_path: Path,
+) -> None:
+    fake_agy = tmp_path / "agy"
+    fake_agy.write_text("#!/bin/sh\nexit 0\n")
+    fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
+
+    with patch(
+        "agentlab.antigravity_provider._is_process_group_alive",
+        side_effect=liveness_error,
+    ):
+        preflight = probe_antigravity_preflight(
+            executable_path=str(fake_agy),
+            timeout_seconds=0.5,
+        )
+
+    result = preflight.version_probe
+    assert isinstance(result, AntigravityPreflightProcessResult)
+    assert result.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+    assert (
+        result.failure_stage
+        is AntigravityFailureStage.PREFLIGHT_PROCESS_CLEANUP
+    )
+    assert result.termination.process_group_cleared is False
+    assert (
+        result.termination.error_code
+        is AntigravityCleanupErrorCode.CLEANUP_PROCESS_ERROR
+    )
+
+    evidence = build_antigravity_evidence(
+        preflight_result=preflight
+    )
+    assert evidence.schema_version == "1.1"
+    assert evidence.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+    assert evidence.cleanup_state is CodexCleanupState.NOT_APPLICABLE
+    assert (
+        evidence.preflight_commands[0].failure_kind
+        is LiveFailureKind.PROCESS_CLEANUP_ERROR
+    )
+
+
+def test_preflight_stderr_limit_flows_into_evidence_v11(
+    tmp_path: Path,
+) -> None:
+    fake_agy = tmp_path / "agy"
+    markers = (
+        "--prompt --output-format stream-json --model --effort "
+        "--print-timeout --sandbox"
+    )
+    padding = " " * (65537 - len(markers) - 1)
+    fake_agy.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then echo "agy 1.2.3"; exit 0; fi\n'
+        f'if [ "$1" = "--help" ]; then printf "%s%s\\n" "{markers}"'
+        f' "{padding}" >&2; exit 0; fi\n'
+        "exit 2\n"
+    )
+    fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
+
+    preflight = probe_antigravity_preflight(
+        executable_path=str(fake_agy),
+        allowlist=frozenset({"agy 1.2.3"}),
+    )
+    assert preflight.failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
+    assert preflight.stdout_truncated is False
+    assert preflight.stderr_truncated is True
+    assert preflight.help_probe is not None
+    assert preflight.help_probe.stderr_bytes == 65536
+    assert preflight.help_probe.stderr_truncated is True
+
+    evidence = build_antigravity_evidence(preflight_result=preflight)
+    assert evidence.schema_version == "1.1"
+    assert evidence.failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
+    assert evidence.stdout_truncated is False
+    assert evidence.stderr_truncated is True
+    assert evidence.stderr_bytes == 65536
+    assert [
+        command.operation for command in evidence.preflight_commands
+    ] == [
+        AntigravityPreflightOperation.VERSION,
+        AntigravityPreflightOperation.HELP,
+    ]
+    assert evidence.preflight_commands[1].stderr_truncated is True
+    assert (
+        AntigravityExecutionEvidence.model_validate_json(
+            evidence.model_dump_json()
+        )
+        == evidence
+    )
+
+
+@pytest.mark.parametrize(
+    "patch_target",
+    [
+        "agentlab.antigravity_provider.os.set_blocking",
+    ],
+)
+def test_preflight_set_blocking_failure_is_collection_error(
+    patch_target: str,
+) -> None:
+    with patch(patch_target, side_effect=OSError("set_blocking failed")):
+        result = _run_preflight_subprocess(
+            "/bin/sh",
+            ["-c", "exit 0"],
+            timeout_seconds=0.5,
+            clean_env={},
+        )
+
+    assert result.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+    assert (
+        result.failure_stage
+        is AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
+    )
+    assert result.termination.process_group_cleared is True
+
+
+def test_preflight_pipe_read_failure_is_collection_error() -> None:
+    real_popen = subprocess.Popen
+
+    class FailingReadPipe:
+        def __init__(self, pipe: object) -> None:
+            self._pipe = pipe
+
+        @property
+        def closed(self) -> bool:
+            return bool(self._pipe.closed)  # type: ignore[attr-defined]
+
+        def fileno(self) -> int:
+            return int(self._pipe.fileno())  # type: ignore[attr-defined]
+
+        def read(self, _size: int) -> bytes:
+            raise OSError("pipe read failed")
+
+        def close(self) -> None:
+            self._pipe.close()  # type: ignore[attr-defined]
+
+    def _spawn_with_failing_stdout(
+        *args: object,
+        **kwargs: object,
+    ) -> subprocess.Popen[bytes]:
+        proc = real_popen(*args, **kwargs)
+        assert proc.stdout is not None
+        proc.stdout = FailingReadPipe(proc.stdout)  # type: ignore[assignment]
+        return proc
+
+    with patch(
+        "agentlab.antigravity_provider.subprocess.Popen",
+        side_effect=_spawn_with_failing_stdout,
+    ):
+        result = _run_preflight_subprocess(
+            "/bin/sh",
+            ["-c", "echo output; sleep 100"],
+            timeout_seconds=0.5,
+            clean_env={},
+        )
+
+    assert result.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+    assert (
+        result.failure_stage
+        is AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
+    )
+    assert result.termination.process_group_cleared is True
+
+
+def test_parser_output_limit_64kb_and_64kb_plus_1byte() -> None:
+    init_prefix = b'{"event": "init", "pad": "'
+    init_suffix_and_result = (
+        b'"}\n'
+        b'{"event": "result", "status": "SUCCESS", "num_turns": 1}\n'
+    )
+    padding = b"X" * (
+        65536 - len(init_prefix) - len(init_suffix_and_result)
+    )
+    exact_stream = init_prefix + padding + init_suffix_and_result
+    assert len(exact_stream) == 65536
+
+    # 1. An actual 65,536-byte complete stream passes.
+    parser_ok = StrictAntigravityStreamParser(max_output_bytes=65536)
+    parser_ok.parse_chunk(exact_stream)
+    parser_ok.finalize()
+    assert not parser_ok.output_limit_exceeded
+    assert parser_ok.protocol_error is None
+
+    # 2. An actual 65,537-byte input fails at the exact +1 boundary.
+    parser_overflow = StrictAntigravityStreamParser(
+        max_output_bytes=65536
+    )
+    parser_overflow.parse_chunk(exact_stream + b"X")
     assert parser_overflow.output_limit_exceeded
     assert parser_overflow.protocol_error is not None
 
@@ -258,7 +458,7 @@ def test_parser_output_limit_64kb_and_64kb_plus_1byte() -> None:
         invocation_state=CodexInvocationState.PROCESS_STARTED,
         cleanup_state=CodexCleanupState.CLEARED,
         parser=parser_overflow,
-        stdout_bytes=150,
+        stdout_bytes=65536,
         exit_code=0,
     )
     assert evidence.failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
@@ -401,6 +601,86 @@ def test_parser_all_terminal_statuses_including_invalid_waiting_running() -> Non
     parser_unknown.finalize()
     assert parser_unknown.protocol_error is not None
     assert parser_unknown.normalized_terminal_status is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("num_turns", True),
+        ("num_turns", -1),
+        ("num_turns", 10001),
+        ("duration_ms", True),
+        ("duration_ms", -1),
+        ("duration_ms", 86400001),
+    ],
+)
+def test_parser_rejects_terminal_numeric_bool_negative_and_overflow(
+    field: str,
+    value: object,
+) -> None:
+    parser = StrictAntigravityStreamParser()
+    result = {
+        "event": "result",
+        "status": "SUCCESS",
+        field: value,
+    }
+    parser.parse_chunk(
+        b'{"event": "init"}\n'
+        + json.dumps(result, separators=(",", ":")).encode()
+        + b"\n"
+    )
+    parser.finalize()
+
+    assert parser.protocol_error is not None
+    assert parser.buffer == bytearray()
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_failure"),
+    [
+        ("SUCCESS", LiveFailureKind.NONE),
+        ("ERROR", LiveFailureKind.PROVIDER_TURN_FAILED),
+        ("CANCELED", LiveFailureKind.PROVIDER_TURN_FAILED),
+        ("INTERRUPTED", LiveFailureKind.PROVIDER_TURN_FAILED),
+        ("INVALID", LiveFailureKind.PROVIDER_PROTOCOL_ERROR),
+        ("WAITING", LiveFailureKind.PROVIDER_PROTOCOL_ERROR),
+        ("RUNNING", LiveFailureKind.PROVIDER_PROTOCOL_ERROR),
+    ],
+)
+def test_all_terminal_statuses_map_to_final_failure_kind(
+    status: str,
+    expected_failure: LiveFailureKind,
+) -> None:
+    parser = StrictAntigravityStreamParser()
+    parser.parse_chunk(
+        (
+            '{"event": "init"}\n'
+            f'{{"event": "result", "status": "{status}", '
+            '"num_turns": 1}\n'
+        ).encode()
+    )
+    parser.finalize()
+
+    evidence = build_antigravity_evidence(
+        cli_version="agy 1.2.3",
+        profile=AntigravityCliProfile.HEADLESS_STREAM_JSON_V1,
+        preflight_checked_at=pytest.importorskip("datetime").datetime.now(
+            pytest.importorskip("datetime").UTC
+        ),
+        preflight_verified_flags=list(AntigravityHelpMarker),
+        execution_stage=AntigravityExecutionStage.PROVIDER_INVOCATION_ATTEMPTED,
+        invocation_state=CodexInvocationState.PROCESS_STARTED,
+        cleanup_state=CodexCleanupState.CLEARED,
+        parser=parser,
+        exit_code=0,
+    )
+
+    assert evidence.failure_kind is expected_failure
+    assert evidence.provider_status is (
+        ProviderExecutionStatus.SUCCEEDED
+        if expected_failure is LiveFailureKind.NONE
+        else ProviderExecutionStatus.FAILED
+    )
 
 
 def test_parser_stream_event_order_abnormalities() -> None:
@@ -681,11 +961,14 @@ def test_preflight_collection_exceptions_and_process_group_extinction(
 ) -> None:
     fake_agy = tmp_path / "agy"
     pid_file = tmp_path / "child.pid"
+    grandchild_pid_file = tmp_path / "grandchild.pid"
     script = (
         "#!/bin/sh\n"
         f"echo $$ > {pid_file}\n"
+        "sleep 100 &\n"
+        f"echo $! > {grandchild_pid_file}\n"
         "trap 'exit 0' TERM\n"
-        "sleep 100\n"
+        "wait\n"
     )
     fake_agy.write_text(script)
     fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
@@ -696,9 +979,11 @@ def test_preflight_collection_exceptions_and_process_group_extinction(
         xlist: list[object],
         timeout: float = 0,
     ) -> tuple[list[object], list[object], list[object]]:
-        # Wait until child process has written child.pid
+        # Wait until both the shell and its spawned grandchild are observable.
         deadline = time.monotonic() + 1.0
-        while not pid_file.exists() and time.monotonic() < deadline:
+        while (
+            not pid_file.exists() or not grandchild_pid_file.exists()
+        ) and time.monotonic() < deadline:
             time.sleep(0.005)
         raise OSError("select collection failure")
 
@@ -712,6 +997,10 @@ def test_preflight_collection_exceptions_and_process_group_extinction(
     child_pid = int(pid_file.read_text().strip())
     with pytest.raises(ProcessLookupError):
         os.kill(child_pid, 0)
+
+    grandchild_pid = int(grandchild_pid_file.read_text().strip())
+    with pytest.raises(ProcessLookupError):
+        os.kill(grandchild_pid, 0)
 
 
 def test_preflight_timeout_normal_recovery_vs_cleanup_failure(
@@ -820,13 +1109,13 @@ def test_evidence_validator_bidirectional_state_transitions_all_cases() -> None:
     # 2. Reject PROVIDER_OUTPUT_LIMIT if stdout_bytes == 0 and stderr_bytes == 0
     with pytest.raises(
         ValueError,
-        match=r"PROVIDER_OUTPUT_LIMIT forbids stdout_bytes == 0 and stderr_bytes == 0",
+        match=r"stdout_truncated requires stdout_bytes > 0",
     ):
         dict_data = base.model_dump()
         dict_data["failure_kind"] = LiveFailureKind.PROVIDER_OUTPUT_LIMIT
         dict_data["stdout_truncated"] = True
         dict_data["stdout_bytes"] = 0
-        dict_data["stderr_bytes"] = 0
+        dict_data["stderr_bytes"] = 1
         AntigravityExecutionEvidence.model_validate(dict_data)
 
     with pytest.raises(
@@ -870,6 +1159,8 @@ def test_evidence_strict_roundtrip_and_forbid_extra() -> None:
     )
 
     json_data = evidence.model_dump_json()
+    assert evidence.schema_version == "1.0"
+    assert '"preflight_commands"' not in json_data
     reloaded = AntigravityExecutionEvidence.model_validate_json(json_data)
     assert reloaded == evidence
 

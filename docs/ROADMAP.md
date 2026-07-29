@@ -138,8 +138,8 @@ fake `agy`受入を是正・補完した。Slice 5BはHeadless Runner readiness�
 Live、Provider比較も承認していない。公式headless interfaceではPromptがargvへ載るため、
 Prompt transportの安全方針を別の人間判断で解決するまでRunnerとLiveはfail closedとする。
 
-**実装済み成果物:** Antigravity Evidence 1.0、version/help preflight、profile選択境界、
-event/usage正規化、raw非永続化、process-group回収、合成fake `agy`受入。
+**実装済み成果物:** Antigravity Evidence 1.0/1.1、構造化version/help preflight、
+profile選択境界、event/usage正規化、raw非永続化、process-group回収、合成fake `agy`受入。
 
 **未実装成果物:** Antigravity Headless Runner、Live Recording/Artifact、品質Gateとの
 vertical slice、Provider比較Spec・scheduler・report。
