@@ -15,6 +15,7 @@ import pytest
 from agentlab.antigravity_provider import (
     AntigravityEvidenceDiagnostic,
     AntigravityPreflightProcessResult,
+    AntigravityPreflightResult,
     StrictAntigravityStreamParser,
     _is_process_group_alive,
     _run_preflight_subprocess,
@@ -43,6 +44,43 @@ from agentlab.models import (
     TerminationReason,
     UsageMetricSource,
 )
+
+
+def _build_successful_v11_evidence(
+    tmp_path: Path,
+) -> AntigravityExecutionEvidence:
+    fake_agy = tmp_path / "agy"
+    fake_agy.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then echo "agy 1.2.3"; exit 0; fi\n'
+        'if [ "$1" = "--help" ]; then echo "--prompt --output-format '
+        'stream-json --model --effort --print-timeout --sandbox"; exit 0; fi\n'
+        "exit 2\n"
+    )
+    fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
+    preflight = probe_antigravity_preflight(
+        executable_path=str(fake_agy),
+        allowlist=frozenset({"agy 1.2.3"}),
+    )
+    assert isinstance(preflight, AntigravityPreflightResult)
+
+    parser = StrictAntigravityStreamParser()
+    parser.parse_chunk(
+        b'{"event": "init"}\n'
+        b'{"event": "result", "status": "SUCCESS", "num_turns": 1}\n'
+    )
+    parser.finalize()
+
+    return build_antigravity_evidence(
+        preflight_result=preflight,
+        execution_stage=(
+            AntigravityExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+        ),
+        invocation_state=CodexInvocationState.PROCESS_STARTED,
+        cleanup_state=CodexCleanupState.CLEARED,
+        parser=parser,
+        exit_code=0,
+    )
 
 
 def test_select_antigravity_profile_default_empty_allowlist() -> None:
@@ -1141,6 +1179,97 @@ def test_evidence_validator_bidirectional_state_transitions_all_cases() -> None:
             AntigravityExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
         )
         AntigravityExecutionEvidence.model_validate(dict_data)
+
+
+def test_evidence_v11_rejects_failed_version_with_provider_success(
+    tmp_path: Path,
+) -> None:
+    evidence = _build_successful_v11_evidence(tmp_path)
+    payload = json.loads(evidence.model_dump_json())
+    version_command = payload["preflight_commands"][0]
+    version_command["returncode"] = 1
+    version_command["failure_kind"] = LiveFailureKind.PROVIDER_UNAVAILABLE
+    version_command["failure_stage"] = (
+        AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"requires both preflight commands to succeed",
+    ):
+        AntigravityExecutionEvidence.model_validate_json(json.dumps(payload))
+
+
+def test_evidence_v11_rejects_missing_help_with_provider_success(
+    tmp_path: Path,
+) -> None:
+    evidence = _build_successful_v11_evidence(tmp_path)
+    payload = json.loads(evidence.model_dump_json())
+    payload["preflight_commands"] = payload["preflight_commands"][:1]
+
+    with pytest.raises(
+        ValueError,
+        match=r"requires successful version and help preflight commands",
+    ):
+        AntigravityExecutionEvidence.model_validate_json(json.dumps(payload))
+
+
+def test_evidence_v11_load_enforces_nested_preflight_failure_priority(
+    tmp_path: Path,
+) -> None:
+    evidence = _build_successful_v11_evidence(tmp_path)
+    payload = json.loads(evidence.model_dump_json())
+    payload.update(
+        {
+            "profile": AntigravityCliProfile.NOT_SELECTED,
+            "preflight_verified_flags": [],
+            "execution_stage": (
+                AntigravityExecutionStage.PREFLIGHT_NOT_COMPLETED
+            ),
+            "invocation_state": CodexInvocationState.NOT_ATTEMPTED,
+            "cleanup_state": CodexCleanupState.NOT_APPLICABLE,
+            "provider_status": ProviderExecutionStatus.FAILED,
+            "failure_kind": LiveFailureKind.PROCESS_CLEANUP_ERROR,
+            "failure_stage": (
+                AntigravityFailureStage.PREFLIGHT_PROCESS_CLEANUP
+            ),
+        }
+    )
+
+    version_command = payload["preflight_commands"][0]
+    version_command["failure_kind"] = LiveFailureKind.EVIDENCE_ERROR
+    version_command["failure_stage"] = (
+        AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
+    )
+
+    help_command = payload["preflight_commands"][1]
+    help_command["failure_kind"] = LiveFailureKind.PROCESS_CLEANUP_ERROR
+    help_command["failure_stage"] = (
+        AntigravityFailureStage.PREFLIGHT_PROCESS_CLEANUP
+    )
+    help_command["stdout_truncated"] = True
+    help_command["termination"] = {
+        "reason": TerminationReason.TIMEOUT,
+        "sigterm_sent": True,
+        "sigkill_sent": True,
+        "process_group_cleared": False,
+        "error_code": AntigravityCleanupErrorCode.CLEANUP_TIMEOUT,
+    }
+
+    loaded = AntigravityExecutionEvidence.model_validate_json(
+        json.dumps(payload)
+    )
+    assert loaded.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+
+    payload["failure_kind"] = LiveFailureKind.EVIDENCE_ERROR
+    payload["failure_stage"] = (
+        AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"must match the highest-priority failed preflight command",
+    ):
+        AntigravityExecutionEvidence.model_validate_json(json.dumps(payload))
 
 
 def test_evidence_strict_roundtrip_and_forbid_extra() -> None:

@@ -1954,6 +1954,93 @@ class AntigravityExecutionEvidence(ContractModel):
                     "Antigravity Evidence 1.1 requires preflight_checked_at"
                 )
 
+            provider_invocation_recorded = (
+                self.execution_stage
+                is AntigravityExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+                or self.invocation_state
+                is not CodexInvocationState.NOT_ATTEMPTED
+            )
+            successful_preflight_required = (
+                self.profile is not AntigravityCliProfile.NOT_SELECTED
+                or provider_invocation_recorded
+                or self.provider_status is ProviderExecutionStatus.SUCCEEDED
+            )
+            expected_operations = [
+                AntigravityPreflightOperation.VERSION,
+                AntigravityPreflightOperation.HELP,
+            ]
+            if successful_preflight_required:
+                if operations != expected_operations:
+                    raise ValueError(
+                        "selected profile, Provider invocation, or Provider "
+                        "success requires successful version and help "
+                        "preflight commands"
+                    )
+                if any(
+                    command.returncode != 0
+                    or command.failure_kind is not LiveFailureKind.NONE
+                    or command.failure_stage is not None
+                    for command in self.preflight_commands
+                ):
+                    raise ValueError(
+                        "selected profile, Provider invocation, or Provider "
+                        "success requires both preflight commands to succeed"
+                    )
+
+            failed_preflight_commands = [
+                command
+                for command in self.preflight_commands
+                if command.failure_kind is not LiveFailureKind.NONE
+            ]
+            if failed_preflight_commands:
+                if self.profile is not AntigravityCliProfile.NOT_SELECTED:
+                    raise ValueError(
+                        "failed preflight command forbids a selected profile"
+                    )
+                if provider_invocation_recorded:
+                    raise ValueError(
+                        "failed preflight command forbids Provider invocation"
+                    )
+                if self.provider_status is ProviderExecutionStatus.SUCCEEDED:
+                    raise ValueError(
+                        "failed preflight command forbids Provider success"
+                    )
+
+                preflight_failure_priority = {
+                    LiveFailureKind.PROCESS_CLEANUP_ERROR: 0,
+                    LiveFailureKind.PROVIDER_TIMEOUT: 1,
+                    LiveFailureKind.PROVIDER_OUTPUT_LIMIT: 2,
+                    LiveFailureKind.EVIDENCE_ERROR: 3,
+                    LiveFailureKind.PROVIDER_UNAVAILABLE: 4,
+                }
+                unsupported_failure_kinds = {
+                    command.failure_kind
+                    for command in failed_preflight_commands
+                    if command.failure_kind not in preflight_failure_priority
+                }
+                if unsupported_failure_kinds:
+                    raise ValueError(
+                        "preflight command contains an unsupported "
+                        "failure_kind"
+                    )
+
+                highest_priority_failure = min(
+                    failed_preflight_commands,
+                    key=lambda command: preflight_failure_priority[
+                        command.failure_kind
+                    ],
+                )
+                if (
+                    self.failure_kind
+                    is not highest_priority_failure.failure_kind
+                    or self.failure_stage
+                    is not highest_priority_failure.failure_stage
+                ):
+                    raise ValueError(
+                        "top-level failure kind/stage must match the "
+                        "highest-priority failed preflight command"
+                    )
+
         if (
             self.cli_version is not None
             and not re.fullmatch(r"^agy \d+\.\d+\.\d+$", self.cli_version)

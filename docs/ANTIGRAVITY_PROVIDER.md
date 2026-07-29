@@ -355,6 +355,10 @@ Preflight観測用にEvidence 1.1を追加する。
   戻してはならない。
 - cleanup失敗はtimeout、output limit、collection失敗より高いpriorityを維持する。
   同時に観測した内容は`preflight_commands`内にnestedしたまま保持する。
+- Evidence 1.1のstrict loaderは、選択済みprofile、Provider invocation、Provider
+  successに正常な`version` → `help`の両commandを必須とする。nested commandが
+  失敗した場合はこれらの状態を禁止し、cleanupを最優先とするfailure kind/stageを
+  top-levelと一致させる。
 
 production用Antigravity CLI version allowlistは空のままとする。選択可能profileおよび
 streamの全acceptance testでは、注入したversion allowlistと合成local executableだけを
