@@ -72,14 +72,16 @@ Provider比較、Live Artifact作成は承認しない。
 
 ### Live用Prompt transportは未解決
 
-文書化されたAntigravityのHeadless interfaceは、`-p`/`--prompt`の値として
-Promptを受け取る。文書化されたstdinまたは`--prompt-file` transportは
-見つかっていない。そのため、生成したPromptを直接渡すとprocess argvへ露出する。
+現行のHeadless modeドキュメントには`-p`/`--prompt`によるflag transportが掲載されている。
+一方、公式Changelogにはstdinを消費するpiped Prompt経路への言及がある。
+ただし、具体的な実行構文・version対応・動作制約を確定できないため、
+non-argv transportは`not_verified`とする。そのため、生成したPromptを直接渡すと
+process argvへ露出する。
 
 現在のrepository契約は、Provider Promptの内容をargvへ含めないことを要求する。
 この要件を引き続き正とする。オフラインSliceで`AGENTS.md`を緩和したり、
-Live用の例外を導入したり、文書化されていない`@file`形式をPrompt-file APIと
-同等だと主張したりしてはならない。
+Live用の例外を導入したり、公式ドキュメントで具体的な実行契約が確定していないstdinや
+文書化されていない`@file`形式をPrompt-file APIと同等だと主張したりしてはならない。
 
 したがって、次を境界とする。
 
@@ -462,7 +464,8 @@ fail-closedのままとする。
 2. 上限付きで機密情報を含まない合成Promptについてrepositoryのsecurity契約を
    明示的に変更し、受け入れたargv露出を記録する。
 
-文書化されていない`@file`、stdin、environment variable、shell expansion、
+公式ドキュメントで具体的な実行契約が確定していないstdinや、
+文書化されていない`@file`、environment variable、shell expansion、
 temporary fileの規約を、production用Antigravity Prompt transportとして扱っては
 ならない。
 
