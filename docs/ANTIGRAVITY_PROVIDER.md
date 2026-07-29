@@ -448,7 +448,7 @@ model catalogまたはquotaへaccessする、外部networkを使用する、Live
 
 #### BlockerとなるPrompt transport判断
 
-2026-07-29に調査結果と判断を [Slice 5B Prompt Transport Decision Record](decisions/SLICE_5B_PROMPT_TRANSPORT_DECISION.md) として記録した。一次情報源から公式な non-argv transport を確認できないため判定は `not_verified` とし、Slice 5B は Blocked / Deferred （実装保留）とする。
+2026-07-29に調査結果と判断を [Slice 5B Prompt Transport Decision Record](decisions/SLICE_5B_PROMPT_TRANSPORT_DECISION.md) として記録した。公式 Changelog に stdin 経由の piped Prompt に関する記述は存在するものの、明確な実行構文や動作制約が公式ドキュメントで確定できないため判定は `not_verified` とし、Slice 5B は Blocked / Deferred （実装保留）とする。
 
 文書化されたCLI契約では、Prompt値を引き続きargvへ置く。AgentLabのrepository契約は
 Prompt内容のargv格納を引き続き禁止し、stdinだけでのPrompt deliveryを許可する。

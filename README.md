@@ -21,7 +21,7 @@ Phase 0〜4を完了しました。**Phase 5: Antigravity CLI Provider** はCurr
 実装範囲をversion付き契約、strict stream parser、read-only preflight、redaction済み
 Evidence、fake `agy`受入へ限定しました。2026-07-29にSlice 5Aの是正と受入テスト補完を
 行い、Slice 5BはHeadless Runner readinessとoffline統合の設計だけを更新しました。
-Promptの安全なnon-argv transportが確認できず判定を `not_verified` としたため、[Slice 5B Prompt Transport Decision Record](docs/decisions/SLICE_5B_PROMPT_TRANSPORT_DECISION.md) に基づき Slice 5B 実装は Blocked / Deferred（fail closed）です。
+公式 Changelog に stdin 経由の piped Prompt に関する記述は存在するものの、明確な実行構文や制約を確定できないため判定を `not_verified` とし、[Slice 5B Prompt Transport Decision Record](docs/decisions/SLICE_5B_PROMPT_TRANSPORT_DECISION.md) に基づき Slice 5B 実装は Blocked / Deferred（fail closed）です。
 実Antigravity Provider call、認証、model catalog、quota利用、Live、Provider比較は
 未着手です。
 offline実装とfake Codexによる受入を完了し、レビュー済みcommit
