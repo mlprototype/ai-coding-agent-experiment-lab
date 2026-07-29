@@ -123,12 +123,14 @@ class StrictAntigravityStreamParser:
 
     def parse_chunk(self, chunk: bytes) -> None:
         if self.protocol_error is not None or self.output_limit_exceeded:
+            self.buffer.clear()
             return
 
         self.total_bytes_read += len(chunk)
         if self.total_bytes_read > self.max_output_bytes:
             self.output_limit_exceeded = True
             self.protocol_error = "Total output exceeded maximum bytes limit"
+            self.buffer.clear()
             return
 
         self.buffer.extend(chunk)
@@ -146,11 +148,13 @@ class StrictAntigravityStreamParser:
 
             if not line_bytes:
                 self.protocol_error = "Empty line in NDJSON stream"
+                self.buffer.clear()
                 return
 
             if len(line_bytes) > self.max_line_bytes:
                 self.output_limit_exceeded = True
                 self.protocol_error = "Line byte count exceeded limit"
+                self.buffer.clear()
                 return
 
             try:
@@ -162,22 +166,30 @@ class StrictAntigravityStreamParser:
                 )
             except Exception as exc:
                 self.protocol_error = f"JSON parse error: {exc}"
+                self.buffer.clear()
                 return
 
             if not isinstance(obj, dict):
                 self.protocol_error = "Stream line is not a JSON object"
+                self.buffer.clear()
                 return
 
             self._process_event(obj)
             if self.protocol_error is not None or self.output_limit_exceeded:
+                self.buffer.clear()
                 return
+
+        if self.protocol_error is not None or self.output_limit_exceeded:
+            self.buffer.clear()
 
     def finalize(self) -> None:
         if self.protocol_error is not None or self.output_limit_exceeded:
+            self.buffer.clear()
             return
 
         if self.buffer:
             line_bytes = bytes(self.buffer).rstrip(b"\r")
+            self.buffer.clear()
             if line_bytes:
                 if len(line_bytes) > self.max_line_bytes:
                     self.output_limit_exceeded = True
@@ -198,11 +210,7 @@ class StrictAntigravityStreamParser:
                     self.protocol_error = f"Trailing JSON line error: {exc}"
                     return
 
-        if (
-            not self.result_received
-            and self.event_count > 0
-            and self.protocol_error is None
-        ):
+        if not self.result_received and self.protocol_error is None:
             self.protocol_error = "Stream ended without terminal result event"
 
     def _process_event(self, obj: dict[str, Any]) -> None:
@@ -839,6 +847,8 @@ def build_antigravity_evidence(
     exit_code: int | None = None,
     stdout_bytes: int = 0,
     stderr_bytes: int = 0,
+    stdout_truncated: bool = False,
+    stderr_truncated: bool = False,
     termination: AntigravityTerminationEvidence | None = None,
     initial_failure_kind: LiveFailureKind = LiveFailureKind.NONE,
 ) -> AntigravityExecutionEvidence:
@@ -864,7 +874,12 @@ def build_antigravity_evidence(
     elif term.reason is TerminationReason.TIMEOUT:
         final_failure_kind = LiveFailureKind.PROVIDER_TIMEOUT
         final_failure_stage = failure_stage or AntigravityFailureStage.STREAM_PARSING
-    elif p.output_limit_exceeded:
+    elif (
+        p.output_limit_exceeded
+        or stdout_truncated
+        or stderr_truncated
+        or initial_failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
+    ):
         final_failure_kind = LiveFailureKind.PROVIDER_OUTPUT_LIMIT
         final_failure_stage = failure_stage or AntigravityFailureStage.STREAM_PARSING
     elif (
@@ -939,8 +954,8 @@ def build_antigravity_evidence(
         usage_metrics=p.usage_metrics,
         stdout_bytes=stdout_bytes,
         stderr_bytes=stderr_bytes,
-        stdout_truncated=p.output_limit_exceeded,
-        stderr_truncated=False,
+        stdout_truncated=p.output_limit_exceeded or stdout_truncated,
+        stderr_truncated=stderr_truncated,
         termination=term,
         failure_kind=final_failure_kind,
     )
@@ -957,4 +972,3 @@ def safe_build_antigravity_evidence(
             error_code="EVIDENCE_CONSTRUCTION_FAILED",
             failure_kind=LiveFailureKind.EVIDENCE_ERROR,
         )
-

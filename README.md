@@ -19,8 +19,11 @@ Antigravity CLI / Replay Provider）は分離します。一度に変える独�
 Phase 0〜4を完了しました。**Phase 5: Antigravity CLI Provider** はCurrentです。
 2026-07-28に[offline設計](docs/ANTIGRAVITY_PROVIDER.md)を確定し、Antigravityへ渡す最初の
 実装範囲をversion付き契約、strict stream parser、read-only preflight、redaction済み
-Evidence、fake `agy`受入へ限定しました。実Antigravity Provider call、認証、model catalog、
-quota利用、Live、Provider比較は未着手です。
+Evidence、fake `agy`受入へ限定しました。2026-07-29にSlice 5Aの是正と受入テスト補完を
+行い、Slice 5BはHeadless Runner readinessとoffline統合の設計だけを更新しました。
+Promptの安全なnon-argv transportが未解決のためSlice 5B実装はfail closedです。
+実Antigravity Provider call、認証、model catalog、quota利用、Live、Provider比較は
+未着手です。
 offline実装とfake Codexによる受入を完了し、レビュー済みcommit
 `2abd653a7b42f8932c0005e6d7d3fdd1252845e0`に対する事前登録済みの実Codex Live A/B
 Campaignを2026-07-28に1回だけ実行しました。予定6 run／6 Provider callsに対し、最初の
@@ -48,7 +51,7 @@ ArtifactはGit管理外に保持し、Campaign 001の`harness_failure`履歴は�
 Campaign 002も再実行しません。Phase 3 manual Live累計8試行は変更せず、Phase 4 Campaignの
 call数と分離します。この1 Task、固定Prompt／Fixture／Gate、各3反復、当該環境・実行時期の
 結果から、一般的なモデル性能、統計的有意差、普遍的なWorkflow優位性は主張しません。
-Phase 4はComplete、Phase 5はPlannedです。
+Phase 4はComplete、Phase 5はCurrentです。
 
 Phase 4までに次を提供します。
 
@@ -88,7 +91,9 @@ strict再読込、redaction、process／Workspace cleanup、成功Recordingのof
 Replay Metrics一致を確認しました。この最小vertical sliceの結果は、一般的なモデル性能や
 Provider比較結果を示すものではありません。Phase 4 Campaign 002では3組のpaired結果を
 得ましたが、固定した1 Taskと各3反復の結果から普遍的なWorkflow優劣を示しません。
-Antigravity、Provider比較、dashboard、notebook、統計的検定、並列schedulerは未実装です。
+AntigravityのHeadless Runner／Live実行、Provider比較、dashboard、notebook、統計的検定、
+並列schedulerは未実装です。Antigravity Slice 5Aのoffline preflight、strict parser、
+Evidence、fake executable受入だけが実装済みです。
 
 ## Quick Start
 
@@ -244,7 +249,7 @@ macOSはlocal process-tree testで検証済みです。Linux実装経路は有�
 - Phase 2: Safe Runner, Evidence and Quality Gate（完了）
 - Phase 3: Codex CLI Provider（完了）
 - Phase 4: Workflow A/B Experiment（完了、Campaign 002は3/3 complete pairs）
-- Phase 5: Antigravity CLI Provider（Current、offline設計完了・実装未着手）
+- Phase 5: Antigravity CLI Provider（Current、Slice 5A offline実装済み、Slice 5B設計のみ）
 - Phase 6: Multi-language Fixtures and Public Report
 - Phase 7: Optional Enhancements
 

@@ -4,16 +4,19 @@
 
 - Phase: 5
 - Phase status: Current
-- Design status: Ready for offline implementation
+- Slice 5A status: Implemented and offline-validated
+- Slice 5B status: Design only; implementation not authorized
 - Design date: 2026-07-28
+- Slice 5A correction and Slice 5B design update: 2026-07-29
 - Design base: `feature/phase5` at
   `d3a8cf814623ea0bdd071d12c948a582f38a827d`
 - Implementation owner: Antigravity
 
-This document is the implementation contract for the first offline slice of the
-Antigravity CLI Provider. It does not authorize an actual Antigravity agent run,
-model request, authentication flow, quota use, provider comparison, or Live
-artifact creation.
+This document is the implementation contract and completion boundary for the
+first offline slice of the Antigravity CLI Provider. It also records the design
+gates for Slice 5B, but does not authorize Slice 5B implementation, an actual
+Antigravity agent run, model request, authentication flow, quota use, provider
+comparison, or Live artifact creation.
 
 ## Goal
 
@@ -344,6 +347,22 @@ Existing Recording 1.0/1.1, Codex Evidence 1.1-1.5, Live Artifact 1.0/1.1,
 Failure Diagnostic 1.0, Workflow Plan, Campaign, and report loaders must remain
 byte- and schema-compatible.
 
+### Slice 5A correction closure
+
+The 2026-07-29 correction closes two review findings without changing the
+Antigravity Evidence 1.0 schema:
+
+- a trailing NDJSON line without a final newline is cleared from the parser
+  buffer immediately after normalization, and failure paths clear any
+  unprocessed buffered bytes;
+- `provider_output_limit` can represent either stdout or stderr truncation,
+  including bounded preflight stderr, while requiring at least one truncated
+  stream and at least one observed byte.
+
+The production Antigravity CLI version allowlist remains empty. All selectable
+profile and stream acceptance tests use an injected version allowlist and
+synthetic local executable only.
+
 ## Offline acceptance tests
 
 The Antigravity implementation must add tests for at least:
@@ -387,6 +406,14 @@ The Antigravity implementation must add tests for at least:
 - no external AI, network, auth, model catalog, Gate, or real `agy -p`;
 - all existing Replay/Codex/Workflow tests remain unchanged and pass.
 
+The 2026-07-29 Slice 5A acceptance suite covers every class above with synthetic
+bytes or a short-lived local fake executable. Parameterized malformed-usage
+cases independently cover negative, boolean, string, non-finite, overflow,
+missing dependency, and inconsistent-total values. Tests also reproduce the
+trailing-line raw-buffer and preflight-stderr output-limit corrections. Test
+counts are reported from `pytest --collect-only` and the full suite rather than
+being fixed as part of the contract.
+
 Required validation:
 
 ```console
@@ -402,30 +429,105 @@ still fake them. If running doctor on a developer machine would touch a real
 
 ## Later slices
 
-### Slice 5B: manual Antigravity vertical slice
+### Slice 5B: Headless Runner readiness and offline integration
 
-Not authorized by this design. Before it can start, a reviewed commit and a
-separate human approval must resolve:
+**Status: design only; implementation is not authorized.**
 
-- Prompt transport and argv exposure;
-- exact local CLI version/profile;
-- sanitized temporary HOME and cached keyring authentication behavior;
-- immutable, run-local permission settings;
-- sandbox and web/MCP denial policy;
-- exact model slug and effort;
-- one run = one fresh conversation = one Provider process;
-- explicit `--confirm-live-antigravity`;
-- Provider call ceiling of one for the first smoke;
-- no retry, fallback, continuation, resume, or subagent delegation;
-- create-only Recording/Evidence/Diagnostic paths;
-- process, Workspace, Prompt adapter, HOME, cache, and settings cleanup.
+Slice 5B prepares a Safe Subprocess runner boundary and proves it only with a
+short-lived synthetic local executable. It must not invoke a real `agy`, send a
+Prompt, authenticate, access a model catalog or quota, use external network, or
+create a Live artifact.
 
-The first real run must be a new experiment and must not reuse any Phase 3 or
-Phase 4 Artifact.
+#### Blocking Prompt-transport decision
 
-### Slice 5C: Provider comparison
+The documented CLI contract still places the Prompt value in argv. AgentLab's
+repository contract still forbids Prompt content in argv and permits Prompt
+delivery only through stdin. A fake executable accepting stdin would prove the
+AgentLab collector but would not prove that the real Antigravity CLI supports
+that transport.
 
-Start only after a successful, replayable Antigravity vertical slice.
+Therefore Slice 5B implementation remains fail-closed until a separate reviewed
+decision does one of the following:
+
+1. registers a documented, locally preflighted non-argv Prompt transport; or
+2. explicitly changes the repository security contract for a bounded,
+   non-secret synthetic Prompt and records the accepted argv exposure.
+
+No undocumented `@file`, stdin, environment-variable, shell-expansion, or
+temporary-file convention may be treated as a production Antigravity Prompt
+transport.
+
+#### Entry criteria
+
+- Slice 5A correction is reviewed and all offline validation passes;
+- the Prompt-transport decision above is recorded in a separate reviewed
+  design change;
+- an exact local `agy X.Y.Z` and its required help markers are reviewed and
+  registered to one immutable profile;
+- temporary HOME, cached authentication behavior, immutable run-local settings,
+  sandbox request, and web/MCP/approval policy are specified without claiming
+  stronger isolation than observed;
+- exact model slug, reasoning effort, CLI timeout, Harness timeout, byte limits,
+  and stop conditions are fixed;
+- create-only Recording/Evidence/Diagnostic paths and cleanup ownership are
+  defined.
+
+#### Runner contract if separately authorized
+
+- selected profile is a mandatory precondition; `NOT_SELECTED` prohibits spawn;
+- one run is one fresh conversation, one process, one Prompt, and at most one
+  Provider call;
+- argv is an explicit array with `shell=False`; stdout and stderr stay separate;
+- the resolved Prompt adapter is the only Prompt transport and never logs or
+  persists Prompt content;
+- Provider and Gate environments are separate and secret parent variables are
+  not inherited;
+- stdout feeds `StrictAntigravityStreamParser` incrementally while stderr is
+  counted and discarded after bounded classification;
+- timeout, signal, output-limit, collection, spawn, and cleanup failures remain
+  exclusive failure kinds and never become a quality-gate failure;
+- raw JSONL, stderr, agent text, reasoning, tool input/output, and subagent
+  payloads are never persisted;
+- there is no retry, fallback, continuation, resume, replacement run, or
+  subagent delegation.
+
+#### Offline acceptance if separately authorized
+
+- only a synthetic local executable is used;
+- Prompt absence from argv, logs, Evidence, Recording, Diagnostic, and process
+  metadata is asserted for a non-argv transport;
+- exact argv, sanitized environments, stdin closure, separate pipes, arbitrary
+  JSONL chunking, byte boundaries, timeout, signal, and process-group extinction
+  are tested;
+- success, Provider failure, CLI non-zero, signal, timeout, protocol drift,
+  output limit, collection failure, spawn failure, and cleanup failure remain
+  distinct;
+- Provider success does not imply tool success; only subsequent quality Gates
+  assess the disposable Workspace;
+- the full Replay, Runner, Codex, Workflow, and Slice 5A suites remain
+  compatible.
+
+### Slice 5C: Live Antigravity smoke and quality-gate verification
+
+**Status: not designed or authorized for execution.**
+
+Slice 5C starts only after a reviewed Slice 5B implementation and a second
+explicit human approval. It must add `--confirm-live-antigravity`, use a new
+experiment and artifact root, and permit at most one Provider call for the
+first smoke. The run is manual, never part of normal tests or CI, and has no
+retry, fallback, resume, continuation, replacement, or subagent delegation.
+
+The approval must separately cover real `agy` execution, cached authentication,
+network/API access, model and quota use, the exact non-secret Prompt, Workspace
+scope, Gate commands, timeouts, stop conditions, and cleanup. A successful
+terminal result does not prove tool execution; the disposable Workspace quality
+Gates remain authoritative.
+
+The first real run must not reuse any Phase 3 or Phase 4 Artifact.
+
+### Slice 5D: Provider comparison
+
+Start only after a successful, replayable Slice 5C vertical smoke.
 
 Use a new strict Provider-comparison Spec rather than overloading Workflow Spec
 2.0 or changing ExperimentSpec 1.0. Fix:
@@ -457,9 +559,10 @@ Reuse the Phase 4 principles:
 - no general model-performance or statistical-significance claim from the
   initial small experiment.
 
-## Implementation handoff
+## Current maintenance handoff
 
-The Antigravity implementation agent must:
+An agent maintaining Slice 5A or preparing a separately approved Slice 5B
+implementation must:
 
 1. verify `feature/phase5`, the design commit, remote parity, and a clean tracked
    worktree before editing;
@@ -467,7 +570,8 @@ The Antigravity implementation agent must:
    `docs/CODEX_PROVIDER.md`, `docs/REPLAY_FORMAT.md`,
    `src/agentlab/models.py`, `src/agentlab/capabilities.py`, and the relevant
    tests;
-3. implement only offline slice 5A;
+3. preserve the completed offline Slice 5A contract and implement no Slice 5B
+   code without a separate approval after its entry criteria are resolved;
 4. preserve existing schemas and completed Phase behavior;
 5. use fake executables and synthetic streams only;
 6. stop rather than invoke real `agy -p` or another Provider task,
@@ -476,7 +580,8 @@ The Antigravity implementation agent must:
 7. run the required offline validation;
 8. update documentation only for what is actually implemented;
 9. commit and push only reviewed Phase 5 files to `feature/phase5`;
-10. do not create a PR, merge main, or start Slice 5B/5C.
+10. do not create a PR, merge main, invoke Live, or start Slice 5C/5D without
+    separate approval.
 
 The completion report must list changed files, test counts, remaining
 unverified capabilities, and confirm that real Antigravity Provider calls and

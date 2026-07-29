@@ -2050,10 +2050,14 @@ class AntigravityExecutionEvidence(ContractModel):
         elif self.failure_kind is LiveFailureKind.PROVIDER_TIMEOUT:
             raise ValueError("PROVIDER_TIMEOUT failure_kind requires TIMEOUT termination reason")
 
-        # 8. failure_kind == PROVIDER_OUTPUT_LIMIT => stdout_truncated and non-zero bytes
+        # 8. failure_kind == PROVIDER_OUTPUT_LIMIT => at least one truncated stream
+        #    and at least one observed byte.
         if self.failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT:
-            if not self.stdout_truncated:
-                raise ValueError("PROVIDER_OUTPUT_LIMIT requires stdout_truncated to be True")
+            if not self.stdout_truncated and not self.stderr_truncated:
+                raise ValueError(
+                    "PROVIDER_OUTPUT_LIMIT requires stdout_truncated or "
+                    "stderr_truncated to be True"
+                )
             if self.stdout_bytes == 0 and self.stderr_bytes == 0:
                 raise ValueError(
                     "PROVIDER_OUTPUT_LIMIT forbids stdout_bytes == 0 and stderr_bytes == 0"

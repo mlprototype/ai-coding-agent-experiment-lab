@@ -101,9 +101,9 @@ process group、Workspace、adapterはいずれも回収済みである。
 Campaignは`harness_failure`で停止し、残り5 runを`not_run`として記録した。retry、
 fallback、resumeは0で、offline reportは1回だけ生成した。scheduled pair 3に対しcomplete
 pairは0、`pairing.status=not_estimable`である。ArtifactはGit管理外で保持し、このCampaignや
-失敗run、reportを再実行しない。比較可能なpairがないためWorkflowの優劣を述べず、Phase 4は
-Current、Phase 5はPlannedのままとする。Phase 4の1 Provider callはPhase 3 manual Live
-累計8試行へ加算しない。
+失敗run、reportを再実行しない。比較可能なpairがないためWorkflowの優劣を述べず、この
+Campaign 001時点ではPhase 4をCurrent、Phase 5をPlannedのままとした。Phase 4の
+1 Provider callはPhase 3 manual Live累計8試行へ加算しない。
 
 Python bytecode cache隔離修正後、reviewed commit
 `edd8c9e748998d056efa70fa43a26d10aa8ded12`、canonical Plan SHA-256
@@ -122,7 +122,7 @@ Plan、Campaign、Recording、Evidence、reportはGit管理外に保持する。
 Phase 4 Campaignのcall数と分離する。この固定Task、Prompt、Fixture、Gate、各3反復、
 当該環境・実行時期に限定された結果であり、一般的なモデル性能、統計的有意差、普遍的な
 Workflow優位性を示さない。受入条件を満たしたためPhase 4は`Complete`、Phase 5は
-`Planned`のままとする。
+`Current`とする。
 
 ## Phase 5: Antigravity CLI Provider
 
@@ -131,19 +131,22 @@ Workflow優位性を示さない。受入条件を満たしたためPhase 4は`C
 **目的:** Antigravity CLIを同じProvider境界へ接続し、Provider比較を可能にする。
 
 **現在の範囲:** 2026-07-28に
-[offline設計](ANTIGRAVITY_PROVIDER.md)を確定した。最初のsliceはversion付き契約、
+[offline設計](ANTIGRAVITY_PROVIDER.md)を確定し、2026-07-29にSlice 5Aのversion付き契約、
 strict `stream-json` parser、read-only version/help preflight、redaction済みEvidence、
-fake `agy`受入だけを実装する。実`agy -p`、認証、model catalog、quota利用、Live、
-Provider比較は承認していない。公式headless interfaceではPromptがargvへ載るため、
-Prompt transportの安全方針を別の人間判断で解決するまでLiveはfail closedとする。
+fake `agy`受入を是正・補完した。Slice 5BはHeadless Runner readinessとoffline統合の
+設計だけを確定し、実装は承認していない。実`agy -p`、認証、model catalog、quota利用、
+Live、Provider比較も承認していない。公式headless interfaceではPromptがargvへ載るため、
+Prompt transportの安全方針を別の人間判断で解決するまでRunnerとLiveはfail closedとする。
 
-**成果物:** Antigravity adapter、能力/版preflight、event正規化、Record/Replay、
-Provider比較Spec。
+**実装済み成果物:** Antigravity Evidence 1.0、version/help preflight、profile選択境界、
+event/usage正規化、raw非永続化、process-group回収、合成fake `agy`受入。
 
-**受入条件:** Phase 3と同じ安全・証跡基準を満たす。Workflowを固定した反復比較ができ、
-Provider固有欠測を明示する。モデル単体比較と表現しない。offline sliceは外部AI、
-network、認証、quota、実Antigravity Provider callを0件に保ち、既存schemaとPhase 0〜4の
-互換性を維持する。
+**未実装成果物:** Antigravity Headless Runner、Live Recording/Artifact、品質Gateとの
+vertical slice、Provider比較Spec・scheduler・report。
+
+**Slice 5A受入条件:** 外部AI、network、認証、quota、実Antigravity Provider callを0件に
+保ち、Promptやraw streamを永続化せず、失敗分類を分離し、既存schemaとPhase 0〜4の互換性を
+維持する。
 
 ## Phase 6: Multi-language Fixtures and Public Report
 
