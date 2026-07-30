@@ -71,6 +71,7 @@ from agentlab.phase6 import (
     ProviderEvaluationStatus,
     PublicChecksums,
     PublicLanguageReport,
+    PublicLanguageReportV1_1,
     PublicRunRecord,
     PublicSuiteManifest,
     PublicSuiteReport,
@@ -81,10 +82,12 @@ from agentlab.phase6 import (
     ToolchainIdentity,
     WorkflowExperimentSpecV2_1,
     WorkflowPlanV1_2,
+    _canonical_jsonl_line,
     _provider_call_count_from_codex,
     _validate_primary_live_bindings,
     canonical_json_bytes,
     derive_language_status,
+    derive_public_language_counts,
     load_campaign_contract,
     load_external_checksum_anchor,
     load_fixture_manifest,
@@ -94,6 +97,7 @@ from agentlab.phase6 import (
     load_public_suite_inputs,
     load_public_suite_manifest,
     load_public_suite_report,
+    load_recording_contract,
     load_release_metadata,
     load_workflow_plan_contract,
     load_workflow_spec_contract,
@@ -101,6 +105,7 @@ from agentlab.phase6 import (
     validate_data_cutoff,
     validate_expected_language_status,
     validate_plan_bindings,
+    validate_public_language_report_campaign,
     validate_public_suite_inputs,
 )
 from agentlab.workflow import (
@@ -1501,6 +1506,131 @@ def test_passed_state_rejects_cleanup_failed_workspace(
         selected.model_validate(payload)
 
 
+@pytest.mark.parametrize("target", ["artifact", "recording"])
+def test_gate_harness_error_rejects_all_successful_gate_commands(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    _source, _spec, _plan, _campaign, artifacts, recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    model = artifacts[0] if target == "artifact" else recordings[0].terminal
+    payload = model.model_dump(mode="json")
+    payload.update(
+        {
+            "overall_status": "harness_error",
+            "failure_kind": "gate_harness_error",
+            "metrics": None,
+        }
+    )
+    if target == "artifact":
+        payload["started_at"] = T0
+        payload["completed_at"] = T0
+    else:
+        payload["event_type"] = "run_failed"
+        payload["occurred_at"] = T0
+    selected = (
+        LiveRunArtifactV1_2
+        if target == "artifact"
+        else Phase6RecordingTerminalEvent
+    )
+
+    with pytest.raises(ValidationError, match="abnormal Gate"):
+        selected.model_validate(payload)
+
+
+@pytest.mark.parametrize("target", ["artifact", "recording"])
+def test_unsupported_platform_rejects_successful_codex(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    _source, _spec, _plan, _campaign, artifacts, recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    model = artifacts[0] if target == "artifact" else recordings[0].terminal
+    payload = model.model_dump(mode="json")
+    payload.update(
+        {
+            "overall_status": "harness_error",
+            "failure_kind": "unsupported_platform",
+            "gate_executed": False,
+            "gate_not_executed_reason": "pre_gate_harness_failure",
+            "gate_commands": [],
+            "metrics": None,
+        }
+    )
+    if target == "artifact":
+        payload["started_at"] = T0
+        payload["completed_at"] = T0
+    else:
+        payload["event_type"] = "run_failed"
+        payload["occurred_at"] = T0
+    selected = (
+        LiveRunArtifactV1_2
+        if target == "artifact"
+        else Phase6RecordingTerminalEvent
+    )
+
+    with pytest.raises(ValidationError, match="runtime-precheck"):
+        selected.model_validate(payload)
+
+
+def test_cleanup_observation_takes_priority_over_gate_harness_error(
+    tmp_path: Path,
+) -> None:
+    _source, _spec, _plan, _campaign, artifacts, _recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    payload = artifacts[0].model_dump(mode="json")
+    payload.update(
+        {
+            "overall_status": "harness_error",
+            "failure_kind": "gate_harness_error",
+            "started_at": T0,
+            "completed_at": T0,
+            "metrics": None,
+        }
+    )
+    payload["gate_commands"][0]["termination"] = {
+        "reason": "residual_process",
+        "sigterm_sent": True,
+        "sigkill_sent": False,
+        "process_group_cleared": False,
+        "error": "process group remained alive",
+    }
+
+    with pytest.raises(ValidationError, match="take priority"):
+        LiveRunArtifactV1_2.model_validate(payload)
+
+
+def test_recording_loader_rejects_terminal_before_codex_completion(
+    tmp_path: Path,
+) -> None:
+    _source, _spec, _plan, _campaign, _artifacts, recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    recording = recordings[0]
+    started_line = _canonical_jsonl_line(recording.started)
+    terminal_raw = json.loads(
+        _canonical_jsonl_line(recording.terminal).decode("utf-8")
+    )
+    terminal_raw["occurred_at"] = "2019-12-31T23:59:59.999999Z"
+    terminal_line = (
+        json.dumps(
+            terminal_raw,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    path = tmp_path / "recording.jsonl"
+    path.write_bytes(started_line + terminal_line)
+
+    with pytest.raises(Phase6ContractError, match="invalid Recording"):
+        load_recording_contract(path)
+
+
 def test_language_status_is_derived_without_public_run_record() -> None:
     source = PrimarySuiteSource(
         source_class=SourceClass.PRIMARY,
@@ -1741,8 +1871,8 @@ def test_checksum_contract_covers_release_metadata_and_uses_external_anchor() ->
 
 
 def test_public_language_report_retains_input_changed_reason() -> None:
-    report = PublicLanguageReport(
-        schema_version="1.0",
+    report = PublicLanguageReportV1_1(
+        schema_version="1.1",
         language=Language.PYTHON,
         status=LanguageStatus.BLOCKED,
         scheduled_runs=2,
@@ -1753,6 +1883,8 @@ def test_public_language_report_retains_input_changed_reason() -> None:
         not_run_runs=2,
         output_rejected_runs=0,
         gate_not_executed_runs=2,
+        zero_call_runs=2,
+        provider_call_count_unknown_runs=0,
         gate_not_executed_reason={
             GateNotExecutedReason.INPUT_CHANGED: 2,
         },
@@ -1764,6 +1896,104 @@ def test_public_language_report_retains_input_changed_reason() -> None:
         report.gate_not_executed_reason[GateNotExecutedReason.INPUT_CHANGED]
         == 2
     )
+    assert report.zero_call_runs == 2
+
+
+def _public_language_report_payload() -> dict[str, Any]:
+    return {
+        "schema_version": "1.0",
+        "language": "python",
+        "status": "blocked",
+        "scheduled_runs": 2,
+        "attempted_runs": 0,
+        "completed_runs": 0,
+        "failed_runs": 0,
+        "interrupted_runs": 0,
+        "not_run_runs": 2,
+        "output_rejected_runs": 0,
+        "gate_not_executed_runs": 2,
+        "zero_call_runs": 2,
+        "provider_call_count_unknown_runs": 0,
+        "gate_not_executed_reason": {"input_changed": 2},
+        "scheduled_pair_count": 1,
+        "complete_pair_count": 0,
+        "estimability": "not_estimable",
+    }
+
+
+def test_public_language_report_rejects_output_rejections_above_failures() -> None:
+    payload = _public_language_report_payload()
+    payload.update(
+        {
+            "output_rejected_runs": 1,
+            "gate_not_executed_reason": {
+                "input_changed": 1,
+                "output_contract_violation": 1,
+            },
+        }
+    )
+
+    with pytest.raises(ValidationError, match="must not exceed failed_runs"):
+        PublicLanguageReportV1_1.model_validate(
+            {**payload, "schema_version": "1.1"}
+        )
+
+
+def test_public_language_report_rejects_gate_nonexecution_above_schedule() -> None:
+    payload = _public_language_report_payload()
+    payload.update(
+        {
+            "gate_not_executed_runs": 3,
+            "gate_not_executed_reason": {"input_changed": 3},
+        }
+    )
+
+    with pytest.raises(ValidationError, match="must not exceed scheduled_runs"):
+        PublicLanguageReportV1_1.model_validate(
+            {**payload, "schema_version": "1.1"}
+        )
+
+
+def test_public_language_report_is_derived_from_campaign() -> None:
+    campaign = _completed_campaign()
+    derived = derive_public_language_counts(campaign)
+    report = PublicLanguageReportV1_1(
+        schema_version="1.1",
+        language=Language.PYTHON,
+        status=LanguageStatus.EVALUATED,
+        **derived.__dict__,
+    )
+    validate_public_language_report_campaign(report, campaign)
+
+    changed = report.model_copy(update={"scheduled_pair_count": 2})
+    with pytest.raises(Phase6ContractError, match="scheduled_pair_count"):
+        validate_public_language_report_campaign(changed, campaign)
+
+
+def test_public_language_report_1_0_loader_remains_compatible(
+    tmp_path: Path,
+) -> None:
+    legacy = PublicLanguageReport(
+        schema_version="1.0",
+        language=Language.PYTHON,
+        status=LanguageStatus.BLOCKED,
+        scheduled_runs=1,
+        attempted_runs=0,
+        completed_runs=0,
+        failed_runs=0,
+        interrupted_runs=0,
+        not_run_runs=1,
+        output_rejected_runs=0,
+        gate_not_executed_runs=1,
+        gate_not_executed_reason={GateNotExecutedReason.NOT_RUN: 1},
+        scheduled_pair_count=0,
+        complete_pair_count=0,
+        estimability="not_estimable",
+    )
+    path = tmp_path / "language-report-1.0.json"
+    path.write_bytes(canonical_json_bytes(legacy))
+
+    assert load_public_language_report(path) == legacy
 
 
 @pytest.mark.parametrize(
@@ -1896,8 +2126,8 @@ def test_all_public_json_contracts_have_canonical_strict_loaders(
         spec=ArtifactReference(role="spec", path="spec.yaml", sha256=HASH_A),
     )
     manifest = _suite_manifest(source)
-    language_report = PublicLanguageReport(
-        schema_version="1.0",
+    language_report = PublicLanguageReportV1_1(
+        schema_version="1.1",
         language=Language.PYTHON,
         status=LanguageStatus.BLOCKED,
         scheduled_runs=1,
@@ -1908,6 +2138,8 @@ def test_all_public_json_contracts_have_canonical_strict_loaders(
         not_run_runs=0,
         output_rejected_runs=1,
         gate_not_executed_runs=1,
+        zero_call_runs=0,
+        provider_call_count_unknown_runs=0,
         gate_not_executed_reason={
             GateNotExecutedReason.OUTPUT_CONTRACT_VIOLATION: 1,
         },

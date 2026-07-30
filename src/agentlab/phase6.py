@@ -40,14 +40,17 @@ from agentlab.campaign import (
     load_campaign,
 )
 from agentlab.models import (
+    CodexCleanupState,
     CodexExecutionEvidence,
     CodexExecutionStage,
+    CodexFailureStage,
     CommandEvidence,
     CommandStatus,
     ContractModel,
     DiffEvidence,
     ExecutionMode,
     GateKind,
+    LiveFailureKind,
     LiveRunArtifact,
     Provider,
     ProviderExecutionStatus,
@@ -1058,20 +1061,69 @@ def _validate_phase6_execution_observations(
         and gate_commands
     ):
         raise ValueError("not_created Workspace cannot contain Gate execution")
-    cleanup_failed = (
+    gate_process_cleanup_failed = any(
+        not command.termination.process_group_cleared
+        for command in gate_commands
+    )
+    codex_process_cleanup_failed = (
+        codex.cleanup_state is CodexCleanupState.FAILED
+        or not codex.termination.process_group_cleared
+        or codex.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+    )
+    cleanup_failed_observed = (
         workspace_lifecycle is WorkspaceLifecycle.CLEANUP_FAILED
+        or gate_process_cleanup_failed
+        or codex_process_cleanup_failed
     )
     cleanup_terminal = (
         overall_status is Phase6OverallStatus.HARNESS_ERROR
         and failure_kind is Phase6FailureKind.PROCESS_CLEANUP_ERROR
     )
-    if cleanup_failed is not cleanup_terminal:
+    if cleanup_failed_observed is not cleanup_terminal:
         raise ValueError(
-            "cleanup_failed Workspace and process_cleanup_error Harness status "
-            "must be bidirectionally consistent"
+            "observed cleanup failure and process_cleanup_error Harness status "
+            "must be bidirectionally consistent and take priority"
         )
     if codex.status is ProviderExecutionStatus.FAILED and gate_commands:
         raise ValueError("quality Gates must not run after failed Codex execution")
+
+    abnormal_gate_observed = bool(gate_commands) and any(
+        command.status not in {CommandStatus.PASSED, CommandStatus.FAILED}
+        or not command.termination.process_group_cleared
+        for command in gate_commands
+    )
+    gate_harness_observed = (
+        codex.status is ProviderExecutionStatus.SUCCEEDED
+        and gate_executed
+        and abnormal_gate_observed
+        and not cleanup_failed_observed
+    )
+    gate_harness_terminal = (
+        overall_status is Phase6OverallStatus.HARNESS_ERROR
+        and failure_kind is Phase6FailureKind.GATE_HARNESS_ERROR
+    )
+    if gate_harness_observed is not gate_harness_terminal:
+        raise ValueError(
+            "gate_harness_error requires successful Codex and an abnormal "
+            "Gate observation without a higher-priority cleanup failure"
+        )
+
+    unsupported_observed = (
+        codex.status is ProviderExecutionStatus.FAILED
+        and codex.failure_kind is LiveFailureKind.UNSUPPORTED_PLATFORM
+        and codex.execution_stage is CodexExecutionStage.PREFLIGHT_COMPLETED
+        and codex.failure_stage
+        is CodexFailureStage.PROVIDER_RUNTIME_PRECHECK
+        and not cleanup_failed_observed
+    )
+    unsupported_terminal = (
+        overall_status is Phase6OverallStatus.HARNESS_ERROR
+        and failure_kind is Phase6FailureKind.UNSUPPORTED_PLATFORM
+    )
+    if unsupported_observed is not unsupported_terminal:
+        raise ValueError(
+            "unsupported_platform must match Codex runtime-precheck Evidence"
+        )
 
     commands_completed_normally = bool(gate_commands) and all(
         command.status in {CommandStatus.PASSED, CommandStatus.FAILED}
@@ -1106,6 +1158,8 @@ def _validate_phase6_execution_observations(
             raise ValueError(
                 "Gate timestamps must follow Codex and remain inside terminal time"
             )
+    if codex.completed_at > terminal_at:
+        raise ValueError("Codex completion must not follow terminal time")
 
     if metrics is None:
         return
@@ -2112,6 +2166,8 @@ class PublicRunRecord(ContractModel):
 
 
 class PublicLanguageReport(ContractModel):
+    """Backward-compatible Public Language Report 1.0."""
+
     schema_version: Literal["1.0"]
     language: Language
     status: LanguageStatus
@@ -2142,6 +2198,12 @@ class PublicLanguageReport(ContractModel):
             raise ValueError("language run counts do not match the terminal taxonomy")
         if sum(self.gate_not_executed_reason.values()) != self.gate_not_executed_runs:
             raise ValueError("Gate non-execution reasons must match their total")
+        if self.output_rejected_runs > self.failed_runs:
+            raise ValueError("output_rejected_runs must not exceed failed_runs")
+        if self.gate_not_executed_runs > self.scheduled_runs:
+            raise ValueError(
+                "gate_not_executed_runs must not exceed scheduled_runs"
+            )
         if (
             self.gate_not_executed_reason.get(
                 GateNotExecutedReason.OUTPUT_CONTRACT_VIOLATION,
@@ -2161,13 +2223,195 @@ class PublicLanguageReport(ContractModel):
         return self
 
 
+class PublicLanguageReportV1_1(PublicLanguageReport):
+    """Phase 6 aggregate with explicit zero/unknown Provider call counts."""
+
+    schema_version: Literal["1.1"]  # type: ignore[assignment]
+    zero_call_runs: StrictInt = Field(ge=0)
+    provider_call_count_unknown_runs: StrictInt = Field(ge=0)
+
+    @model_validator(mode="after")
+    def provider_call_aggregates_are_coherent(
+        self,
+    ) -> PublicLanguageReportV1_1:
+        if (
+            self.zero_call_runs > self.gate_not_executed_runs
+            or self.provider_call_count_unknown_runs > self.interrupted_runs
+            or self.zero_call_runs
+            + self.provider_call_count_unknown_runs
+            > self.scheduled_runs
+        ):
+            raise ValueError(
+                "zero and unknown Provider call aggregates are inconsistent"
+            )
+        return self
+
+
+@dataclass(frozen=True)
+class DerivedPublicLanguageCounts:
+    scheduled_runs: int
+    attempted_runs: int
+    completed_runs: int
+    failed_runs: int
+    interrupted_runs: int
+    not_run_runs: int
+    output_rejected_runs: int
+    gate_not_executed_runs: int
+    zero_call_runs: int
+    provider_call_count_unknown_runs: int
+    gate_not_executed_reason: dict[GateNotExecutedReason, int]
+    scheduled_pair_count: int
+    complete_pair_count: int
+    estimability: Literal["estimable", "not_estimable"]
+
+
+def _gate_not_executed_reason_from_campaign(
+    event: Phase6CampaignRunEvent,
+) -> GateNotExecutedReason:
+    if event.gate_executed:
+        raise Phase6ContractError(
+            "executed Campaign Gate has no non-execution reason"
+        )
+    if event.stop_reason is CampaignStopReason.INPUT_CHANGED:
+        return GateNotExecutedReason.INPUT_CHANGED
+    if event.status is CampaignRunStatus.INTERRUPTED:
+        return GateNotExecutedReason.INTERRUPTED
+    if (
+        event.outcome
+        is Phase6CampaignOutcome.OUTPUT_CONTRACT_VIOLATION
+    ):
+        return GateNotExecutedReason.OUTPUT_CONTRACT_VIOLATION
+    if (
+        event.outcome is Phase6CampaignOutcome.PROVIDER_TIMEOUT
+        or event.failure_kind is Phase6FailureKind.PROVIDER_TIMEOUT
+    ):
+        return GateNotExecutedReason.PROVIDER_TIMEOUT
+    if event.outcome is Phase6CampaignOutcome.PROVIDER_FAILURE:
+        return GateNotExecutedReason.PROVIDER_FAILURE
+    if event.outcome in {
+        Phase6CampaignOutcome.HARNESS_FAILURE,
+        Phase6CampaignOutcome.CLEANUP_FAILURE,
+    }:
+        return GateNotExecutedReason.PRE_GATE_HARNESS_FAILURE
+    if event.status is CampaignRunStatus.NOT_RUN:
+        return GateNotExecutedReason.NOT_RUN
+    raise Phase6ContractError(
+        "Campaign terminal state has no fixed Gate non-execution reason"
+    )
+
+
+def derive_public_language_counts(
+    campaign: LoadedPhase6Campaign,
+) -> DerivedPublicLanguageCounts:
+    """Derive every publishable language aggregate from Campaign 1.2."""
+    terminal = [
+        event
+        for event in campaign.events
+        if isinstance(event, Phase6CampaignRunEvent)
+        and event.status is not CampaignRunStatus.STARTED
+    ]
+    gate_reasons: dict[GateNotExecutedReason, int] = {}
+    for event in terminal:
+        if not event.gate_executed:
+            reason = _gate_not_executed_reason_from_campaign(event)
+            gate_reasons[reason] = gate_reasons.get(reason, 0) + 1
+    scheduled_pairs: dict[tuple[str, int], set[Workflow]] = {}
+    completed_pairs: dict[tuple[str, int], set[Workflow]] = {}
+    for event in terminal:
+        pair = (event.task_id, event.repetition_index)
+        scheduled_pairs.setdefault(pair, set()).add(event.workflow)
+        if event.status is CampaignRunStatus.COMPLETED:
+            completed_pairs.setdefault(pair, set()).add(event.workflow)
+    pair_workflows = {Workflow.ONE_SHOT, Workflow.STAGED}
+    scheduled_pair_count = sum(
+        workflows == pair_workflows
+        for workflows in scheduled_pairs.values()
+    )
+    complete_pair_count = sum(
+        workflows == pair_workflows
+        for workflows in completed_pairs.values()
+    )
+    return DerivedPublicLanguageCounts(
+        scheduled_runs=len(terminal),
+        attempted_runs=sum(
+            event.status
+            in {
+                CampaignRunStatus.COMPLETED,
+                CampaignRunStatus.FAILED,
+                CampaignRunStatus.INTERRUPTED,
+            }
+            for event in terminal
+        ),
+        completed_runs=sum(
+            event.status is CampaignRunStatus.COMPLETED for event in terminal
+        ),
+        failed_runs=sum(
+            event.status is CampaignRunStatus.FAILED for event in terminal
+        ),
+        interrupted_runs=sum(
+            event.status is CampaignRunStatus.INTERRUPTED for event in terminal
+        ),
+        not_run_runs=sum(
+            event.status is CampaignRunStatus.NOT_RUN for event in terminal
+        ),
+        output_rejected_runs=sum(
+            event.outcome
+            is Phase6CampaignOutcome.OUTPUT_CONTRACT_VIOLATION
+            for event in terminal
+        ),
+        gate_not_executed_runs=sum(
+            not event.gate_executed for event in terminal
+        ),
+        zero_call_runs=sum(
+            event.provider_call_count == 0 for event in terminal
+        ),
+        provider_call_count_unknown_runs=sum(
+            event.provider_call_count is None for event in terminal
+        ),
+        gate_not_executed_reason=gate_reasons,
+        scheduled_pair_count=scheduled_pair_count,
+        complete_pair_count=complete_pair_count,
+        estimability=(
+            "estimable" if complete_pair_count > 0 else "not_estimable"
+        ),
+    )
+
+
+def validate_public_language_report_campaign(
+    report: PublicLanguageReportV1_1,
+    campaign: LoadedPhase6Campaign,
+) -> None:
+    """Reject a public aggregate that differs from its listed Campaign."""
+    derived = derive_public_language_counts(campaign)
+    for field_name in (
+        "scheduled_runs",
+        "attempted_runs",
+        "completed_runs",
+        "failed_runs",
+        "interrupted_runs",
+        "not_run_runs",
+        "output_rejected_runs",
+        "gate_not_executed_runs",
+        "zero_call_runs",
+        "provider_call_count_unknown_runs",
+        "gate_not_executed_reason",
+        "scheduled_pair_count",
+        "complete_pair_count",
+        "estimability",
+    ):
+        if getattr(report, field_name) != getattr(derived, field_name):
+            raise Phase6ContractError(
+                f"Public Language Report {field_name} differs from Campaign"
+            )
+
+
 class PublicSuiteReport(ContractModel):
     schema_version: Literal["1.0"]
     suite_id: StrictStr
     renderer_version: StrictStr
     generated_at: datetime
     data_cutoff_at: datetime
-    languages: list[PublicLanguageReport]
+    languages: list[PublicLanguageReport | PublicLanguageReportV1_1]
     provider_coverage: list[ProviderCoverage]
     automatic_winner_selected: Literal[False]
     leaderboard_generated: Literal[False]
@@ -2349,10 +2593,25 @@ def load_public_run_record(path: Path) -> PublicRunRecord:
     return _load_canonical_model(path, PublicRunRecord, "Public Run Record")
 
 
-def load_public_language_report(path: Path) -> PublicLanguageReport:
-    return _load_canonical_model(
-        path,
-        PublicLanguageReport,
+def load_public_language_report(
+    path: Path,
+) -> PublicLanguageReport | PublicLanguageReportV1_1:
+    snapshot = _read_stable_regular_file(path, "Public Language Report")
+    raw = _strict_json_bytes(snapshot.content, "Public Language Report")
+    version = raw.get("schema_version")
+    if version == "1.0":
+        model: type[PublicLanguageReport] | type[PublicLanguageReportV1_1] = (
+            PublicLanguageReport
+        )
+    elif version == "1.1":
+        model = PublicLanguageReportV1_1
+    else:
+        raise Phase6ContractError(
+            "unsupported Public Language Report schema_version"
+        )
+    return _load_canonical_model_bytes(
+        snapshot.content,
+        model,
         "Public Language Report",
     )
 
@@ -2657,7 +2916,12 @@ def _load_phase6_recording_bytes(
     if (
         started.run_id != terminal.run_id
         or started.experiment_id != terminal.experiment_id
-        or terminal.occurred_at < started.occurred_at
+        or not (
+            started.occurred_at
+            <= terminal.codex.started_at
+            <= terminal.codex.completed_at
+            <= terminal.occurred_at
+        )
         or started.requested_model != terminal.codex.requested_model
         or started.requested_reasoning_effort
         is not terminal.codex.requested_reasoning_effort

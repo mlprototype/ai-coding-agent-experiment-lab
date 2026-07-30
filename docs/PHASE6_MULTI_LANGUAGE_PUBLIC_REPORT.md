@@ -41,7 +41,7 @@ CodexExecutionEvidence 1.5を変更しない。
 | Historical Verification Record | 1.0 | Campaign 002の非再実行検証。toolchainは`unknown`固定 |
 | Public Suite Manifest | 1.0 | 明示入力、期待言語status、coverage、cutoff、予定出力 |
 | Public Run Record | 1.0 | 公開allowlistだけからなる正規化run |
-| Public Language／Suite Report | 1.0 | 言語別集計と決定的Suite集計 |
+| Public Language／Suite Report | 1.0／1.1 | 1.0互換読取、call状態付き言語集計、決定的Suite集計 |
 | checksums／release metadata／external anchor | 1.0 | bundle integrityと外部固定境界 |
 
 新契約は未知field、型強制、重複JSON key、非有限数を拒否する。JSONはUTF-8、
@@ -187,6 +187,16 @@ Gate成功かつ`quality_gate_pass=true`、`failed`は通常終了したGateの�
 `quality_gate_pass=false`に固定する。`cleanup_failed`を観測した場合はquality／Provider
 結果より`harness_error / process_cleanup_error`を優先し、逆方向の対応も要求する。
 
+Harness failure kindも同じ共通validatorで観測から双方向に決める。Codex成功後の
+`gate_harness_error`にはGate実行と、normally-completedでないcommandを必須とし、全commandが
+正常終了した場合は拒否する。`unsupported_platform`はCodex Evidenceのfailed status、
+`preflight_completed`、`provider_runtime_precheck`、同一failure kindを必須とする。Workspace、
+Codex process、Gate processのいずれかに回収失敗があれば、他の分類より
+`process_cleanup_error`を優先する。
+
+Recording 1.2は`Recording started <= Codex started <= Codex completed <= Recording
+terminal`を要求する。
+
 ## Public allowlist and checksum trust
 
 Public Run Record 1.0はreviewed commit、experiment／run／task ID、language、exact model ID、
@@ -202,6 +212,12 @@ Prompt本文、raw Provider output、agent message、reasoning、thread ID、絶
 Acceptance／Regression／lint／typecheck値をすべて0とし、`acceptance_passed`は
 `acceptance_total`を超えてはならない。overall status、failure kind、Gate状態、Metrics、
 Gate非実行理由は双方向に整合させる。
+
+Public Language Report 1.1は1.0のloader互換性を維持したまま`zero_call_runs`と
+`provider_call_count_unknown_runs`を持つ。`output_rejected_runs <= failed_runs`、
+`gate_not_executed_runs <= scheduled_runs`を必須とし、Campaign 1.2のterminal eventから
+run taxonomy、Provider call状態、Gate非実行理由、scheduled／complete pairを再導出して
+report値と完全一致させる。
 
 `checksums.json`は`release-metadata.json`を含む全予定出力を対象とし、自身だけを対象外と
 する。`checksums.json`自身のSHA-256はbundle外のExternal Checksum Anchor 1.0へ固定する。
