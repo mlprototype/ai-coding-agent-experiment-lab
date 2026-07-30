@@ -175,15 +175,24 @@ architectureを再検証したうえで、ローカル環境の
 
 ## Phase 6: Multi-language Fixtures and Public Report
 
-**Status: Planned**
+**Status: Current**
 
-**目的:** 複数言語・課題へ適用範囲を広げ、再現可能な公開結果を作る。
+**目的:** Phase 4 Completeを基礎として、Codex Provider上のWorkflow比較を複数言語へ
+広げ、保存済みArtifactから追跡可能な公開結果を作る。Phase 5には依存せず、同Phaseの
+Blocked状態を変更しない。
 
-**成果物:** version固定された複数fixture、fixture検証、集計pipeline、方法・制約・
-生データ参照を含む公開レポート。
+**現在の範囲:** Slice 6Aとして、Fixture Manifest／Acceptance／Diff Policy 1.0、
+Workflow Spec 2.1、Plan／Campaign／Recording／LiveRunArtifact 1.2、Public Suite
+Manifest／Run Record／Report 1.0、canonical serialization、後方互換loader、
+cross-artifact validatorをoffline実装した。Fixture、capability audit、Campaign runtime、
+renderer、publication、Liveは未実装である。詳細は
+[Phase 6詳細設計](PHASE6_MULTI_LANGUAGE_PUBLIC_REPORT.md)を参照する。
 
-**受入条件:** 各fixtureが独立したAcceptance/Gateを持ち、初期状態を再生成できる。
-レポート数値をrun証跡へ追跡でき、一般的モデル性能を断定しない。
+**受入条件:** Live-readyには最低2言語の実toolchain Fixture受入が必要で、offline実装だけ
+では到達しない。Completeには最低2言語で各1 complete pairを含む承認済みLiveとPublic
+Suite bundleが必要である。未実行言語は`not_run`として示す。3言語・各3反復の18 callsは
+目標であり、最低条件ではない。レポート数値を正規化run証跡へ追跡でき、総合winner、
+leaderboard、統計的有意差、一般的モデル性能を主張しない。
 
 ## Phase 7: Optional Enhancements
 

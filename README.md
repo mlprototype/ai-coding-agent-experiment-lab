@@ -60,6 +60,12 @@ call数と分離します。この1 Task、固定Prompt／Fixture／Gate、各3�
 結果から、一般的なモデル性能、統計的有意差、普遍的なWorkflow優位性は主張しません。
 Phase 4はComplete、Phase 5はBlockedです。
 
+Phase 6はPhase 4 Completeへ依存し、Phase 5とは独立して開始しました。現在はSlice 6Aの
+version付き契約、strict loader、canonical serialization、cross-artifact validatorだけを
+offline実装済みです。Fixture、capability audit、Campaign runtime、Public Report生成、
+Liveは未着手で、いずれの言語もまだLive-readyではありません。詳細と停止境界は
+[Phase 6詳細設計](docs/PHASE6_MULTI_LANGUAGE_PUBLIC_REPORT.md)を参照してください。
+
 Phase 4までに次を提供します。
 
 - バージョン付きExperimentSpec、RunMetrics、UsageMetrics、CapabilityReport
@@ -258,7 +264,7 @@ macOSはlocal process-tree testで検証済みです。Linux実装経路は有�
 - Phase 4: Workflow A/B Experiment（完了、Campaign 002は3/3 complete pairs）
 - Phase 5: Antigravity CLI Provider（Blocked、Slice 5A offline実装済み、Slice 5B／5Cは
   上流artifact署名検証失敗により停止）
-- Phase 6: Multi-language Fixtures and Public Report
+- Phase 6: Multi-language Fixtures and Public Report（Current、Slice 6A offline契約のみ）
 - Phase 7: Optional Enhancements
 
 詳細は [docs/ROADMAP.md](docs/ROADMAP.md) を参照してください。
