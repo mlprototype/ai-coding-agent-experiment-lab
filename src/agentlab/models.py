@@ -44,6 +44,19 @@ CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS = frozenset(
     }
 )
 
+ANTIGRAVITY_REQUIRED_HELP_MARKERS = (
+    "--prompt",
+    "--output-format",
+    "stream-json",
+    "--model",
+    "--effort",
+    "--print-timeout",
+    "--sandbox",
+)
+
+ANTIGRAVITY_ALLOWLISTED_CLI_VERSIONS: frozenset[str] = frozenset()
+
+
 NonNegativeStrictInt = Annotated[StrictInt, Field(ge=0)]
 
 
@@ -169,6 +182,134 @@ class CodexFailureStage(StrEnum):
     PROVIDER_RUNNER_RESULT_CONSTRUCTION = "provider_runner_result_construction"
     PROVIDER_RUNNER_RESULT_EXTRACTION = "provider_runner_result_extraction"
     PROVIDER_ORCHESTRATION = "provider_orchestration"
+
+
+class AntigravityHelpMarker(StrEnum):
+    PROMPT = "--prompt"
+    OUTPUT_FORMAT = "--output-format"
+    STREAM_JSON = "stream-json"
+    MODEL = "--model"
+    EFFORT = "--effort"
+    PRINT_TIMEOUT = "--print-timeout"
+    SANDBOX = "--sandbox"
+
+
+class AntigravityReasoningEffort(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class AntigravityCliProfile(StrEnum):
+    """Versioned CLI contract selected by preflight."""
+
+    NOT_SELECTED = "not_selected"
+    HEADLESS_STREAM_JSON_V1 = "headless_stream_json_v1"
+
+
+class AntigravityTerminalStatus(StrEnum):
+    """Normalized terminal status emitted in Antigravity result event."""
+
+    SUCCESS = "SUCCESS"
+    ERROR = "ERROR"
+    CANCELED = "CANCELED"
+    INTERRUPTED = "INTERRUPTED"
+    INVALID = "INVALID"
+    WAITING = "WAITING"
+    RUNNING = "RUNNING"
+
+
+class AntigravityEventType(StrEnum):
+    INIT = "init"
+    STEP_UPDATE = "step_update"
+    RESULT = "result"
+
+
+class AntigravityStepType(StrEnum):
+    USER_INPUT = "user_input"
+    AGENT_RESPONSE = "agent_response"
+    TOOL = "tool"
+    CHECKPOINT = "checkpoint"
+
+
+class AntigravityPermissionMode(StrEnum):
+    AUTO = "auto"
+    CONFIRM = "confirm"
+    DISABLED = "disabled"
+    NOT_AVAILABLE = "not_available"
+
+
+class AntigravityPromptTransport(StrEnum):
+    UNSUPPORTED = "unsupported"
+
+
+class AntigravityExecutionStage(StrEnum):
+    """Furthest completed step at the Antigravity Provider boundary."""
+
+    PREFLIGHT_NOT_COMPLETED = "preflight_not_completed"
+    PREFLIGHT_COMPLETED = "preflight_completed"
+    PROVIDER_INVOCATION_ATTEMPTED = "provider_invocation_attempted"
+
+
+class AntigravityFailureStage(StrEnum):
+    """Safe fixed location for a failed Antigravity Provider lifecycle."""
+
+    PREFLIGHT = "preflight"
+    PREFLIGHT_PROCESS_SPAWN = "preflight_process_spawn"
+    PREFLIGHT_PROCESS_COLLECTION = "preflight_process_collection"
+    PREFLIGHT_PROCESS_CLEANUP = "preflight_process_cleanup"
+    STREAM_PARSING = "stream_parsing"
+    EVIDENCE_CONSTRUCTION = "evidence_construction"
+
+
+class AntigravityPreflightOperation(StrEnum):
+    VERSION = "version"
+    HELP = "help"
+
+
+class AntigravityCleanupErrorCode(StrEnum):
+    CLEANUP_TIMEOUT = "cleanup_timeout"
+    CLEANUP_PROCESS_ERROR = "cleanup_process_error"
+    NONE = "none"
+
+
+class AntigravityTerminationEvidence(ContractModel):
+    reason: TerminationReason
+    sigterm_sent: StrictBool
+    sigkill_sent: StrictBool
+    process_group_cleared: StrictBool
+    error_code: AntigravityCleanupErrorCode
+
+    @model_validator(mode="after")
+    def signal_and_cleanup_state_must_be_consistent(
+        self,
+    ) -> AntigravityTerminationEvidence:
+        if self.sigkill_sent and not self.sigterm_sent:
+            raise ValueError("sigkill_sent requires sigterm_sent")
+        if self.reason is TerminationReason.NONE:
+            if self.sigterm_sent or self.sigkill_sent:
+                raise ValueError(
+                    "termination reason none must not contain sent signals"
+                )
+            if (
+                self.process_group_cleared
+                and self.error_code is not AntigravityCleanupErrorCode.NONE
+            ):
+                raise ValueError(
+                    "cleared process group requires error_code none"
+                )
+        if (
+            self.process_group_cleared
+            and self.error_code is not AntigravityCleanupErrorCode.NONE
+        ):
+            raise ValueError("cleared process group must have error_code none")
+        if (
+            not self.process_group_cleared
+            and self.error_code is AntigravityCleanupErrorCode.NONE
+        ):
+            raise ValueError("uncleared process group requires an error_code")
+        return self
+
 
 
 class CodexRunnerState(StrEnum):
@@ -338,6 +479,143 @@ class LiveFailureKind(StrEnum):
     GATE_HARNESS_ERROR = "gate_harness_error"
     EVIDENCE_ERROR = "evidence_error"
     UNSUPPORTED_PLATFORM = "unsupported_platform"
+
+
+class AntigravityPreflightCommandEvidence(ContractModel):
+    """Redacted result of one bounded Antigravity version/help subprocess."""
+
+    operation: AntigravityPreflightOperation
+    returncode: StrictInt | None = Field(default=None, ge=-255, le=255)
+    stdout_bytes: StrictInt = Field(ge=0, le=64 * 1024)
+    stderr_bytes: StrictInt = Field(ge=0, le=64 * 1024)
+    stdout_truncated: StrictBool
+    stderr_truncated: StrictBool
+    collection_error_observed: StrictBool
+    failure_stage: AntigravityFailureStage | None
+    failure_kind: LiveFailureKind
+    termination: AntigravityTerminationEvidence
+
+    @model_validator(mode="after")
+    def preflight_streams_and_failure_must_be_consistent(
+        self,
+    ) -> AntigravityPreflightCommandEvidence:
+        if self.stdout_truncated and self.stdout_bytes == 0:
+            raise ValueError(
+                "preflight stdout_truncated requires stdout_bytes > 0"
+            )
+        if self.stderr_truncated and self.stderr_bytes == 0:
+            raise ValueError(
+                "preflight stderr_truncated requires stderr_bytes > 0"
+            )
+
+        cleanup_failed = not self.termination.process_group_cleared
+        timed_out = self.termination.reason is TerminationReason.TIMEOUT
+        output_limit_exceeded = (
+            self.stdout_truncated or self.stderr_truncated
+        )
+        if cleanup_failed:
+            expected_failure_kind = LiveFailureKind.PROCESS_CLEANUP_ERROR
+            expected_failure_stage = (
+                AntigravityFailureStage.PREFLIGHT_PROCESS_CLEANUP
+            )
+        elif timed_out:
+            expected_failure_kind = LiveFailureKind.PROVIDER_TIMEOUT
+            expected_failure_stage = (
+                AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
+            )
+        elif output_limit_exceeded:
+            expected_failure_kind = LiveFailureKind.PROVIDER_OUTPUT_LIMIT
+            expected_failure_stage = (
+                AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
+            )
+        elif self.collection_error_observed:
+            expected_failure_kind = LiveFailureKind.EVIDENCE_ERROR
+            expected_failure_stage = (
+                AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
+            )
+        elif self.returncode is None:
+            expected_failure_kind = LiveFailureKind.PROVIDER_UNAVAILABLE
+            expected_failure_stage = (
+                AntigravityFailureStage.PREFLIGHT_PROCESS_SPAWN
+            )
+        elif self.returncode != 0:
+            expected_failure_kind = LiveFailureKind.PROVIDER_UNAVAILABLE
+            expected_failure_stage = (
+                AntigravityFailureStage.PREFLIGHT_PROCESS_COLLECTION
+            )
+        else:
+            expected_failure_kind = LiveFailureKind.NONE
+            expected_failure_stage = None
+
+        if self.failure_kind is not expected_failure_kind:
+            raise ValueError(
+                "preflight failure_kind does not match observed cleanup, "
+                "timeout, output-limit, collection, and returncode priority"
+            )
+        if self.failure_stage is not expected_failure_stage:
+            raise ValueError(
+                "preflight failure_stage does not match observed failure"
+            )
+
+        if self.failure_kind is LiveFailureKind.NONE:
+            if self.failure_stage is not None:
+                raise ValueError(
+                    "successful preflight command requires failure_stage None"
+                )
+            if self.returncode != 0:
+                raise ValueError(
+                    "successful preflight command requires returncode 0"
+                )
+            if self.stdout_truncated or self.stderr_truncated:
+                raise ValueError(
+                    "successful preflight command forbids truncated streams"
+                )
+        elif self.failure_stage is None:
+            raise ValueError(
+                "failed preflight command requires a failure_stage"
+            )
+
+        if (
+            self.failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT
+            and not self.stdout_truncated
+            and not self.stderr_truncated
+        ):
+            raise ValueError(
+                "preflight provider_output_limit requires a truncated stream"
+            )
+
+        if (
+            self.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+            and self.termination.process_group_cleared
+        ):
+            raise ValueError(
+                "preflight process_cleanup_error requires uncleared or "
+                "unverifiable process group"
+            )
+        if (
+            not self.termination.process_group_cleared
+            and self.failure_kind is not LiveFailureKind.PROCESS_CLEANUP_ERROR
+        ):
+            raise ValueError(
+                "uncleared preflight process group requires "
+                "process_cleanup_error"
+            )
+
+        if self.termination.reason is TerminationReason.TIMEOUT:
+            if self.failure_kind not in {
+                LiveFailureKind.PROVIDER_TIMEOUT,
+                LiveFailureKind.PROCESS_CLEANUP_ERROR,
+            }:
+                raise ValueError(
+                    "preflight timeout requires provider_timeout or "
+                    "process_cleanup_error"
+                )
+        elif self.failure_kind is LiveFailureKind.PROVIDER_TIMEOUT:
+            raise ValueError(
+                "preflight provider_timeout requires timeout termination"
+            )
+
+        return self
 
 
 class QualityGate(ContractModel):
@@ -1603,6 +1881,636 @@ class CodexExecutionEvidence(ContractModel):
         ):
             raise ValueError("process_cleanup_error requires an uncleared process group")
         return self
+
+
+class AntigravityExecutionEvidence(ContractModel):
+    """Redacted summary of one Antigravity CLI execution; raw stream is never persisted."""
+
+    schema_version: Literal["1.0", "1.1"] = "1.0"
+    provider: Literal[Provider.ANTIGRAVITY] = Provider.ANTIGRAVITY
+    cli_version: StrictStr | None = None
+    profile: AntigravityCliProfile = AntigravityCliProfile.NOT_SELECTED
+    preflight_checked_at: datetime | None = None
+    preflight_verified_flags: list[AntigravityHelpMarker] = Field(
+        default_factory=list
+    )
+    preflight_commands: list[AntigravityPreflightCommandEvidence] | None = Field(
+        default=None,
+        max_length=2,
+        exclude_if=lambda value: value is None,
+    )
+    requested_model: StrictStr | None = None
+    requested_reasoning_effort: AntigravityReasoningEffort | None = None
+    requested_output_format: Literal["stream-json"] | None = None
+    prompt_transport: AntigravityPromptTransport = (
+        AntigravityPromptTransport.UNSUPPORTED
+    )
+    prompt_argv_exposure: StrictBool = True
+    execution_stage: AntigravityExecutionStage = (
+        AntigravityExecutionStage.PREFLIGHT_NOT_COMPLETED
+    )
+    failure_stage: AntigravityFailureStage | None = None
+    invocation_state: CodexInvocationState = (
+        CodexInvocationState.NOT_ATTEMPTED
+    )
+    cleanup_state: CodexCleanupState = CodexCleanupState.NOT_APPLICABLE
+    requested_sandbox: StrictBool = True
+    observed_permission_mode: AntigravityPermissionMode | None = None
+    raw_stream_persisted: Literal[False] = False
+    provider_status: ProviderExecutionStatus
+    normalized_terminal_status: AntigravityTerminalStatus | None = None
+    exit_code: StrictInt | None = Field(default=None, ge=-255, le=255)
+    terminal_num_turns: StrictInt | None = Field(default=None, ge=0, le=10_000)
+    provider_duration_ms: StrictInt | None = Field(
+        default=None, ge=0, le=86_400_000
+    )
+    init_requested_model_present: StrictBool = False
+    init_requested_agent_present: StrictBool = False
+    event_count: StrictInt = Field(ge=0, le=100_000)
+    unknown_event_count: StrictInt = Field(default=0, ge=0, le=100_000)
+    unknown_step_type_count: StrictInt = Field(default=0, ge=0, le=100_000)
+    init_event_index: StrictInt | None = Field(default=None, ge=0, le=100_000)
+    result_event_index: StrictInt | None = Field(
+        default=None, ge=0, le=100_000
+    )
+    event_counts: dict[AntigravityEventType, NonNegativeStrictInt] = Field(
+        default_factory=dict
+    )
+    step_counts: dict[AntigravityStepType, NonNegativeStrictInt] = Field(
+        default_factory=dict
+    )
+    usage_metrics: UsageMetrics
+    stdout_bytes: StrictInt = Field(ge=0, le=64 * 1024 * 1024)
+    stderr_bytes: StrictInt = Field(ge=0, le=64 * 1024 * 1024)
+    stdout_truncated: StrictBool = False
+    stderr_truncated: StrictBool = False
+    termination: AntigravityTerminationEvidence
+    failure_kind: LiveFailureKind = LiveFailureKind.NONE
+
+    @field_validator("preflight_checked_at", mode="before")
+    @classmethod
+    def timestamps_must_use_datetime_or_iso_string(
+        cls, value: object
+    ) -> object:
+        if value is not None and not isinstance(value, (str, datetime)):
+            raise ValueError(
+                "Antigravity timestamps must be ISO strings or datetime values"
+            )
+        return value
+
+    @field_validator("preflight_checked_at")
+    @classmethod
+    def preflight_checked_at_must_be_timezone_aware(
+        cls, value: datetime | None
+    ) -> datetime | None:
+        if value is not None and (
+            value.tzinfo is None or value.utcoffset() is None
+        ):
+            raise ValueError(
+                "preflight_checked_at timestamp must be timezone-aware"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_antigravity_evidence(self) -> AntigravityExecutionEvidence:
+        if (
+            self.schema_version == "1.0"
+            and self.preflight_commands is not None
+        ):
+            raise ValueError(
+                "Antigravity Evidence 1.0 forbids preflight_commands"
+            )
+        if self.schema_version == "1.1":
+            if self.preflight_commands is None:
+                raise ValueError(
+                    "Antigravity Evidence 1.1 requires preflight_commands"
+                )
+            operations = [
+                command.operation for command in self.preflight_commands
+            ]
+            if operations not in (
+                [AntigravityPreflightOperation.VERSION],
+                [
+                    AntigravityPreflightOperation.VERSION,
+                    AntigravityPreflightOperation.HELP,
+                ],
+            ):
+                raise ValueError(
+                    "preflight_commands must contain version followed "
+                    "optionally by help"
+                )
+            if self.preflight_checked_at is None:
+                raise ValueError(
+                    "Antigravity Evidence 1.1 requires preflight_checked_at"
+                )
+
+            provider_invocation_recorded = (
+                self.execution_stage
+                is AntigravityExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+                or self.invocation_state
+                is not CodexInvocationState.NOT_ATTEMPTED
+            )
+            successful_preflight_required = (
+                self.profile is not AntigravityCliProfile.NOT_SELECTED
+                or provider_invocation_recorded
+                or self.provider_status is ProviderExecutionStatus.SUCCEEDED
+            )
+            expected_operations = [
+                AntigravityPreflightOperation.VERSION,
+                AntigravityPreflightOperation.HELP,
+            ]
+            if successful_preflight_required:
+                if operations != expected_operations:
+                    raise ValueError(
+                        "selected profile, Provider invocation, or Provider "
+                        "success requires successful version and help "
+                        "preflight commands"
+                    )
+                if any(
+                    command.returncode != 0
+                    or command.failure_kind is not LiveFailureKind.NONE
+                    or command.failure_stage is not None
+                    for command in self.preflight_commands
+                ):
+                    raise ValueError(
+                        "selected profile, Provider invocation, or Provider "
+                        "success requires both preflight commands to succeed"
+                    )
+
+            failed_preflight_commands = [
+                command
+                for command in self.preflight_commands
+                if command.failure_kind is not LiveFailureKind.NONE
+            ]
+            if failed_preflight_commands:
+                if self.profile is not AntigravityCliProfile.NOT_SELECTED:
+                    raise ValueError(
+                        "failed preflight command forbids a selected profile"
+                    )
+                if provider_invocation_recorded:
+                    raise ValueError(
+                        "failed preflight command forbids Provider invocation"
+                    )
+                if self.provider_status is ProviderExecutionStatus.SUCCEEDED:
+                    raise ValueError(
+                        "failed preflight command forbids Provider success"
+                    )
+
+                preflight_failure_priority = {
+                    LiveFailureKind.PROCESS_CLEANUP_ERROR: 0,
+                    LiveFailureKind.PROVIDER_TIMEOUT: 1,
+                    LiveFailureKind.PROVIDER_OUTPUT_LIMIT: 2,
+                    LiveFailureKind.EVIDENCE_ERROR: 3,
+                    LiveFailureKind.PROVIDER_UNAVAILABLE: 4,
+                }
+                unsupported_failure_kinds = {
+                    command.failure_kind
+                    for command in failed_preflight_commands
+                    if command.failure_kind not in preflight_failure_priority
+                }
+                if unsupported_failure_kinds:
+                    raise ValueError(
+                        "preflight command contains an unsupported "
+                        "failure_kind"
+                    )
+
+                highest_priority_failure = min(
+                    failed_preflight_commands,
+                    key=lambda command: preflight_failure_priority[
+                        command.failure_kind
+                    ],
+                )
+                if (
+                    self.failure_kind
+                    is not highest_priority_failure.failure_kind
+                    or self.failure_stage
+                    is not highest_priority_failure.failure_stage
+                ):
+                    raise ValueError(
+                        "top-level failure kind/stage must match the "
+                        "highest-priority failed preflight command"
+                    )
+
+        if (
+            self.cli_version is not None
+            and not re.fullmatch(r"^agy \d+\.\d+\.\d+$", self.cli_version)
+        ):
+            raise ValueError("cli_version must strictly match 'agy X.Y.Z'")
+
+        if (
+            self.requested_model is not None
+            and not re.fullmatch(
+                r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$", self.requested_model
+            )
+        ):
+            raise ValueError(
+                "requested_model must be a bounded valid model slug"
+            )
+
+        expected_event_keys = list(AntigravityEventType)
+        if list(self.event_counts.keys()) != expected_event_keys:
+            raise ValueError(
+                "event_counts must include all AntigravityEventType keys in defined Enum order"
+            )
+
+        expected_step_keys = list(AntigravityStepType)
+        if list(self.step_counts.keys()) != expected_step_keys:
+            raise ValueError(
+                "step_counts must include all AntigravityStepType keys in defined Enum order"
+            )
+
+        total_event_counts = (
+            sum(self.event_counts.values()) + self.unknown_event_count
+        )
+        if total_event_counts != self.event_count:
+            raise ValueError(
+                "sum of event_counts + unknown_event_count must equal event_count"
+            )
+
+        step_update_count = self.event_counts.get(
+            AntigravityEventType.STEP_UPDATE, 0
+        )
+        total_step_counts = (
+            sum(self.step_counts.values()) + self.unknown_step_type_count
+        )
+        if total_step_counts != step_update_count:
+            raise ValueError(
+                "sum of step_counts + unknown_step_type_count must equal STEP_UPDATE event count"
+            )
+
+        if (
+            self.init_event_index is not None
+            and not (0 <= self.init_event_index < self.event_count)
+        ):
+            raise ValueError(
+                "init_event_index out of bounds [0, event_count)"
+            )
+        if (
+            self.result_event_index is not None
+            and not (0 <= self.result_event_index < self.event_count)
+        ):
+            raise ValueError(
+                "result_event_index out of bounds [0, event_count)"
+            )
+
+        if self.invocation_state is CodexInvocationState.PROCESS_STARTED:
+            if self.cleanup_state is CodexCleanupState.CLEARED:
+                if not (
+                    self.termination.process_group_cleared
+                    and self.termination.error_code
+                    is AntigravityCleanupErrorCode.NONE
+                ):
+                    raise ValueError(
+                        "cleared cleanup requires cleared process group and error_code NONE"
+                    )
+            elif self.cleanup_state is CodexCleanupState.FAILED:
+                if not (
+                    not self.termination.process_group_cleared
+                    and self.termination.error_code
+                    is not AntigravityCleanupErrorCode.NONE
+                ):
+                    raise ValueError(
+                        "failed cleanup requires uncleared process group and non-NONE error_code"
+                    )
+            else:
+                raise ValueError(
+                    "started process requires cleanup_state CLEARED or FAILED"
+                )
+        elif self.cleanup_state is not CodexCleanupState.NOT_APPLICABLE:
+            raise ValueError(
+                "unstarted process requires cleanup_state not_applicable"
+            )
+
+        # 1. PROVIDER_INVOCATION_ATTEMPTED requires HEADLESS_STREAM_JSON_V1 profile,
+        #    valid cli_version, timestamp, all required markers, and
+        #    SPAWN_ATTEMPTED or PROCESS_STARTED
+        if (
+            self.execution_stage
+            is AntigravityExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+        ):
+            if self.profile is not AntigravityCliProfile.HEADLESS_STREAM_JSON_V1:
+                raise ValueError(
+                    "PROVIDER_INVOCATION_ATTEMPTED stage requires HEADLESS_STREAM_JSON_V1 profile"
+                )
+            if self.cli_version is None or not re.fullmatch(
+                r"^agy \d+\.\d+\.\d+$", self.cli_version
+            ):
+                raise ValueError(
+                    "PROVIDER_INVOCATION_ATTEMPTED stage requires valid cli_version"
+                )
+            if self.preflight_checked_at is None:
+                raise ValueError(
+                    "PROVIDER_INVOCATION_ATTEMPTED stage requires preflight_checked_at timestamp"
+                )
+            if set(self.preflight_verified_flags) != set(AntigravityHelpMarker):
+                raise ValueError(
+                    "PROVIDER_INVOCATION_ATTEMPTED stage requires all mandatory help markers"
+                )
+            if self.invocation_state not in (
+                CodexInvocationState.SPAWN_ATTEMPTED,
+                CodexInvocationState.PROCESS_STARTED,
+            ):
+                raise ValueError(
+                    "PROVIDER_INVOCATION_ATTEMPTED stage requires "
+                    "SPAWN_ATTEMPTED or PROCESS_STARTED invocation_state"
+                )
+        elif self.invocation_state in (
+            CodexInvocationState.SPAWN_ATTEMPTED,
+            CodexInvocationState.PROCESS_STARTED,
+        ):
+            raise ValueError(
+                "Process invocation attempted requires PROVIDER_INVOCATION_ATTEMPTED stage"
+            )
+
+        # 2. profile == NOT_SELECTED forbids SPAWN_ATTEMPTED / PROCESS_STARTED
+        if (
+            self.profile is AntigravityCliProfile.NOT_SELECTED
+            and self.invocation_state is not CodexInvocationState.NOT_ATTEMPTED
+        ):
+            raise ValueError(
+                "NOT_SELECTED profile forbids SPAWN_ATTEMPTED or PROCESS_STARTED invocation_state"
+            )
+
+        # 3. Selected Profile => exact cli_version, timestamp, help markers, stage >= COMPLETED
+        if self.profile is not AntigravityCliProfile.NOT_SELECTED:
+            if self.cli_version is None or not re.fullmatch(
+                r"^agy \d+\.\d+\.\d+$", self.cli_version
+            ):
+                raise ValueError("Selected profile requires valid cli_version")
+            if self.preflight_checked_at is None:
+                raise ValueError(
+                    "Selected profile requires preflight_checked_at timestamp"
+                )
+            if set(self.preflight_verified_flags) != set(AntigravityHelpMarker):
+                raise ValueError(
+                    "Selected profile requires all mandatory help markers"
+                )
+            if self.execution_stage not in (
+                AntigravityExecutionStage.PREFLIGHT_COMPLETED,
+                AntigravityExecutionStage.PROVIDER_INVOCATION_ATTEMPTED,
+            ):
+                raise ValueError(
+                    "Selected profile requires PREFLIGHT_COMPLETED or "
+                    "PROVIDER_INVOCATION_ATTEMPTED stage"
+                )
+
+        # 4. PREFLIGHT_NOT_COMPLETED => NOT_SELECTED, NOT_ATTEMPTED, no help markers
+        if (
+            self.execution_stage
+            is AntigravityExecutionStage.PREFLIGHT_NOT_COMPLETED
+        ):
+            if self.profile is not AntigravityCliProfile.NOT_SELECTED:
+                raise ValueError(
+                    "PREFLIGHT_NOT_COMPLETED stage requires NOT_SELECTED profile"
+                )
+            if self.invocation_state is not CodexInvocationState.NOT_ATTEMPTED:
+                raise ValueError(
+                    "PREFLIGHT_NOT_COMPLETED stage requires NOT_ATTEMPTED invocation_state"
+                )
+            if self.preflight_verified_flags:
+                raise ValueError(
+                    "PREFLIGHT_NOT_COMPLETED stage requires no help markers"
+                )
+
+        # 5. provider_status == SUCCEEDED => Selected profile, completed preflight, etc.
+        if self.provider_status is ProviderExecutionStatus.SUCCEEDED:
+            if self.profile is AntigravityCliProfile.NOT_SELECTED:
+                raise ValueError("SUCCEEDED status requires selected profile")
+            if (
+                self.execution_stage
+                is not AntigravityExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+            ):
+                raise ValueError(
+                    "SUCCEEDED status requires PROVIDER_INVOCATION_ATTEMPTED stage"
+                )
+            if set(self.preflight_verified_flags) != set(AntigravityHelpMarker):
+                raise ValueError("SUCCEEDED status requires all mandatory help markers")
+            if self.invocation_state is not CodexInvocationState.PROCESS_STARTED:
+                raise ValueError("SUCCEEDED status requires PROCESS_STARTED invocation_state")
+            if self.cleanup_state is not CodexCleanupState.CLEARED:
+                raise ValueError("SUCCEEDED status requires CLEARED cleanup_state")
+            if self.exit_code != 0:
+                raise ValueError("SUCCEEDED status requires exit_code == 0")
+            if (
+                self.normalized_terminal_status
+                is not AntigravityTerminalStatus.SUCCESS
+            ):
+                raise ValueError("SUCCEEDED status requires SUCCESS terminal status")
+            if self.terminal_num_turns is None or self.terminal_num_turns < 1:
+                raise ValueError("SUCCEEDED status requires terminal_num_turns >= 1")
+
+        preflight_cleanup_failed = any(
+            command.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+            for command in (self.preflight_commands or [])
+        )
+        preflight_timed_out = any(
+            command.termination.reason is TerminationReason.TIMEOUT
+            for command in (self.preflight_commands or [])
+        )
+
+        # 6. A Provider cleanup failure uses cleanup_state FAILED. A preflight
+        #    cleanup failure remains nested because Provider invocation was not
+        #    attempted.
+        if self.cleanup_state is CodexCleanupState.FAILED:
+            if self.failure_kind is not LiveFailureKind.PROCESS_CLEANUP_ERROR:
+                raise ValueError("FAILED cleanup_state requires PROCESS_CLEANUP_ERROR failure_kind")
+        elif (
+            self.failure_kind is LiveFailureKind.PROCESS_CLEANUP_ERROR
+            and not preflight_cleanup_failed
+        ):
+            raise ValueError(
+                "PROCESS_CLEANUP_ERROR failure_kind requires FAILED "
+                "cleanup_state or failed preflight cleanup"
+            )
+
+        # 7. A cleanup failure has priority over a simultaneous timeout.
+        if self.termination.reason is TerminationReason.TIMEOUT:
+            if self.failure_kind not in {
+                LiveFailureKind.PROVIDER_TIMEOUT,
+                LiveFailureKind.PROCESS_CLEANUP_ERROR,
+            }:
+                raise ValueError(
+                    "TIMEOUT termination reason requires PROVIDER_TIMEOUT "
+                    "or PROCESS_CLEANUP_ERROR failure_kind"
+                )
+        elif (
+            self.failure_kind is LiveFailureKind.PROVIDER_TIMEOUT
+            and not preflight_timed_out
+        ):
+            raise ValueError(
+                "PROVIDER_TIMEOUT failure_kind requires timeout termination"
+            )
+
+        # 8. failure_kind == PROVIDER_OUTPUT_LIMIT => at least one truncated stream
+        #    and at least one observed byte.
+        if self.stdout_truncated and self.stdout_bytes == 0:
+            raise ValueError(
+                "stdout_truncated requires stdout_bytes > 0"
+            )
+        if self.stderr_truncated and self.stderr_bytes == 0:
+            raise ValueError(
+                "stderr_truncated requires stderr_bytes > 0"
+            )
+        if self.failure_kind is LiveFailureKind.PROVIDER_OUTPUT_LIMIT:
+            if not self.stdout_truncated and not self.stderr_truncated:
+                raise ValueError(
+                    "PROVIDER_OUTPUT_LIMIT requires stdout_truncated or "
+                    "stderr_truncated to be True"
+                )
+            if self.stdout_bytes == 0 and self.stderr_bytes == 0:
+                raise ValueError(
+                    "PROVIDER_OUTPUT_LIMIT forbids stdout_bytes == 0 and stderr_bytes == 0"
+                )
+
+        # 8. failure_kind specific rules
+        if (
+            self.failure_kind is LiveFailureKind.PROVIDER_SIGNAL_TERMINATION
+            and (self.exit_code is None or self.exit_code >= 0)
+        ):
+            raise ValueError(
+                "PROVIDER_SIGNAL_TERMINATION requires negative exit_code"
+            )
+
+        if (
+            self.failure_kind is LiveFailureKind.PROVIDER_CLI_NONZERO
+            and (self.exit_code is None or self.exit_code <= 0)
+        ):
+            raise ValueError(
+                "PROVIDER_CLI_NONZERO requires positive exit_code"
+            )
+
+        if (
+            self.failure_kind is LiveFailureKind.PROVIDER_TURN_FAILED
+            and self.normalized_terminal_status
+            not in (
+                AntigravityTerminalStatus.ERROR,
+                AntigravityTerminalStatus.CANCELED,
+                AntigravityTerminalStatus.INTERRUPTED,
+            )
+        ):
+            raise ValueError(
+                "PROVIDER_TURN_FAILED requires ERROR, CANCELED, or INTERRUPTED status"
+            )
+
+        # 9. Usage metrics rules
+        if (
+            self.usage_metrics.cached_input_tokens is not None
+            and self.usage_metrics.input_tokens is None
+        ):
+            raise ValueError(
+                "cached_input_tokens requires input_tokens to be present"
+            )
+
+        if (
+            self.usage_metrics.reasoning_output_tokens is not None
+            and self.usage_metrics.output_tokens is None
+        ):
+            raise ValueError(
+                "reasoning_output_tokens requires output_tokens to be present"
+            )
+
+
+
+
+        if (
+            self.usage_metrics.estimated_api_cost is not None
+            or self.usage_metrics.quota_consumption is not None
+        ):
+            raise ValueError(
+                "Antigravity UsageMetrics must not contain estimated_api_cost or quota_consumption"
+            )
+
+        tokens = (
+            self.usage_metrics.input_tokens,
+            self.usage_metrics.cached_input_tokens,
+            self.usage_metrics.output_tokens,
+            self.usage_metrics.reasoning_output_tokens,
+        )
+        if any(t is not None and t > 10_000_000 for t in tokens):
+            raise ValueError("Token counts in UsageMetrics must not exceed 10,000,000")
+
+        if any(t is not None for t in tokens):
+            if (
+                self.usage_metrics.source
+                is not UsageMetricSource.PROVIDER_REPORTED
+            ):
+                raise ValueError(
+                    "Antigravity token metrics require source provider_reported"
+                )
+            if (
+                self.usage_metrics.input_tokens is not None
+                and self.usage_metrics.cached_input_tokens is not None
+                and self.usage_metrics.cached_input_tokens
+                > self.usage_metrics.input_tokens
+            ):
+                raise ValueError(
+                    "cached_input_tokens must not exceed input_tokens"
+                )
+            if (
+                self.usage_metrics.output_tokens is not None
+                and self.usage_metrics.reasoning_output_tokens is not None
+                and self.usage_metrics.reasoning_output_tokens
+                > self.usage_metrics.output_tokens
+            ):
+                raise ValueError(
+                    "reasoning_output_tokens must not exceed output_tokens"
+                )
+        else:
+            if self.usage_metrics.source is not UsageMetricSource.NOT_AVAILABLE:
+                raise ValueError(
+                    "absent token metrics require source not_available"
+                )
+
+        if self.provider_status is ProviderExecutionStatus.SUCCEEDED:
+            if self.failure_kind is not LiveFailureKind.NONE:
+                raise ValueError(
+                    "succeeded provider_status requires failure_kind NONE"
+                )
+            if self.failure_stage is not None:
+                raise ValueError(
+                    "succeeded provider_status requires failure_stage None"
+                )
+            if self.exit_code != 0:
+                raise ValueError(
+                    "succeeded provider_status requires exit_code 0"
+                )
+            if self.terminal_num_turns != 1:
+                raise ValueError(
+                    "succeeded provider_status requires terminal_num_turns 1"
+                )
+            if (
+                self.normalized_terminal_status
+                is not AntigravityTerminalStatus.SUCCESS
+            ):
+                raise ValueError(
+                    "succeeded provider_status requires normalized_terminal_status SUCCESS"
+                )
+            if self.init_event_index != 0:
+                raise ValueError(
+                    "succeeded provider_status requires init_event_index 0"
+                )
+            if self.result_event_index != self.event_count - 1:
+                raise ValueError(
+                    "succeeded provider_status requires result_event_index at last event"
+                )
+            if self.cleanup_state is not CodexCleanupState.CLEARED and (
+                self.invocation_state is CodexInvocationState.PROCESS_STARTED
+            ):
+                raise ValueError(
+                    "succeeded provider_status requires cleared cleanup_state"
+                )
+        else:
+            if self.failure_kind is LiveFailureKind.NONE:
+                raise ValueError(
+                    "failed provider_status requires non-NONE failure_kind"
+                )
+            if self.failure_stage is None:
+                raise ValueError(
+                    "failed provider_status requires non-None failure_stage"
+                )
+
+        return self
+
 
 
 class LiveFailureDiagnostic(ContractModel):

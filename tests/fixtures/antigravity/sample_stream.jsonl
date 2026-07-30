@@ -1,0 +1,6 @@
+{"event": "init", "permission_mode": "auto", "requested_model": "gemini-3.6-flash"}
+{"event": "step_update", "step_type": "user_input"}
+{"event": "step_update", "step_type": "agent_response"}
+{"event": "step_update", "step_type": "tool"}
+{"event": "step_update", "step_type": "checkpoint"}
+{"event": "result", "status": "SUCCESS", "num_turns": 1, "duration_ms": 1250, "usage": {"input_tokens": 100, "cache_read_tokens": 20, "output_tokens": 50, "thinking_tokens": 10, "total_tokens": 150}}
