@@ -41,6 +41,7 @@ from agentlab.campaign import (
 )
 from agentlab.models import (
     CodexExecutionEvidence,
+    CodexExecutionStage,
     CommandEvidence,
     CommandStatus,
     ContractModel,
@@ -97,6 +98,19 @@ class FileSnapshot:
     identity: FileIdentity
     content: bytes
     sha256: str
+
+
+@dataclass(frozen=True)
+class DirectoryIdentity:
+    device: int
+    inode: int
+    mode: int
+
+
+@dataclass(frozen=True)
+class DirectorySnapshot:
+    path: Path
+    identity: DirectoryIdentity
 
 
 class Language(StrEnum):
@@ -228,6 +242,188 @@ def _identity(metadata: os.stat_result) -> FileIdentity:
     )
 
 
+def _directory_identity(metadata: os.stat_result) -> DirectoryIdentity:
+    return DirectoryIdentity(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        mode=metadata.st_mode,
+    )
+
+
+def _directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def _snapshot_directory(path: Path, label: str) -> DirectorySnapshot:
+    """Open one directory without following a final symlink and snapshot it."""
+    descriptor: int | None = None
+    try:
+        before = path.lstat()
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+            raise Phase6PathError(f"{label} must be a real directory")
+        descriptor = os.open(path, _directory_open_flags())
+        opened = os.fstat(descriptor)
+        after = path.lstat()
+    except Phase6PathError:
+        raise
+    except OSError as error:
+        raise Phase6PathError(f"{label} could not be opened safely") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    identities = {
+        _directory_identity(before),
+        _directory_identity(opened),
+        _directory_identity(after),
+    }
+    if len(identities) != 1:
+        raise Phase6PathError(f"{label} changed while being inspected")
+    return DirectorySnapshot(
+        path=path,
+        identity=_directory_identity(opened),
+    )
+
+
+def _require_directory_snapshot_unchanged(
+    snapshot: DirectorySnapshot,
+    label: str,
+) -> None:
+    current = _snapshot_directory(snapshot.path, label)
+    if current.identity != snapshot.identity:
+        raise Phase6PathError(f"{label} changed after Manifest load")
+
+
+def _read_file_below_root(
+    *,
+    root_snapshot: DirectorySnapshot,
+    relative: str,
+    label: str,
+) -> tuple[FileSnapshot, tuple[DirectorySnapshot, ...]]:
+    """Read a listed file from a stable root FD using no-follow component opens."""
+    relative = _relative_file(relative, label)
+    parts = PurePosixPath(relative).parts
+    directory_descriptors: list[int] = []
+    directory_snapshots: list[DirectorySnapshot] = [root_snapshot]
+    file_descriptor: int | None = None
+    try:
+        root_descriptor = os.open(root_snapshot.path, _directory_open_flags())
+        directory_descriptors.append(root_descriptor)
+        if (
+            _directory_identity(os.fstat(root_descriptor))
+            != root_snapshot.identity
+        ):
+            raise Phase6PathError("Manifest root changed before listed file read")
+
+        current_path = root_snapshot.path
+        for component in parts[:-1]:
+            parent_descriptor = directory_descriptors[-1]
+            before = os.stat(
+                component,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                raise Phase6PathError(f"{label} path contains a non-directory link")
+            child_descriptor = os.open(
+                component,
+                _directory_open_flags(),
+                dir_fd=parent_descriptor,
+            )
+            directory_descriptors.append(child_descriptor)
+            opened = os.fstat(child_descriptor)
+            after = os.stat(
+                component,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            directory_identities = {
+                _directory_identity(before),
+                _directory_identity(opened),
+                _directory_identity(after),
+            }
+            if len(directory_identities) != 1:
+                raise Phase6PathError(f"{label} parent directory changed")
+            current_path /= component
+            directory_snapshots.append(
+                DirectorySnapshot(
+                    path=current_path,
+                    identity=_directory_identity(opened),
+                )
+            )
+
+        parent_descriptor = directory_descriptors[-1]
+        filename = parts[-1]
+        before_file = os.stat(
+            filename,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if stat.S_ISLNK(before_file.st_mode):
+            raise Phase6PathError(f"{label} must not be a symlink")
+        if not stat.S_ISREG(before_file.st_mode):
+            raise Phase6PathError(f"{label} must be a regular file")
+        if before_file.st_nlink != 1:
+            raise Phase6PathError(f"{label} hardlink is not allowed")
+        file_descriptor = os.open(
+            filename,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        opened_file = os.fstat(file_descriptor)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after_open_file = os.fstat(file_descriptor)
+        after_file = os.stat(
+            filename,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except Phase6PathError:
+        raise
+    except OSError as error:
+        raise Phase6PathError(f"{label} could not be read safely") from error
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        for descriptor in reversed(directory_descriptors):
+            os.close(descriptor)
+
+    file_identities = {
+        _identity(before_file),
+        _identity(opened_file),
+        _identity(after_open_file),
+        _identity(after_file),
+    }
+    if len(file_identities) != 1:
+        raise Phase6PathError(f"{label} changed while being read")
+    content = b"".join(chunks)
+    if len(content) != after_open_file.st_size:
+        raise Phase6PathError(f"{label} size changed while being read")
+    snapshot = FileSnapshot(
+        path=root_snapshot.path.joinpath(*parts),
+        identity=_identity(after_open_file),
+        content=content,
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
+    for index, directory_snapshot in enumerate(directory_snapshots):
+        _require_directory_snapshot_unchanged(
+            directory_snapshot,
+            f"{label} parent component {index}",
+        )
+    return snapshot, tuple(directory_snapshots)
+
+
 def _read_stable_regular_file(path: Path, label: str) -> FileSnapshot:
     """Read one regular non-link file while detecting replacement or mutation."""
     try:
@@ -291,16 +487,6 @@ def _read_stable_regular_file(path: Path, label: str) -> FileSnapshot:
         content=content,
         sha256=hashlib.sha256(content).hexdigest(),
     )
-
-
-def _require_snapshot_unchanged(snapshot: FileSnapshot, label: str) -> None:
-    current = _read_stable_regular_file(snapshot.path, label)
-    if (
-        current.identity != snapshot.identity
-        or current.sha256 != snapshot.sha256
-        or current.content != snapshot.content
-    ):
-        raise Phase6PathError(f"{label} changed after Manifest load")
 
 
 class ToolchainComponent(ContractModel):
@@ -655,12 +841,18 @@ class Phase6CampaignRunEvent(ContractModel):
         if self.status is CampaignRunStatus.INTERRUPTED:
             if (
                 self.outcome is not Phase6CampaignOutcome.HUMAN_INTERRUPTION
+                or self.stop_reason is not CampaignStopReason.HUMAN_INTERRUPTION
                 or self.provider_call_count not in {0, 1, None}
+                or self.gate_executed
                 or self.counted_failure
                 or self.fail_fast_applies
                 or self.max_failures_applies
+                or self.failure_kind is not None
             ):
-                raise ValueError("interrupted state must remain outside failure counting")
+                raise ValueError(
+                    "interrupted state requires human_interruption, no Gate or "
+                    "failure kind, and remains outside failure counting"
+                )
             return self
 
         if (
@@ -669,6 +861,7 @@ class Phase6CampaignRunEvent(ContractModel):
                 CampaignRunStatus.FAILED,
             }
             or self.stop_reason is not None
+            or self.provider_call_count is None
         ):
             raise ValueError("attempted terminal state is incomplete")
 
@@ -825,6 +1018,154 @@ class LoadedPhase6Campaign:
 CampaignContract = list[CampaignEvent] | LoadedPhase6Campaign
 
 
+def _validate_phase6_execution_observations(
+    *,
+    overall_status: Phase6OverallStatus,
+    failure_kind: Phase6FailureKind,
+    codex: CodexExecutionEvidence,
+    gate_executed: bool,
+    gate_not_executed_reason: GateNotExecutedReason | None,
+    gate_commands: list[CommandEvidence],
+    diff: DiffEvidence,
+    metrics: RunMetrics | None,
+    workspace_lifecycle: WorkspaceLifecycle,
+    terminal_at: datetime,
+) -> None:
+    """Apply the shared Artifact/Recording quality and cleanup state contract."""
+    if gate_executed != bool(gate_commands):
+        raise ValueError("gate_executed must match Gate Evidence presence")
+    if gate_executed is (gate_not_executed_reason is not None):
+        raise ValueError(
+            "Gate execution and gate_not_executed_reason must be complementary"
+        )
+    if (
+        codex.execution_stage is CodexExecutionStage.PREFLIGHT_NOT_COMPLETED
+        and workspace_lifecycle is not WorkspaceLifecycle.NOT_CREATED
+    ):
+        raise ValueError(
+            "preflight_not_completed requires a not_created Workspace"
+        )
+    if (
+        codex.execution_stage
+        is CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+        and workspace_lifecycle is WorkspaceLifecycle.NOT_CREATED
+    ):
+        raise ValueError(
+            "provider_invocation_attempted requires a created Workspace"
+        )
+    if (
+        workspace_lifecycle is WorkspaceLifecycle.NOT_CREATED
+        and gate_commands
+    ):
+        raise ValueError("not_created Workspace cannot contain Gate execution")
+    cleanup_failed = (
+        workspace_lifecycle is WorkspaceLifecycle.CLEANUP_FAILED
+    )
+    cleanup_terminal = (
+        overall_status is Phase6OverallStatus.HARNESS_ERROR
+        and failure_kind is Phase6FailureKind.PROCESS_CLEANUP_ERROR
+    )
+    if cleanup_failed is not cleanup_terminal:
+        raise ValueError(
+            "cleanup_failed Workspace and process_cleanup_error Harness status "
+            "must be bidirectionally consistent"
+        )
+    if codex.status is ProviderExecutionStatus.FAILED and gate_commands:
+        raise ValueError("quality Gates must not run after failed Codex execution")
+
+    commands_completed_normally = bool(gate_commands) and all(
+        command.status in {CommandStatus.PASSED, CommandStatus.FAILED}
+        and command.termination.process_group_cleared
+        for command in gate_commands
+    )
+    quality_status = overall_status in {
+        Phase6OverallStatus.PASSED,
+        Phase6OverallStatus.FAILED,
+    }
+    if quality_status and (
+        codex.status is not ProviderExecutionStatus.SUCCEEDED
+        or not commands_completed_normally
+        or not diff.line_counts_complete
+        or workspace_lifecycle is not WorkspaceLifecycle.REMOVED
+    ):
+        raise ValueError(
+            "quality result requires complete Gate, diff, and Workspace Evidence"
+        )
+    if quality_status is not (metrics is not None):
+        raise ValueError(
+            "RunMetrics presence must match a complete quality result"
+        )
+    if gate_commands:
+        if not any(command.gate is GateKind.ACCEPTANCE for command in gate_commands):
+            raise ValueError("executed Gate requires acceptance commands")
+        if any(
+            command.started_at < codex.completed_at
+            or command.completed_at > terminal_at
+            for command in gate_commands
+        ):
+            raise ValueError(
+                "Gate timestamps must follow Codex and remain inside terminal time"
+            )
+
+    if metrics is None:
+        return
+    acceptance = [
+        command
+        for command in gate_commands
+        if command.gate is GateKind.ACCEPTANCE
+    ]
+    regression = [
+        command
+        for command in gate_commands
+        if command.gate is GateKind.REGRESSION
+    ]
+    lint = [
+        command for command in gate_commands if command.gate is GateKind.LINT
+    ]
+    typecheck = [
+        command
+        for command in gate_commands
+        if command.gate is GateKind.TYPECHECK
+    ]
+    expected_quality_pass = all(
+        command.status is CommandStatus.PASSED for command in gate_commands
+    )
+    expected_counts = (
+        sum(command.status is CommandStatus.PASSED for command in acceptance),
+        len(acceptance),
+        sum(command.status is CommandStatus.FAILED for command in regression),
+        sum(command.status is CommandStatus.FAILED for command in lint),
+        sum(command.status is CommandStatus.FAILED for command in typecheck),
+    )
+    actual_counts = (
+        metrics.acceptance_tests_passed,
+        metrics.acceptance_tests_total,
+        metrics.regression_failures,
+        metrics.lint_errors,
+        metrics.typecheck_errors,
+    )
+    if (
+        metrics.quality_gate_pass is not expected_quality_pass
+        or (
+            overall_status is Phase6OverallStatus.PASSED
+        )
+        is not expected_quality_pass
+        or actual_counts != expected_counts
+        or metrics.agent_duration_ms != codex.duration_ms
+        or metrics.total_duration_ms
+        != metrics.agent_duration_ms + metrics.evaluation_duration_ms
+        or metrics.agent_call_count != 1
+        or metrics.retry_count != 0
+        or metrics.changed_files != diff.changed_files
+        or metrics.added_lines != diff.added_lines
+        or metrics.deleted_lines != diff.deleted_lines
+        or metrics.usage_metrics != codex.usage_metrics
+    ):
+        raise ValueError(
+            "quality status, Metrics, Gate, Codex, and diff observations differ"
+        )
+
+
 class Phase6RecordingStartedEvent(ContractModel):
     schema_version: Literal["1.2"]
     sequence: Literal[0]
@@ -868,7 +1209,10 @@ class Phase6RecordingTerminalEvent(ContractModel):
     codex: CodexExecutionEvidence
     gate_executed: StrictBool
     gate_not_executed_reason: GateNotExecutedReason | None
+    gate_commands: list[CommandEvidence]
+    diff: DiffEvidence
     metrics: RunMetrics | None
+    workspace_lifecycle: WorkspaceLifecycle
 
     @field_validator("codex", mode="before")
     @classmethod
@@ -895,6 +1239,18 @@ class Phase6RecordingTerminalEvent(ContractModel):
     def terminal_state_is_coherent(self) -> Phase6RecordingTerminalEvent:
         if self.gate_not_executed_reason is GateNotExecutedReason.INPUT_CHANGED:
             raise ValueError("input_changed must not create a Recording")
+        _validate_phase6_execution_observations(
+            overall_status=self.overall_status,
+            failure_kind=self.failure_kind,
+            codex=self.codex,
+            gate_executed=self.gate_executed,
+            gate_not_executed_reason=self.gate_not_executed_reason,
+            gate_commands=self.gate_commands,
+            diff=self.diff,
+            metrics=self.metrics,
+            workspace_lifecycle=self.workspace_lifecycle,
+            terminal_at=self.occurred_at,
+        )
         if self.event_type == "run_completed":
             if (
                 (
@@ -1110,6 +1466,18 @@ class LiveRunArtifactV1_2(ContractModel):
             raise ValueError(
                 "Codex stdin byte total must match Prompt byte count"
             )
+        _validate_phase6_execution_observations(
+            overall_status=self.overall_status,
+            failure_kind=self.failure_kind,
+            codex=self.codex,
+            gate_executed=self.gate_executed,
+            gate_not_executed_reason=self.gate_not_executed_reason,
+            gate_commands=self.gate_commands,
+            diff=self.diff,
+            metrics=self.metrics,
+            workspace_lifecycle=self.workspace_lifecycle,
+            terminal_at=self.completed_at,
+        )
         if self.gate_executed != bool(self.gate_commands):
             raise ValueError("gate_executed must match Gate Evidence presence")
         if self.gate_executed is (
@@ -1486,6 +1854,7 @@ class PublicSuiteManifest(ContractModel):
     historical_sources: list[HistoricalSuiteSource]
     provider_coverage: list[ProviderCoverage]
     antigravity_blocker: Literal["upstream_artifact_signature_invalid"]
+    zero_call_run_publication: Literal["aggregate_only_no_run_record"]
     planned_outputs: list[StrictStr] = Field(min_length=1)
     automatic_winner_selected: Literal[False]
     leaderboard_generated: Literal[False]
@@ -1528,6 +1897,8 @@ class PublicSuiteManifest(ContractModel):
 
 
 class PublicRunRecord(ContractModel):
+    """One allowlisted attempted run; zero-call runs remain aggregate-only."""
+
     schema_version: Literal["1.0"]
     reviewed_commit: StrictStr = Field(pattern=COMMIT_PATTERN)
     experiment_id: StrictStr
@@ -2234,18 +2605,22 @@ def _validate_phase6_campaign(events: list[Phase6CampaignEvent]) -> None:
                 "run started and terminal identities differ"
             )
 
-    not_run_reasons = {
+    terminal_stop_reasons = {
         event.stop_reason
         for event in terminal
-        if event.status is CampaignRunStatus.NOT_RUN
+        if event.status
+        in {CampaignRunStatus.NOT_RUN, CampaignRunStatus.INTERRUPTED}
     }
-    if not_run_reasons and not_run_reasons != {finished.stop_reason}:
+    if (
+        terminal_stop_reasons
+        and terminal_stop_reasons != {finished.stop_reason}
+    ):
         raise Phase6ContractError(
-            "Campaign finished stop reason differs from not_run reason"
+            "Campaign finished stop reason differs from terminal stop reason"
         )
     if (
         finished.stop_reason is CampaignStopReason.INPUT_CHANGED
-        and CampaignStopReason.INPUT_CHANGED not in not_run_reasons
+        and CampaignStopReason.INPUT_CHANGED not in terminal_stop_reasons
     ):
         raise Phase6ContractError(
             "input_changed Campaign finish requires an input_changed not_run state"
@@ -2424,36 +2799,11 @@ def _safe_root(root: Path) -> Path:
     return resolved
 
 
-def _safe_listed_file(root: Path, relative: str) -> Path:
-    resolved_root = _safe_root(root)
-    relative = _relative_file(relative, "listed Artifact")
-    current = resolved_root
-    for component in PurePosixPath(relative).parts:
-        current /= component
-        try:
-            metadata = current.lstat()
-        except OSError as error:
-            raise Phase6PathError(f"listed Artifact is unavailable: {relative}") from error
-        if stat.S_ISLNK(metadata.st_mode):
-            raise Phase6PathError(f"listed Artifact path contains symlink: {relative}")
-    try:
-        resolved = current.resolve(strict=True)
-        metadata = current.stat(follow_symlinks=False)
-    except (OSError, RuntimeError) as error:
-        raise Phase6PathError(f"could not resolve listed Artifact: {relative}") from error
-    if not resolved.is_relative_to(resolved_root):
-        raise Phase6PathError("listed Artifact escapes the fixed Manifest root")
-    if not stat.S_ISREG(metadata.st_mode):
-        raise Phase6PathError("listed Artifact must be a regular file")
-    if metadata.st_nlink != 1:
-        raise Phase6PathError("listed Artifact hardlink is not allowed")
-    return resolved
-
-
 @dataclass(frozen=True)
 class LoadedPublicSuiteInputs:
     manifest: PublicSuiteManifest
     root: Path
+    directory_snapshots: tuple[DirectorySnapshot, ...]
     manifest_snapshot: FileSnapshot
     paths: dict[str, Path]
     bytes_by_path: dict[str, bytes]
@@ -2474,15 +2824,19 @@ def load_public_suite_inputs(
 ) -> LoadedPublicSuiteInputs:
     """Load exactly the Manifest and its explicitly listed input files."""
     resolved_root = _safe_root(root)
+    root_snapshot = _snapshot_directory(
+        resolved_root,
+        "Public Suite root",
+    )
     try:
         lexical_manifest = Path(os.path.abspath(manifest_path))
         relative_manifest = lexical_manifest.relative_to(resolved_root).as_posix()
     except (OSError, ValueError) as error:
         raise Phase6PathError("Public Suite Manifest must remain below root") from error
-    safe_manifest = _safe_listed_file(resolved_root, relative_manifest)
-    manifest_snapshot = _read_stable_regular_file(
-        safe_manifest,
-        "Public Suite Manifest",
+    manifest_snapshot, manifest_directories = _read_file_below_root(
+        root_snapshot=root_snapshot,
+        relative=relative_manifest,
+        label="Public Suite Manifest",
     )
     manifest = _load_canonical_model_bytes(
         manifest_snapshot.content,
@@ -2493,12 +2847,24 @@ def load_public_suite_inputs(
     bytes_by_path: dict[str, bytes] = {}
     snapshots_by_path: dict[str, FileSnapshot] = {}
     identities = {manifest_snapshot.identity}
+    directory_snapshot_by_path = {
+        snapshot.path: snapshot for snapshot in manifest_directories
+    }
     for reference in _manifest_references(manifest):
-        path = _safe_listed_file(resolved_root, reference.path)
-        snapshot = _read_stable_regular_file(
-            path,
-            f"listed Artifact {reference.path}",
+        snapshot, parent_directories = _read_file_below_root(
+            root_snapshot=root_snapshot,
+            relative=reference.path,
+            label=f"listed Artifact {reference.path}",
         )
+        for directory_snapshot in parent_directories:
+            previous = directory_snapshot_by_path.setdefault(
+                directory_snapshot.path,
+                directory_snapshot,
+            )
+            if previous.identity != directory_snapshot.identity:
+                raise Phase6PathError(
+                    "listed Artifact parent directory changed during load"
+                )
         if snapshot.identity in identities:
             raise Phase6PathError(
                 "Manifest and listed Artifacts must have distinct file identities"
@@ -2508,12 +2874,25 @@ def load_public_suite_inputs(
             raise Phase6ContractError(
                 f"listed Artifact hash differs: {reference.path}"
             )
-        paths[reference.path] = path
+        paths[reference.path] = snapshot.path
         bytes_by_path[reference.path] = snapshot.content
         snapshots_by_path[reference.path] = snapshot
+    directory_snapshots = tuple(
+        directory_snapshot_by_path[path]
+        for path in sorted(
+            directory_snapshot_by_path,
+            key=lambda item: (len(item.parts), item.as_posix()),
+        )
+    )
+    for index, directory_snapshot in enumerate(directory_snapshots):
+        _require_directory_snapshot_unchanged(
+            directory_snapshot,
+            f"Public Suite directory component {index}",
+        )
     return LoadedPublicSuiteInputs(
         manifest=manifest,
         root=resolved_root,
+        directory_snapshots=directory_snapshots,
         manifest_snapshot=manifest_snapshot,
         paths=paths,
         bytes_by_path=bytes_by_path,
@@ -2857,14 +3236,36 @@ def validate_public_suite_inputs(
 def _require_loaded_inputs_unchanged(
     loaded: LoadedPublicSuiteInputs,
 ) -> None:
-    _require_snapshot_unchanged(
-        loaded.manifest_snapshot,
-        "Public Suite Manifest",
+    root_snapshot = loaded.directory_snapshots[0]
+    for index, directory_snapshot in enumerate(loaded.directory_snapshots):
+        _require_directory_snapshot_unchanged(
+            directory_snapshot,
+            f"Public Suite directory component {index}",
+        )
+    manifest_relative = loaded.manifest_snapshot.path.relative_to(
+        loaded.root
+    ).as_posix()
+    current_manifest, _ = _read_file_below_root(
+        root_snapshot=root_snapshot,
+        relative=manifest_relative,
+        label="Public Suite Manifest",
     )
-    for relative, snapshot in loaded.snapshots_by_path.items():
-        _require_snapshot_unchanged(
-            snapshot,
-            f"listed Artifact {relative}",
+    if current_manifest != loaded.manifest_snapshot:
+        raise Phase6PathError("Public Suite Manifest changed after Manifest load")
+    for relative, file_snapshot in loaded.snapshots_by_path.items():
+        current, _ = _read_file_below_root(
+            root_snapshot=root_snapshot,
+            relative=relative,
+            label=f"listed Artifact {relative}",
+        )
+        if current != file_snapshot:
+            raise Phase6PathError(
+                f"listed Artifact {relative} changed after Manifest load"
+            )
+    for index, directory_snapshot in enumerate(loaded.directory_snapshots):
+        _require_directory_snapshot_unchanged(
+            directory_snapshot,
+            f"Public Suite directory component {index}",
         )
 
 
@@ -2992,6 +3393,33 @@ def _validate_primary_live_bindings(
             strict=True,
         )
     }
+    derived_provider_calls: dict[str, int | None] = {}
+    for run_id, event in terminal.items():
+        artifact = evidence_by_run.get(run_id)
+        if artifact is not None:
+            derived_count = _provider_call_count_from_codex(artifact.codex)
+            if event.provider_call_count != derived_count:
+                raise Phase6ContractError(
+                    "Campaign Provider call count differs from Codex Evidence"
+                )
+            derived_provider_calls[run_id] = derived_count
+        elif event.status is CampaignRunStatus.NOT_RUN:
+            derived_provider_calls[run_id] = 0
+        elif event.status is CampaignRunStatus.INTERRUPTED:
+            derived_provider_calls[run_id] = event.provider_call_count
+        else:
+            raise Phase6ContractError(
+                "attempted terminal run lacks Provider call Evidence"
+            )
+    if (
+        sum(value or 0 for value in derived_provider_calls.values())
+        != campaign.finished.provider_call_count
+        or sum(value is None for value in derived_provider_calls.values())
+        != campaign.finished.provider_call_count_unknown_runs
+    ):
+        raise Phase6ContractError(
+            "Campaign finished Provider call totals differ from run Evidence"
+        )
     for run_id, artifact in evidence_by_run.items():
         run = planned.get(run_id)
         event = terminal[run_id]
@@ -3060,6 +3488,10 @@ def _validate_primary_live_bindings(
             or recording.terminal.gate_executed is not artifact.gate_executed
             or recording.terminal.gate_not_executed_reason
             is not artifact.gate_not_executed_reason
+            or recording.terminal.gate_commands != artifact.gate_commands
+            or recording.terminal.diff != artifact.diff
+            or recording.terminal.workspace_lifecycle
+            is not artifact.workspace_lifecycle
             or recording.started.occurred_at != artifact.started_at
             or recording.terminal.occurred_at != artifact.completed_at
             or evidence_hash_by_run.get(run_id) is None
@@ -3090,6 +3522,22 @@ def _validate_primary_live_bindings(
             raise Phase6ContractError(
                 "Campaign run terminal timestamp precedes Artifact completion"
             )
+
+
+def _provider_call_count_from_codex(
+    codex: CodexExecutionEvidence,
+) -> Literal[0, 1]:
+    if (
+        codex.execution_stage
+        is CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
+    ):
+        return 1
+    if codex.execution_stage in {
+        CodexExecutionStage.PREFLIGHT_NOT_COMPLETED,
+        CodexExecutionStage.PREFLIGHT_COMPLETED,
+    }:
+        return 0
+    raise Phase6ContractError("Codex execution stage has no Provider call mapping")
 
 
 def _campaign_artifact_state(

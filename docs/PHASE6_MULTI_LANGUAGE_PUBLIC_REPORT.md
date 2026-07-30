@@ -129,6 +129,24 @@ run ID／task／Workflow／repetition identity、Planと全terminal run IDの完
 `not_run`の理由はCampaign finishedのstop reasonと一致させる。Evidence／Recordingの必要集合は
 `completed`／`failed` Campaign状態から導出し、不足、余分、重複を拒否する。
 
+`interrupted`は次の状態に固定する。
+
+| Observation | Required / allowed value |
+|---|---|
+| status | `interrupted` |
+| outcome / stop reason | `human_interruption / human_interruption` |
+| Gate | 未実行 |
+| Provider call count | 中断位置を確定できれば`0`または`1`、それ以外は`unknown` |
+| failure kind | なし |
+| failure count | 対象外 |
+| `fail_fast` / `max_failures` | 対象外 |
+
+`unknown`を許すのはEvidenceを生成しないこの状態だけである。
+
+Evidenceを持つterminal runのProvider call数はCampaignの自己申告を正本にしない。
+CodexExecutionEvidenceの`provider_invocation_attempted`から`1`、preflight段階で停止した
+状態から`0`を導出し、run eventとCampaign finishedの合計へ照合する。
+
 ## Output contract rejection
 
 `output_contract_violation`はProvider成功後、期待した安全な出力契約を満たさず、Gateを
@@ -142,8 +160,9 @@ run ID／task／Workflow／repetition identity、Planと全terminal run IDの完
 
 Public Suite Manifest 1.0はPrimary／Historicalを分離し、入力Artifactの相対pathと
 SHA-256、Plan、Campaign、Historical Verification Record、Provider coverage、
-Antigravity blocker、renderer version、予定出力、`data_cutoff_at`を明示列挙する。
-directory自動探索で入力を追加しない。
+Antigravity blocker、renderer version、予定出力、`data_cutoff_at`を明示列挙する。また
+`zero_call_run_publication=aggregate_only_no_run_record`を固定し、directory自動探索で
+入力を追加しない。
 
 `data_cutoff_at`は列挙されたCampaign terminalとAcceptance／Historical verificationの
 timestampの最大値である。Manifest値と再計算値を完全一致させ、UTCのcanonical RFC 3339
@@ -153,11 +172,20 @@ loaderは呼出側が渡した固定rootを基準とし、Manifest自身と列�
 path、`..`、非canonical path、正規化後重複、symlink、hardlink、特殊file、root外参照を
 拒否し、各fileのSHA-256をManifestへ照合する。
 
-Manifest自身はresolve前にsymlinkを拒否する。Manifestと各入力はopen前、descriptor読取前後、
-close後のdevice／inode／mode／link count／size／mtime／ctimeが一致する場合だけsnapshot化
-する。strict loaderはhash検証済みsnapshot bytesだけをparseし、pathから再読込しない。
-cross-artifact validationの開始時と終了時に同一pathを再検証し、Manifest load後の差し替えや
-内容変更を拒否する。
+Manifest自身はresolve前にsymlinkを拒否する。固定rootを`O_NOFOLLOW`相当で開き、そのFDから
+各親directoryとfileを相対openする。rootと全親directoryはdevice／inode／mode、Manifestと
+各入力fileはdevice／inode／mode／link count／size／mtime／ctimeが読取前後で一致する場合
+だけsnapshot化する。strict loaderはhash検証済みsnapshot bytesだけをparseし、pathから
+再読込しない。cross-artifact validationの開始時と終了時には全path componentのsymlinkと
+identityおよびfile snapshotを再検証し、root／中間directory／fileの差し替えや内容変更を
+拒否する。
+
+LiveRunArtifact 1.2とRecording 1.2は同じGate、diff、Metrics、workspace lifecycle観測を持つ。
+`passed`／`failed`のquality結果はCodex成功、全Gate commandの正常終了、完全なdiff line
+count、`workspace_lifecycle=removed`、MetricsとGate集計の一致を必須とする。`passed`は全
+Gate成功かつ`quality_gate_pass=true`、`failed`は通常終了したGateの不合格かつ
+`quality_gate_pass=false`に固定する。`cleanup_failed`を観測した場合はquality／Provider
+結果より`harness_error / process_cleanup_error`を優先し、逆方向の対応も要求する。
 
 ## Public allowlist and checksum trust
 
@@ -168,7 +196,8 @@ diff統計、Usage欠測状態、実行期間だけを許可する。
 
 Prompt本文、raw Provider output、agent message、reasoning、thread ID、絶対path、
 認証情報、secretはfieldとして持たない。Usage欠損を0へ変換せず、`missing`と`null`で保つ。
-`input_changed`はProvider callがないためPublic Run Recordを生成せず、言語集計だけに残す。
+0-call terminal run（`input_changed`とpreflight停止を含む）はPublic Run Recordを生成せず、
+言語集計だけに残す。Public Run Recordの`provider_call_count`は`1`に固定する。
 `run_metrics_available`はduration／diff統計の完全な有無と一致させる。Gate未実行時は
 Acceptance／Regression／lint／typecheck値をすべて0とし、`acceptance_passed`は
 `acceptance_total`を超えてはならない。overall status、failure kind、Gate状態、Metrics、

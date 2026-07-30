@@ -27,6 +27,7 @@ from agentlab.models import (
     CodexTerminalEvent,
     CommandEvidence,
     CommandStatus,
+    DiffEvidence,
     GateKind,
     LiveFailureKind,
     Provider,
@@ -80,6 +81,7 @@ from agentlab.phase6 import (
     ToolchainIdentity,
     WorkflowExperimentSpecV2_1,
     WorkflowPlanV1_2,
+    _provider_call_count_from_codex,
     _validate_primary_live_bindings,
     canonical_json_bytes,
     derive_language_status,
@@ -311,6 +313,7 @@ def _suite_manifest(
         historical_sources=[],
         provider_coverage=_coverage(),
         antigravity_blocker="upstream_artifact_signature_invalid",
+        zero_call_run_publication="aggregate_only_no_run_record",
         planned_outputs=[
             "checksums.json",
             "release-metadata.json",
@@ -620,6 +623,17 @@ def _successful_live_pair(
         prompt_bytes=prompt_bytes,
     )
     metrics = _passing_metrics()
+    gate_commands = _passing_gate_commands()
+    diff = DiffEvidence(
+        changed_files=[],
+        binary_files=[],
+        added_lines=0,
+        deleted_lines=0,
+        unified_diff="",
+        diff_truncated=False,
+        line_counts_complete=True,
+        collection_error=None,
+    )
     started = Phase6RecordingStartedEvent(
         schema_version="1.2",
         sequence=0,
@@ -657,7 +671,10 @@ def _successful_live_pair(
         codex=codex,
         gate_executed=True,
         gate_not_executed_reason=None,
+        gate_commands=gate_commands,
+        diff=diff,
         metrics=metrics,
+        workspace_lifecycle=WorkspaceLifecycle.REMOVED,
     )
     recording = Phase6Recording(started, terminal)
     recording_sha256 = hashlib.sha256(
@@ -692,17 +709,8 @@ def _successful_live_pair(
         codex=codex,
         gate_executed=True,
         gate_not_executed_reason=None,
-        gate_commands=_passing_gate_commands(),
-        diff={
-            "changed_files": [],
-            "binary_files": [],
-            "added_lines": 0,
-            "deleted_lines": 0,
-            "unified_diff": "",
-            "diff_truncated": False,
-            "line_counts_complete": True,
-            "collection_error": None,
-        },
+        gate_commands=gate_commands,
+        diff=diff,
         metrics=metrics,
         workspace_lifecycle=WorkspaceLifecycle.REMOVED,
         recording_sha256=recording_sha256,
@@ -1055,6 +1063,41 @@ def test_cleanup_failure_has_priority_over_other_failure_kinds() -> None:
         )
 
 
+def test_interrupted_state_has_fixed_non_failure_observations() -> None:
+    valid = {
+        "schema_version": "1.2",
+        "sequence": 1,
+        "event_type": "run_state",
+        "run_id": "run-one",
+        "task_id": "task",
+        "workflow": "one_shot",
+        "repetition_index": 0,
+        "status": "interrupted",
+        "outcome": "human_interruption",
+        "stop_reason": "human_interruption",
+        "provider_call_count": None,
+        "gate_executed": False,
+        "counted_failure": False,
+        "fail_fast_applies": False,
+        "max_failures_applies": False,
+        "failure_kind": None,
+        "occurred_at": T0,
+    }
+    assert (
+        Phase6CampaignRunEvent.model_validate(valid).stop_reason
+        is CampaignStopReason.HUMAN_INTERRUPTION
+    )
+    with pytest.raises(ValidationError, match="human_interruption"):
+        Phase6CampaignRunEvent.model_validate(
+            {
+                **valid,
+                "stop_reason": "fail_fast",
+                "gate_executed": True,
+                "failure_kind": "quality_gate_failure",
+            }
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -1104,6 +1147,67 @@ def test_cross_validator_rejects_campaign_artifact_outcome_mismatch(
     )
 
     with pytest.raises(Phase6ContractError, match="identities differ"):
+        _validate_primary_live_bindings(
+            source=source,
+            spec=spec,
+            plan=plan,
+            campaign=LoadedPhase6Campaign(tuple(events)),
+            evidence=artifacts,
+            recordings=recordings,
+        )
+
+
+def test_cross_validator_derives_provider_calls_from_codex_evidence(
+    tmp_path: Path,
+) -> None:
+    source, spec, plan, campaign, artifacts, recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    events = list(campaign.events)
+    terminal = events[2]
+    assert isinstance(terminal, Phase6CampaignRunEvent)
+    events[2] = terminal.model_copy(update={"provider_call_count": 0})
+    finished = events[-1]
+    assert isinstance(finished, Phase6CampaignFinishedEvent)
+    events[-1] = finished.model_copy(update={"provider_call_count": 1})
+
+    with pytest.raises(Phase6ContractError, match="Codex Evidence"):
+        _validate_primary_live_bindings(
+            source=source,
+            spec=spec,
+            plan=plan,
+            campaign=LoadedPhase6Campaign(tuple(events)),
+            evidence=artifacts,
+            recordings=recordings,
+        )
+
+
+def test_provider_call_derivation_distinguishes_preflight_and_invocation(
+    tmp_path: Path,
+) -> None:
+    _source, _spec, _plan, _campaign, artifacts, _recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    codex = artifacts[0].codex
+    assert _provider_call_count_from_codex(codex) == 1
+    preflight = codex.model_copy(
+        update={"execution_stage": CodexExecutionStage.PREFLIGHT_COMPLETED}
+    )
+    assert _provider_call_count_from_codex(preflight) == 0
+
+
+def test_cross_validator_recomputes_campaign_finished_provider_calls(
+    tmp_path: Path,
+) -> None:
+    source, spec, plan, campaign, artifacts, recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    events = list(campaign.events)
+    finished = events[-1]
+    assert isinstance(finished, Phase6CampaignFinishedEvent)
+    events[-1] = finished.model_copy(update={"provider_call_count": 1})
+
+    with pytest.raises(Phase6ContractError, match="finished Provider call totals"):
         _validate_primary_live_bindings(
             source=source,
             spec=spec,
@@ -1346,6 +1450,55 @@ def test_live_artifact_and_recording_reject_input_changed(
     )
     with pytest.raises(ValidationError, match="must not create"):
         Phase6RecordingTerminalEvent.model_validate(terminal_payload)
+
+
+@pytest.mark.parametrize("target", ["artifact", "recording"])
+def test_passed_state_rejects_failed_gate_command(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    _source, _spec, _plan, _campaign, artifacts, recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    model = artifacts[0] if target == "artifact" else recordings[0].terminal
+    payload = model.model_dump(mode="json")
+    payload["started_at" if target == "artifact" else "occurred_at"] = T0
+    if target == "artifact":
+        payload["completed_at"] = T0
+    payload["gate_commands"][0]["status"] = "failed"
+    payload["gate_commands"][0]["return_code"] = 1
+    selected = (
+        LiveRunArtifactV1_2
+        if target == "artifact"
+        else Phase6RecordingTerminalEvent
+    )
+
+    with pytest.raises(ValidationError, match="quality status"):
+        selected.model_validate(payload)
+
+
+@pytest.mark.parametrize("target", ["artifact", "recording"])
+def test_passed_state_rejects_cleanup_failed_workspace(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    _source, _spec, _plan, _campaign, artifacts, recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    model = artifacts[0] if target == "artifact" else recordings[0].terminal
+    payload = model.model_dump(mode="json")
+    payload["started_at" if target == "artifact" else "occurred_at"] = T0
+    if target == "artifact":
+        payload["completed_at"] = T0
+    payload["workspace_lifecycle"] = "cleanup_failed"
+    selected = (
+        LiveRunArtifactV1_2
+        if target == "artifact"
+        else Phase6RecordingTerminalEvent
+    )
+
+    with pytest.raises(ValidationError, match="bidirectionally consistent"):
+        selected.model_validate(payload)
 
 
 def test_language_status_is_derived_without_public_run_record() -> None:
@@ -1630,6 +1783,14 @@ def test_public_run_record_rejects_contradictory_state(
 ) -> None:
     payload = _public_output_record_payload()
     payload.update(changes)
+
+    with pytest.raises(ValidationError):
+        PublicRunRecord.model_validate(payload)
+
+
+def test_public_run_record_excludes_zero_call_terminal_runs() -> None:
+    payload = _public_output_record_payload()
+    payload["provider_call_count"] = 0
 
     with pytest.raises(ValidationError):
         PublicRunRecord.model_validate(payload)
@@ -1964,6 +2125,55 @@ def test_suite_rejects_file_replacement_after_hash_verification(
 
     with pytest.raises(Phase6PathError, match="changed after Manifest load"):
         validate_public_suite_inputs(loaded)
+
+
+def test_suite_rejects_root_replacement_after_load(tmp_path: Path) -> None:
+    suite_root = tmp_path / "suite-root"
+    suite_root.mkdir()
+    _manifest_path, loaded = _write_ready_suite(suite_root)
+    moved = tmp_path / "moved-suite-root"
+    suite_root.rename(moved)
+    suite_root.symlink_to(moved, target_is_directory=True)
+    try:
+        with pytest.raises(Phase6PathError):
+            validate_public_suite_inputs(loaded)
+    finally:
+        suite_root.unlink()
+        moved.rename(suite_root)
+
+
+def test_suite_rejects_intermediate_directory_replacement(
+    tmp_path: Path,
+) -> None:
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    inner_manifest_path, _inner_loaded = _write_ready_suite(inputs)
+    inner_manifest = load_public_suite_manifest(inner_manifest_path)
+    source_raw = inner_manifest.primary_sources[0].model_dump(mode="json")
+    for field in (
+        "spec",
+        "fixture_manifest",
+        "fixture_acceptance",
+        "diff_policy",
+        "plan",
+    ):
+        source_raw[field]["path"] = f"inputs/{source_raw[field]['path']}"
+    source = PrimarySuiteSource.model_validate(source_raw)
+    outer_manifest_path = tmp_path / "suite-manifest.json"
+    outer_manifest_path.write_bytes(
+        canonical_json_bytes(_suite_manifest(source))
+    )
+    loaded = load_public_suite_inputs(outer_manifest_path, root=tmp_path)
+
+    moved = tmp_path / "moved-inputs"
+    inputs.rename(moved)
+    inputs.symlink_to(moved, target_is_directory=True)
+    try:
+        with pytest.raises(Phase6PathError):
+            validate_public_suite_inputs(loaded)
+    finally:
+        inputs.unlink()
+        moved.rename(inputs)
 
 
 def test_suite_rejects_spec_and_manifest_reference_path_mismatch(
