@@ -3,12 +3,15 @@
 ## ステータス
 
 - Phase: 5
-- Phaseステータス: 実施中
+- Phaseステータス: Blocked
 - Slice 5Aステータス: 実装済み、オフライン検証済み
-- Slice 5Bステータス: 設計のみ。Prompt transport判定: not_verified (Blocked / Deferred、実装は未承認)
+- Slice 5Bステータス: Blocked。binary受入拒否、Prompt transport判定: `not_verified`
+- Slice 5Cステータス: Blocked。Live前提条件未達、実行未承認
+- Blocker: `upstream_artifact_signature_invalid`
 - Prompt Transport Decision: [SLICE_5B_PROMPT_TRANSPORT_DECISION.md](decisions/SLICE_5B_PROMPT_TRANSPORT_DECISION.md) (Status: Blocked / Deferred)
 - 設計日: 2026-07-28
 - Slice 5A是正およびSlice 5B設計更新日: 2026-07-29
+- 上流artifact受入停止日: 2026-07-30
 - 設計ベース: `feature/phase5` の
   `d3a8cf814623ea0bdd071d12c948a582f38a827d`
 - 実装担当: Antigravity
@@ -115,6 +118,85 @@ AgentLabはretry、fallback、conversation resume、replacement runを行って�
 ならない。Antigravityのserviceまたはharness内部で行われるretryはProviderの
 挙動であり、AgentLabのretryではない。streamに安定した型付きfieldとして
 公開されない限り、`0`ではなくunavailableとして記録する。
+
+## 上流artifact受入Gateと停止判定
+
+2026-07-30に、公式manifestから取得したAntigravity CLI 1.1.8 `darwin_arm64`
+payloadを実行前に静的監査した。これはProvider能力やmodel性能の試験ではなく、CLI binaryを
+配置・実行してよいか判断する受入Gateである。
+
+| Scope | Status | Reason |
+|---|---|---|
+| Phase 5 | Blocked | Upstream macOS artifact signature verification failed |
+| Slice 5B | Blocked | CLI binary was rejected before execution |
+| Slice 5C | Blocked | Live execution prerequisites were not satisfied |
+
+正式な判定は次のとおりである。
+
+- `payload_integrity`: `verified`
+- `archive_safety`: `verified`
+- `platform_signature`: `failed`
+- `binary_acceptance`: `rejected`
+- `stdin_transport`: `not_verified`
+- `blocker`: `upstream_artifact_signature_invalid`
+
+### 停止した工程と検証結果
+
+停止したのは、公式payloadを標準配置先へ置く前のbinary受入工程である。
+manifest SHA-256は
+`d241a825d79d112a73f14bb7a215a5ab84bc3637d8015fa800eac1b66ccd08ca`であり、
+manifest記載SHA-512とpayload実測SHA-512は完全一致した。
+
+PASSした項目:
+
+- manifestおよびpayload checksum
+- archiveが単一の通常file `antigravity`だけを含み、絶対path、`..`、symlink、
+  hardlink、device entry、追加installerを含まないこと
+- payloadがMach-O 64-bit executable、arm64であること
+- embedded signature、TeamIdentifier、Hardened Runtimeが存在すること
+
+FAILした項目:
+
+- macOS platform signature
+  - command: `codesign --verify --deep --strict`
+  - exit code: `1`
+  - error: `invalid signature (code or signature have been modified)`
+
+checksum一致は、取得payloadがmanifest指定artifactと一致することを示すが、platform
+signatureの成功を代替しない。この結果だけから改ざん、悪意、Antigravity CLI全般の危険性を
+断定しない。上流の署名工程、archive packaging、または配布artifactの不具合を含む可能性が
+あるものの、原因は未確定である。安全性を確認できない配布artifactとして受入を拒否する。
+
+binaryは`/Users/apple/.local/bin`へ配置せず、展開済みpayloadも実行していない。
+`agy --version`、`agy --help`、認証、Provider call、Prompt送信、quota利用はすべて0件で
+ある。安全Gateが意図どおり未検証binaryの実行前に停止した。
+
+### 影響範囲と禁止する回避策
+
+影響範囲はAntigravity ProviderのSlice 5BおよびSlice 5Cだけである。完了済みのSlice 5A、
+Phase 0〜4、Codex Provider、Replay、Safe Runner、Workflow A/Bの状態は変更しない。
+実装不具合やローカルRunner障害を原因とする停止ではない。
+
+次の回避策は禁止する。
+
+- 自己署名
+- 署名削除
+- quarantine attribute解除
+- Gatekeeper回避
+- 未検証binaryの配置または実行
+
+### 再開条件と次アクション
+
+上流から説明が提供されただけでは再開しない。次をすべて満たす必要がある。
+
+1. 新しい公式payload、または公式修正手順を適用したartifactを取得する。
+2. checksum、archive安全性、platform、architectureを再検証する。
+3. ローカル環境で`codesign --verify --deep --strict`が成功する。
+4. その後、別途承認された手順でのみ標準配置とread-only Preflightへ進む。
+5. stdin transportが確認できるまではLiveへ進まない。
+
+現在の次アクションは、上流の修正版または公式修正手順を待つことである。必要に応じて、
+改ざんや原因を断定しない再現情報を上流へ報告する。
 
 ## スコープ
 
@@ -441,16 +523,26 @@ uv run agentlab doctor --json
 
 ### Slice 5B: Headless Runner準備とオフライン統合
 
-**ステータス: 設計のみ。実装は未承認。**
+**ステータス: Blocked。binary受入拒否、実装未承認。**
 
 Slice 5BはSafe Subprocess runner境界を準備し、短時間で終了する合成local
 executableだけで証明する。実際の`agy`を起動する、Promptを送信する、認証する、
 model catalogまたはquotaへaccessする、外部networkを使用する、Live Artifactを
 作成する、のいずれも行ってはならない。
 
+実装開始前提となる公式CLI binaryは、上記の
+`upstream_artifact_signature_invalid`により実行前に受入を拒否した。このblockerが
+厳密な再開条件を満たして解消されるまで、Prompt transport判断とは独立にSlice 5Bを
+開始しない。
+
 #### BlockerとなるPrompt transport判断
 
-2026-07-29に調査結果と判断を [Slice 5B Prompt Transport Decision Record](decisions/SLICE_5B_PROMPT_TRANSPORT_DECISION.md) として記録した。公式 Changelog に stdin 経由の piped Prompt に関する記述は存在するものの、明確な実行構文や動作制約が公式ドキュメントで確定できないため判定は `not_verified` とし、Slice 5B は Blocked / Deferred （実装保留）とする。
+2026-07-29に調査結果と判断を
+[Slice 5B Prompt Transport Decision Record](decisions/SLICE_5B_PROMPT_TRANSPORT_DECISION.md)
+として記録した。公式Changelogにstdin経由のpiped Promptに関する記述は存在するものの、
+明確な実行構文や動作制約が公式ドキュメントで確定できないため、transport判定は
+`not_verified`のままである。これは上流artifact受入blockerとは独立したfail-closed条件で
+あり、Slice 5Bの正式な状態を`Blocked`とする。
 
 文書化されたCLI契約では、Prompt値を引き続きargvへ置く。AgentLabのrepository契約は
 Prompt内容のargv格納を引き続き禁止し、stdinだけでのPrompt deliveryを許可する。
@@ -471,6 +563,7 @@ temporary fileの規約を、production用Antigravity Prompt transportとして�
 
 #### 開始条件
 
+- 上流artifact受入blockerが厳密な再開条件を満たして解消されていること
 - Slice 5A是正がreview済みで、すべてのオフライン検証がpassしていること
 - 上記のPrompt transport判断が、別のreview済み設計変更として記録されていること
 - 厳密なローカル`agy X.Y.Z`と必須help markerがreviewされ、1つのimmutable profileに
@@ -513,7 +606,7 @@ temporary fileの規約を、production用Antigravity Prompt transportとして�
 
 ### Slice 5C: Live Antigravity smokeおよびQuality Gate検証
 
-**ステータス: 未設計、実行未承認。**
+**ステータス: Blocked。Live前提条件未達、未設計、実行未承認。**
 
 Slice 5Cは、review済みSlice 5B実装と2回目の明示的な人間の承認後に限って開始する。
 `--confirm-live-antigravity`を追加し、新しいexperimentおよびartifact rootを使用し、

@@ -121,23 +121,39 @@ Plan、Campaign、Recording、Evidence、reportはGit管理外に保持する。
 再生成を行っていない。Campaign 002も再実行しない。Phase 3 manual Live累計8試行は変更せず、
 Phase 4 Campaignのcall数と分離する。この固定Task、Prompt、Fixture、Gate、各3反復、
 当該環境・実行時期に限定された結果であり、一般的なモデル性能、統計的有意差、普遍的な
-Workflow優位性を示さない。受入条件を満たしたためPhase 4は`Complete`、Phase 5は
-`Current`とする。
+Workflow優位性を示さない。受入条件を満たしたためPhase 4は`Complete`である。Phase 5は
+後述する上流artifact受入blockerにより`Blocked`とする。
 
 ## Phase 5: Antigravity CLI Provider
 
-**Status: Current**
+**Status: Blocked**
 
 **目的:** Antigravity CLIを同じProvider境界へ接続し、Provider比較を可能にする。
 
 **現在の範囲:** 2026-07-28に
 [offline設計](ANTIGRAVITY_PROVIDER.md)を確定し、2026-07-29にSlice 5Aのversion付き契約、
 strict `stream-json` parser、read-only version/help preflight、redaction済みEvidence、
-fake `agy`受入を是正・補完した。Slice 5BはHeadless Runner readinessとoffline統合の
-設計だけを確定し、実装は承認していない。実`agy -p`、認証、model catalog、quota利用、
-Live、Provider比較も承認していない。公式headless interfaceではPromptがargvへ載るため、
-公式 Changelog に stdin 経由の piped Prompt に関する記述は存在するものの、明確な実行構文や制約が確定できないため判定を `not_verified` とし、
-[Slice 5B Prompt Transport Decision Record](decisions/SLICE_5B_PROMPT_TRANSPORT_DECISION.md) に基づき Slice 5B 実装は Blocked / Deferred（保留・fail closed）とする。
+fake `agy`受入を是正・補完した。2026-07-30に公式Antigravity CLI 1.1.8
+`darwin_arm64` payloadを実行前に受入検証した。manifest記載SHA-512とpayload実測SHA-512は
+完全一致し、archiveは単一の通常fileで危険なentryを含まず、Mach-O arm64であることを
+確認した。一方、embedded signatureが存在するにもかかわらず、
+`codesign --verify --deep --strict`はexit code 1と
+`invalid signature (code or signature have been modified)`で失敗した。改ざんや悪意は
+断定せず、原因未確定の上流署名工程、archive packaging、または配布artifactの不具合を
+含み得る外部blocker `upstream_artifact_signature_invalid`として扱う。binaryは配置も
+実行もしておらず、実装不具合やローカルRunner障害による停止ではない。
+
+| Scope | Status | Reason |
+|---|---|---|
+| Phase 5 | Blocked | Upstream macOS artifact signature verification failed |
+| Slice 5B | Blocked | CLI binary was rejected before execution |
+| Slice 5C | Blocked | Live execution prerequisites were not satisfied |
+
+公式Changelogにstdin経由のpiped Promptへの言及はあるが、明確な実行構文や制約は
+確定できていないため、stdin transportも`not_verified`のままとする。
+[Slice 5B Prompt Transport Decision Record](decisions/SLICE_5B_PROMPT_TRANSPORT_DECISION.md)
+のfail-closed判断は維持する。実`agy`、認証、Provider call、Prompt送信、quota利用、
+Live、Provider比較は0件である。
 
 **実装済み成果物:** Antigravity Evidence 1.0/1.1、構造化version/help preflight、
 profile選択境界、event/usage正規化、raw非永続化、process-group回収、合成fake `agy`受入。
@@ -148,6 +164,14 @@ vertical slice、Provider比較Spec・scheduler・report。
 **Slice 5A受入条件:** 外部AI、network、認証、quota、実Antigravity Provider callを0件に
 保ち、Promptやraw streamを永続化せず、失敗分類を分離し、既存schemaとPhase 0〜4の互換性を
 維持する。
+
+**再開条件:** 上流から説明が提供されただけでは再開しない。新しい公式payload、または
+公式修正手順を適用したartifactを取得し、checksum、archive安全性、platform、
+architectureを再検証したうえで、ローカル環境の
+`codesign --verify --deep --strict`が成功することを必須とする。その後も、別途承認された
+手順でのみ配置とread-only Preflightへ進む。stdin transportを確認できるまではLiveへ
+進まない。当面は上流の修正版または公式修正手順を待ち、必要に応じて再現情報を上流へ
+報告する。
 
 ## Phase 6: Multi-language Fixtures and Public Report
 
