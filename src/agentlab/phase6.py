@@ -1125,6 +1125,32 @@ def _validate_phase6_execution_observations(
             "unsupported_platform must match Codex runtime-precheck Evidence"
         )
 
+    evidence_error_observed = (
+        (
+            codex.status is ProviderExecutionStatus.FAILED
+            and codex.failure_kind is LiveFailureKind.EVIDENCE_ERROR
+        )
+        or (
+            codex.status is ProviderExecutionStatus.SUCCEEDED
+            and diff.collection_error is not None
+        )
+    )
+    evidence_error_expected = (
+        evidence_error_observed
+        and not cleanup_failed_observed
+        and not gate_harness_observed
+        and not unsupported_observed
+    )
+    evidence_error_terminal = (
+        overall_status is Phase6OverallStatus.HARNESS_ERROR
+        and failure_kind is Phase6FailureKind.EVIDENCE_ERROR
+    )
+    if evidence_error_expected is not evidence_error_terminal:
+        raise ValueError(
+            "evidence_error requires matching Codex Evidence failure or an "
+            "explicit post-Codex Evidence collection error"
+        )
+
     commands_completed_normally = bool(gate_commands) and all(
         command.status in {CommandStatus.PASSED, CommandStatus.FAILED}
         and command.termination.process_group_cleared
@@ -2198,12 +2224,6 @@ class PublicLanguageReport(ContractModel):
             raise ValueError("language run counts do not match the terminal taxonomy")
         if sum(self.gate_not_executed_reason.values()) != self.gate_not_executed_runs:
             raise ValueError("Gate non-execution reasons must match their total")
-        if self.output_rejected_runs > self.failed_runs:
-            raise ValueError("output_rejected_runs must not exceed failed_runs")
-        if self.gate_not_executed_runs > self.scheduled_runs:
-            raise ValueError(
-                "gate_not_executed_runs must not exceed scheduled_runs"
-            )
         if (
             self.gate_not_executed_reason.get(
                 GateNotExecutedReason.OUTPUT_CONTRACT_VIOLATION,
@@ -2234,6 +2254,12 @@ class PublicLanguageReportV1_1(PublicLanguageReport):
     def provider_call_aggregates_are_coherent(
         self,
     ) -> PublicLanguageReportV1_1:
+        if self.output_rejected_runs > self.failed_runs:
+            raise ValueError("output_rejected_runs must not exceed failed_runs")
+        if self.gate_not_executed_runs > self.scheduled_runs:
+            raise ValueError(
+                "gate_not_executed_runs must not exceed scheduled_runs"
+            )
         if (
             self.zero_call_runs > self.gate_not_executed_runs
             or self.provider_call_count_unknown_runs > self.interrupted_runs
@@ -2380,8 +2406,28 @@ def derive_public_language_counts(
 def validate_public_language_report_campaign(
     report: PublicLanguageReportV1_1,
     campaign: LoadedPhase6Campaign,
+    *,
+    source: PrimarySuiteSource,
+    plan: WorkflowPlanV1_2,
+    evidence_run_ids: set[str],
 ) -> None:
-    """Reject a public aggregate that differs from its listed Campaign."""
+    """Bind a public aggregate to its Primary source, Plan, and Campaign."""
+    derived_status = validate_expected_language_status(
+        source,
+        campaign=campaign,
+        evidence_run_ids=evidence_run_ids,
+    )
+    if (
+        report.language is not source.language
+        or report.language is not plan.language
+    ):
+        raise Phase6ContractError(
+            "Public Language Report language differs from Primary source or Plan"
+        )
+    if report.status is not derived_status:
+        raise Phase6ContractError(
+            "Public Language Report status differs from derived language status"
+        )
     derived = derive_public_language_counts(campaign)
     for field_name in (
         "scheduled_runs",
@@ -3689,6 +3735,37 @@ def _validate_primary_live_bindings(
         event = terminal[run_id]
         campaign_run_started = campaign_run_starts[run_id]
         recording = recording_by_run[run_id]
+        try:
+            _validate_phase6_execution_observations(
+                overall_status=artifact.overall_status,
+                failure_kind=artifact.failure_kind,
+                codex=artifact.codex,
+                gate_executed=artifact.gate_executed,
+                gate_not_executed_reason=artifact.gate_not_executed_reason,
+                gate_commands=artifact.gate_commands,
+                diff=artifact.diff,
+                metrics=artifact.metrics,
+                workspace_lifecycle=artifact.workspace_lifecycle,
+                terminal_at=artifact.completed_at,
+            )
+            _validate_phase6_execution_observations(
+                overall_status=recording.terminal.overall_status,
+                failure_kind=recording.terminal.failure_kind,
+                codex=recording.terminal.codex,
+                gate_executed=recording.terminal.gate_executed,
+                gate_not_executed_reason=(
+                    recording.terminal.gate_not_executed_reason
+                ),
+                gate_commands=recording.terminal.gate_commands,
+                diff=recording.terminal.diff,
+                metrics=recording.terminal.metrics,
+                workspace_lifecycle=recording.terminal.workspace_lifecycle,
+                terminal_at=recording.terminal.occurred_at,
+            )
+        except ValueError as error:
+            raise Phase6ContractError(
+                "Campaign Artifact or Recording observations are inconsistent"
+            ) from error
         if run is None:
             raise Phase6ContractError("Evidence run is absent from Workflow Plan")
         expected_prompt_sha256 = (

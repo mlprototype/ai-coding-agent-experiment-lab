@@ -194,6 +194,12 @@ Harness failure kindも同じ共通validatorで観測から双方向に決める
 Codex process、Gate processのいずれかに回収失敗があれば、他の分類より
 `process_cleanup_error`を優先する。
 
+`evidence_error`は、Codex Evidence自身の`failure_kind=evidence_error`、またはCodex成功後の
+`diff.collection_error`という明示的なEvidence収集失敗のどちらかを必須とする。Provider
+failureをtop-levelの`evidence_error`へ付け替えることはできない。複数観測がある場合も
+process cleanup失敗を最優先とする。この照合はArtifact／Recordingのstrict modelだけでなく、
+Campaignとのcross-artifact validationでも再実行する。
+
 Recording 1.2は`Recording started <= Codex started <= Codex completed <= Recording
 terminal`を要求する。
 
@@ -213,11 +219,14 @@ Acceptance／Regression／lint／typecheck値をすべて0とし、`acceptance_p
 `acceptance_total`を超えてはならない。overall status、failure kind、Gate状態、Metrics、
 Gate非実行理由は双方向に整合させる。
 
-Public Language Report 1.1は1.0のloader互換性を維持したまま`zero_call_runs`と
+Public Language Report 1.1は1.0のvalidatorとcanonical loader互換性を維持したまま
+`zero_call_runs`と
 `provider_call_count_unknown_runs`を持つ。`output_rejected_runs <= failed_runs`、
 `gate_not_executed_runs <= scheduled_runs`を必須とし、Campaign 1.2のterminal eventから
 run taxonomy、Provider call状態、Gate非実行理由、scheduled／complete pairを再導出して
-report値と完全一致させる。
+report値と完全一致させる。この2つの上限検証は1.1だけに適用する。reportの`language`は
+Primary sourceとPlanのlanguage、`status`はManifest期待値と一致を確認したderived language
+statusへ完全一致させる。
 
 `checksums.json`は`release-metadata.json`を含む全予定出力を対象とし、自身だけを対象外と
 する。`checksums.json`自身のSHA-256はbundle外のExternal Checksum Anchor 1.0へ固定する。

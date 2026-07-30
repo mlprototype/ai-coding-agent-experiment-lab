@@ -20,6 +20,7 @@ from agentlab.models import (
     CodexCliProfile,
     CodexExecutionEvidence,
     CodexExecutionStage,
+    CodexFailureStage,
     CodexInvocationState,
     CodexProviderFailureHint,
     CodexRunnerState,
@@ -61,6 +62,7 @@ from agentlab.phase6 import (
     Phase6CampaignStartedEvent,
     Phase6ContractError,
     Phase6FailureKind,
+    Phase6OverallStatus,
     Phase6PathError,
     Phase6Recording,
     Phase6RecordingStartedEvent,
@@ -484,6 +486,67 @@ def _successful_codex(
         item_type_counts={},
         usage_metrics=UsageMetrics(source=UsageMetricSource.NOT_AVAILABLE),
         stdout_bytes=1,
+        stderr_bytes=0,
+        stdout_limit_exceeded=False,
+        stderr_truncated=False,
+        termination=TerminationEvidence(
+            reason=TerminationReason.NONE,
+            sigterm_sent=False,
+            sigkill_sent=False,
+            process_group_cleared=True,
+            error=None,
+        ),
+    )
+
+
+def _provider_unavailable_codex(
+    *,
+    model: str,
+    reasoning_effort: Any,
+) -> CodexExecutionEvidence:
+    timestamp = datetime.fromisoformat(T0.replace("Z", "+00:00"))
+    return CodexExecutionEvidence(
+        schema_version="1.5",
+        provider=Provider.CODEX,
+        cli_version=None,
+        cli_profile=CodexCliProfile.NOT_SELECTED,
+        execution_stage=CodexExecutionStage.PREFLIGHT_NOT_COMPLETED,
+        failure_stage=CodexFailureStage.PREFLIGHT,
+        runner_state=CodexRunnerState.NOT_STARTED,
+        invocation_state=CodexInvocationState.NOT_ATTEMPTED,
+        cleanup_state=CodexCleanupState.NOT_APPLICABLE,
+        preflight_checked_at=timestamp,
+        verified_flags=[],
+        requested_model=model,
+        requested_reasoning_effort=reasoning_effort,
+        sandbox_mode="workspace-write",
+        approval_policy=None,
+        approval_basis=None,
+        web_search_disabled=True,
+        command_network_disabled=True,
+        raw_stream_persisted=False,
+        process_started=False,
+        stdin_write_state=CodexStdinWriteState.NOT_STARTED,
+        stdin_bytes_written=0,
+        stdin_bytes_total=None,
+        provider_failure_hint=CodexProviderFailureHint.NOT_APPLICABLE,
+        status=ProviderExecutionStatus.FAILED,
+        failure_kind=LiveFailureKind.PROVIDER_UNAVAILABLE,
+        exit_code=None,
+        started_at=timestamp,
+        completed_at=timestamp,
+        duration_ms=0,
+        event_count=0,
+        unknown_event_count=0,
+        thread_started_count=0,
+        turn_started_count=0,
+        terminal_event=CodexTerminalEvent.NONE,
+        turn_completed_count=0,
+        turn_failed_count=0,
+        error_event_count=0,
+        item_type_counts={},
+        usage_metrics=UsageMetrics(source=UsageMetricSource.NOT_AVAILABLE),
+        stdout_bytes=0,
         stderr_bytes=0,
         stdout_limit_exceeded=False,
         stderr_truncated=False,
@@ -1603,6 +1666,172 @@ def test_cleanup_observation_takes_priority_over_gate_harness_error(
         LiveRunArtifactV1_2.model_validate(payload)
 
 
+@pytest.mark.parametrize("target", ["artifact", "recording"])
+def test_evidence_error_rejects_provider_failure_reclassification(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    _source, _spec, plan, _campaign, artifacts, recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    codex = _provider_unavailable_codex(
+        model=plan.model,
+        reasoning_effort=plan.reasoning_effort,
+    )
+    model = artifacts[0] if target == "artifact" else recordings[0].terminal
+    payload = model.model_dump(mode="json")
+    payload.update(
+        {
+            "overall_status": "harness_error",
+            "failure_kind": "evidence_error",
+            "codex": codex.model_dump(mode="json"),
+            "gate_executed": False,
+            "gate_not_executed_reason": "pre_gate_harness_failure",
+            "gate_commands": [],
+            "metrics": None,
+            "workspace_lifecycle": "not_created",
+        }
+    )
+    if target == "artifact":
+        payload["started_at"] = T0
+        payload["completed_at"] = T0
+    else:
+        payload["event_type"] = "run_failed"
+        payload["occurred_at"] = T0
+    selected = (
+        LiveRunArtifactV1_2
+        if target == "artifact"
+        else Phase6RecordingTerminalEvent
+    )
+
+    with pytest.raises(ValidationError, match="evidence_error requires"):
+        selected.model_validate(payload)
+
+
+@pytest.mark.parametrize("observation", ["codex", "diff"])
+def test_evidence_error_accepts_explicit_observation(
+    tmp_path: Path,
+    observation: str,
+) -> None:
+    _source, _spec, plan, _campaign, artifacts, _recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    payload = artifacts[0].model_dump(mode="json")
+    payload.update(
+        {
+            "overall_status": "harness_error",
+            "failure_kind": "evidence_error",
+            "started_at": T0,
+            "completed_at": T0,
+            "gate_executed": False,
+            "gate_not_executed_reason": "pre_gate_harness_failure",
+            "gate_commands": [],
+            "metrics": None,
+        }
+    )
+    if observation == "codex":
+        codex_raw = _provider_unavailable_codex(
+            model=plan.model,
+            reasoning_effort=plan.reasoning_effort,
+        ).model_dump(mode="json")
+        codex_raw["failure_kind"] = "evidence_error"
+        payload["codex"] = CodexExecutionEvidence.model_validate(
+            codex_raw
+        ).model_dump(mode="json")
+        payload["workspace_lifecycle"] = "not_created"
+    else:
+        payload["diff"] = {
+            "changed_files": [],
+            "binary_files": [],
+            "added_lines": None,
+            "deleted_lines": None,
+            "unified_diff": "",
+            "diff_truncated": False,
+            "line_counts_complete": False,
+            "collection_error": "diff collection failed",
+        }
+
+    assert (
+        LiveRunArtifactV1_2.model_validate(payload).failure_kind
+        is Phase6FailureKind.EVIDENCE_ERROR
+    )
+
+
+def test_cross_validator_rejects_provider_failure_as_evidence_error(
+    tmp_path: Path,
+) -> None:
+    source, spec, plan, campaign, artifacts, recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    codex = _provider_unavailable_codex(
+        model=plan.model,
+        reasoning_effort=plan.reasoning_effort,
+    )
+    changed_artifacts = list(artifacts)
+    changed_recordings = list(recordings)
+    changed_artifacts[0] = artifacts[0].model_copy(
+        update={
+            "overall_status": Phase6OverallStatus.HARNESS_ERROR,
+            "failure_kind": Phase6FailureKind.EVIDENCE_ERROR,
+            "codex": codex,
+            "gate_executed": False,
+            "gate_not_executed_reason": (
+                GateNotExecutedReason.PRE_GATE_HARNESS_FAILURE
+            ),
+            "gate_commands": [],
+            "metrics": None,
+            "workspace_lifecycle": WorkspaceLifecycle.NOT_CREATED,
+        }
+    )
+    changed_terminal = recordings[0].terminal.model_copy(
+        update={
+            "event_type": "run_failed",
+            "overall_status": Phase6OverallStatus.HARNESS_ERROR,
+            "failure_kind": Phase6FailureKind.EVIDENCE_ERROR,
+            "codex": codex,
+            "gate_executed": False,
+            "gate_not_executed_reason": (
+                GateNotExecutedReason.PRE_GATE_HARNESS_FAILURE
+            ),
+            "gate_commands": [],
+            "metrics": None,
+            "workspace_lifecycle": WorkspaceLifecycle.NOT_CREATED,
+        }
+    )
+    changed_recordings[0] = Phase6Recording(
+        recordings[0].started,
+        changed_terminal,
+    )
+    events = list(campaign.events)
+    first_terminal = events[2]
+    assert isinstance(first_terminal, Phase6CampaignRunEvent)
+    events[2] = first_terminal.model_copy(
+        update={
+            "status": CampaignRunStatus.FAILED,
+            "outcome": Phase6CampaignOutcome.HARNESS_FAILURE,
+            "provider_call_count": 0,
+            "gate_executed": False,
+            "counted_failure": False,
+            "fail_fast_applies": False,
+            "max_failures_applies": False,
+            "failure_kind": Phase6FailureKind.EVIDENCE_ERROR,
+        }
+    )
+    finished = events[-1]
+    assert isinstance(finished, Phase6CampaignFinishedEvent)
+    events[-1] = finished.model_copy(update={"provider_call_count": 1})
+
+    with pytest.raises(Phase6ContractError, match="observations are inconsistent"):
+        _validate_primary_live_bindings(
+            source=source,
+            spec=spec,
+            plan=plan,
+            campaign=LoadedPhase6Campaign(tuple(events)),
+            evidence=changed_artifacts,
+            recordings=changed_recordings,
+        )
+
+
 def test_recording_loader_rejects_terminal_before_codex_completion(
     tmp_path: Path,
 ) -> None:
@@ -1954,8 +2183,12 @@ def test_public_language_report_rejects_gate_nonexecution_above_schedule() -> No
         )
 
 
-def test_public_language_report_is_derived_from_campaign() -> None:
-    campaign = _completed_campaign()
+def test_public_language_report_is_derived_from_campaign(
+    tmp_path: Path,
+) -> None:
+    source, _spec, plan, campaign, artifacts, _recordings = (
+        _cross_artifact_case(tmp_path)
+    )
     derived = derive_public_language_counts(campaign)
     report = PublicLanguageReportV1_1(
         schema_version="1.1",
@@ -1963,37 +2196,74 @@ def test_public_language_report_is_derived_from_campaign() -> None:
         status=LanguageStatus.EVALUATED,
         **derived.__dict__,
     )
-    validate_public_language_report_campaign(report, campaign)
+    evidence_run_ids = {artifact.run_id for artifact in artifacts}
+    validate_public_language_report_campaign(
+        report,
+        campaign,
+        source=source,
+        plan=plan,
+        evidence_run_ids=evidence_run_ids,
+    )
 
     changed = report.model_copy(update={"scheduled_pair_count": 2})
     with pytest.raises(Phase6ContractError, match="scheduled_pair_count"):
-        validate_public_language_report_campaign(changed, campaign)
+        validate_public_language_report_campaign(
+            changed,
+            campaign,
+            source=source,
+            plan=plan,
+            evidence_run_ids=evidence_run_ids,
+        )
 
 
-def test_public_language_report_1_0_loader_remains_compatible(
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("language", Language.TYPESCRIPT, "language differs"),
+        ("status", LanguageStatus.BLOCKED, "status differs"),
+    ],
+)
+def test_public_language_report_binds_language_and_status(
     tmp_path: Path,
+    field: str,
+    value: Any,
+    message: str,
 ) -> None:
-    legacy = PublicLanguageReport(
-        schema_version="1.0",
-        language=Language.PYTHON,
-        status=LanguageStatus.BLOCKED,
-        scheduled_runs=1,
-        attempted_runs=0,
-        completed_runs=0,
-        failed_runs=0,
-        interrupted_runs=0,
-        not_run_runs=1,
-        output_rejected_runs=0,
-        gate_not_executed_runs=1,
-        gate_not_executed_reason={GateNotExecutedReason.NOT_RUN: 1},
-        scheduled_pair_count=0,
-        complete_pair_count=0,
-        estimability="not_estimable",
+    source, _spec, plan, campaign, artifacts, _recordings = (
+        _cross_artifact_case(tmp_path)
     )
-    path = tmp_path / "language-report-1.0.json"
-    path.write_bytes(canonical_json_bytes(legacy))
+    derived = derive_public_language_counts(campaign)
+    report = PublicLanguageReportV1_1(
+        schema_version="1.1",
+        language=Language.PYTHON,
+        status=LanguageStatus.EVALUATED,
+        **derived.__dict__,
+    ).model_copy(update={field: value})
 
-    assert load_public_language_report(path) == legacy
+    with pytest.raises(Phase6ContractError, match=message):
+        validate_public_language_report_campaign(
+            report,
+            campaign,
+            source=source,
+            plan=plan,
+            evidence_run_ids={artifact.run_id for artifact in artifacts},
+        )
+
+
+def test_public_language_report_1_0_loader_accepts_6b65674_fixture() -> None:
+    path = (
+        Path(__file__).parent
+        / "fixtures"
+        / "phase6"
+        / "public-language-report-1.0-6b65674.json"
+    )
+
+    loaded = load_public_language_report(path)
+
+    assert isinstance(loaded, PublicLanguageReport)
+    assert loaded.schema_version == "1.0"
+    assert loaded.failed_runs == 0
+    assert loaded.output_rejected_runs == 1
 
 
 @pytest.mark.parametrize(
