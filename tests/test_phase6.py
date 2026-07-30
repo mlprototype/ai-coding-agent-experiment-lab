@@ -13,10 +13,31 @@ from pydantic import ValidationError
 
 from agentlab.campaign import CampaignRunStatus, CampaignStopReason
 from agentlab.models import (
+    CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS,
+    CODEX_REQUIRED_EXEC_FLAGS,
+    CodexApprovalBasis,
+    CodexCleanupState,
+    CodexCliProfile,
     CodexExecutionEvidence,
+    CodexExecutionStage,
+    CodexInvocationState,
+    CodexProviderFailureHint,
+    CodexRunnerState,
+    CodexStdinWriteState,
+    CodexTerminalEvent,
+    CommandEvidence,
+    CommandStatus,
+    GateKind,
+    LiveFailureKind,
     Provider,
     ProviderExecutionStatus,
+    RunMetrics,
+    TerminationEvidence,
+    TerminationReason,
+    UsageMetrics,
+    UsageMetricSource,
     Workflow,
+    WorkspaceLifecycle,
 )
 from agentlab.phase6 import (
     ArtifactReference,
@@ -40,6 +61,9 @@ from agentlab.phase6 import (
     Phase6ContractError,
     Phase6FailureKind,
     Phase6PathError,
+    Phase6Recording,
+    Phase6RecordingStartedEvent,
+    Phase6RecordingTerminalEvent,
     PrimarySuiteSource,
     ProtectedPathPolicy,
     ProviderCoverage,
@@ -56,8 +80,10 @@ from agentlab.phase6 import (
     ToolchainIdentity,
     WorkflowExperimentSpecV2_1,
     WorkflowPlanV1_2,
+    _validate_primary_live_bindings,
     canonical_json_bytes,
     derive_language_status,
+    load_campaign_contract,
     load_external_checksum_anchor,
     load_fixture_manifest,
     load_public_checksums,
@@ -382,6 +408,480 @@ def _completed_campaign() -> LoadedPhase6Campaign:
     )
 
 
+def _campaign_jsonl(events: tuple[Any, ...]) -> bytes:
+    lines: list[bytes] = []
+    for event in events:
+        payload = event.model_dump(mode="json")
+        payload["occurred_at"] = event.occurred_at.strftime(
+            "%Y-%m-%dT%H:%M:%S.%fZ"
+        )
+        lines.append(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            + b"\n"
+        )
+    return b"".join(lines)
+
+
+def _successful_codex(
+    *,
+    model: str,
+    reasoning_effort: Any,
+    prompt_bytes: int,
+) -> CodexExecutionEvidence:
+    timestamp = datetime.fromisoformat(T0.replace("Z", "+00:00"))
+    return CodexExecutionEvidence(
+        schema_version="1.5",
+        provider=Provider.CODEX,
+        cli_version=next(iter(CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS)),
+        cli_profile=CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2,
+        execution_stage=CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED,
+        failure_stage=None,
+        runner_state=CodexRunnerState.STARTED,
+        invocation_state=CodexInvocationState.PROCESS_STARTED,
+        cleanup_state=CodexCleanupState.CLEARED,
+        preflight_checked_at=timestamp,
+        verified_flags=sorted(CODEX_REQUIRED_EXEC_FLAGS),
+        requested_model=model,
+        requested_reasoning_effort=reasoning_effort,
+        sandbox_mode="workspace-write",
+        approval_policy="never",
+        approval_basis=CodexApprovalBasis.EXPLICIT_CONFIG_NEVER,
+        web_search_disabled=True,
+        command_network_disabled=True,
+        raw_stream_persisted=False,
+        process_started=True,
+        stdin_write_state=CodexStdinWriteState.COMPLETE,
+        stdin_bytes_written=prompt_bytes,
+        stdin_bytes_total=prompt_bytes,
+        provider_failure_hint=CodexProviderFailureHint.NOT_APPLICABLE,
+        status=ProviderExecutionStatus.SUCCEEDED,
+        failure_kind=LiveFailureKind.NONE,
+        exit_code=0,
+        started_at=timestamp,
+        completed_at=timestamp,
+        duration_ms=10,
+        event_count=3,
+        unknown_event_count=0,
+        thread_started_count=1,
+        turn_started_count=1,
+        terminal_event=CodexTerminalEvent.TURN_COMPLETED,
+        turn_completed_count=1,
+        turn_failed_count=0,
+        error_event_count=0,
+        item_type_counts={},
+        usage_metrics=UsageMetrics(source=UsageMetricSource.NOT_AVAILABLE),
+        stdout_bytes=1,
+        stderr_bytes=0,
+        stdout_limit_exceeded=False,
+        stderr_truncated=False,
+        termination=TerminationEvidence(
+            reason=TerminationReason.NONE,
+            sigterm_sent=False,
+            sigkill_sent=False,
+            process_group_cleared=True,
+            error=None,
+        ),
+    )
+
+
+def _passing_metrics() -> RunMetrics:
+    return RunMetrics(
+        quality_gate_pass=True,
+        acceptance_tests_passed=1,
+        acceptance_tests_total=1,
+        regression_failures=0,
+        lint_errors=0,
+        typecheck_errors=0,
+        agent_duration_ms=10,
+        evaluation_duration_ms=0,
+        total_duration_ms=10,
+        agent_call_count=1,
+        retry_count=0,
+        changed_files=[],
+        added_lines=0,
+        deleted_lines=0,
+        usage_metrics=UsageMetrics(source=UsageMetricSource.NOT_AVAILABLE),
+    )
+
+
+def _passing_gate_commands() -> list[CommandEvidence]:
+    timestamp = datetime.fromisoformat(T0.replace("Z", "+00:00"))
+    termination = TerminationEvidence(
+        reason=TerminationReason.NONE,
+        sigterm_sent=False,
+        sigkill_sent=False,
+        process_group_cleared=True,
+        error=None,
+    )
+    return [
+        CommandEvidence(
+            gate=gate,
+            command_index=0,
+            argv=["gate"],
+            status=CommandStatus.PASSED,
+            return_code=0,
+            started_at=timestamp,
+            completed_at=timestamp,
+            duration_ms=0,
+            stdout="",
+            stderr="",
+            stdout_truncated=False,
+            stderr_truncated=False,
+            stdout_decode_replaced=False,
+            stderr_decode_replaced=False,
+            termination=termination,
+            error=None,
+        )
+        for gate in (
+            GateKind.ACCEPTANCE,
+            GateKind.REGRESSION,
+            GateKind.LINT,
+            GateKind.TYPECHECK,
+        )
+    ]
+
+
+def _public_output_record_payload() -> dict[str, Any]:
+    return {
+        "schema_version": "1.0",
+        "reviewed_commit": COMMIT,
+        "experiment_id": "phase6-python",
+        "run_id": "phase6-python-one-shot-000",
+        "task_id": "task",
+        "language": "python",
+        "provider": "codex",
+        "workflow": "one_shot",
+        "repetition_index": 0,
+        "exact_model_id": "gpt-fixed-model",
+        "reasoning_effort": "high",
+        "cli_profile": "headless_exec_explicit_never_v2",
+        "cli_version": "codex-cli fixed",
+        "os": "darwin",
+        "architecture": "arm64",
+        "toolchain_fingerprint": HASH_A,
+        "fixture_sha256": HASH_A,
+        "prompt_sha256": HASH_A,
+        "plan_sha256": HASH_A,
+        "campaign_sha256": HASH_A,
+        "evidence_sha256": HASH_A,
+        "recording_sha256": HASH_A,
+        "overall_status": "rejected",
+        "failure_kind": "output_contract_violation",
+        "provider_call_count": 1,
+        "gate_executed": False,
+        "gate_not_executed_reason": "output_contract_violation",
+        "run_metrics_available": False,
+        "acceptance_passed": 0,
+        "acceptance_total": 0,
+        "regression_failures": 0,
+        "lint_errors": 0,
+        "typecheck_errors": 0,
+        "usage_status": "missing",
+        "usage_source": None,
+        "started_at": T0,
+        "completed_at": T1,
+    }
+
+
+def _minimal_plan(plan: WorkflowPlanV1_2) -> WorkflowPlanV1_2:
+    raw = plan.model_dump(mode="json")
+    raw["runs"] = raw["runs"][:2]
+    raw["planned_run_count"] = 2
+    raw["planned_provider_call_count"] = 2
+    return WorkflowPlanV1_2.model_validate(raw)
+
+
+def _successful_live_pair(
+    *,
+    spec: WorkflowExperimentSpecV2_1,
+    spec_sha256: str,
+    plan: WorkflowPlanV1_2,
+    plan_sha256: str,
+    run: Any,
+) -> tuple[LiveRunArtifactV1_2, Phase6Recording, str]:
+    prompt_sha256 = (
+        plan.one_shot_prompt_sha256
+        if run.workflow is Workflow.ONE_SHOT
+        else plan.staged_prompt_sha256
+    )
+    prompt_bytes = (
+        plan.one_shot_prompt_bytes
+        if run.workflow is Workflow.ONE_SHOT
+        else plan.staged_prompt_bytes
+    )
+    codex = _successful_codex(
+        model=plan.model,
+        reasoning_effort=plan.reasoning_effort,
+        prompt_bytes=prompt_bytes,
+    )
+    metrics = _passing_metrics()
+    started = Phase6RecordingStartedEvent(
+        schema_version="1.2",
+        sequence=0,
+        event_type="run_started",
+        run_id=run.run_id,
+        experiment_id=plan.experiment_id,
+        task_id=run.task_id,
+        language=plan.language,
+        workflow=run.workflow,
+        provider=Provider.CODEX,
+        repetition_index=run.repetition_index,
+        execution_mode="live",
+        occurred_at=T0,
+        plan_sha256=plan_sha256,
+        fixture_sha256=plan.fixture_sha256,
+        fixture_manifest_sha256=plan.fixture_manifest_sha256,
+        fixture_acceptance_sha256=plan.fixture_acceptance_sha256,
+        diff_policy_sha256=plan.diff_policy_sha256,
+        prompt_sha256=prompt_sha256,
+        prompt_bytes=prompt_bytes,
+        prompt_redacted=True,
+        requested_model=plan.model,
+        requested_reasoning_effort=plan.reasoning_effort,
+        cli_version=codex.cli_version,
+    )
+    terminal = Phase6RecordingTerminalEvent(
+        schema_version="1.2",
+        sequence=1,
+        event_type="run_completed",
+        run_id=run.run_id,
+        experiment_id=plan.experiment_id,
+        occurred_at=T0,
+        overall_status="passed",
+        failure_kind="none",
+        codex=codex,
+        gate_executed=True,
+        gate_not_executed_reason=None,
+        metrics=metrics,
+    )
+    recording = Phase6Recording(started, terminal)
+    recording_sha256 = hashlib.sha256(
+        f"recording:{run.run_id}".encode()
+    ).hexdigest()
+    artifact = LiveRunArtifactV1_2(
+        schema_version="1.2",
+        run_id=run.run_id,
+        experiment_id=plan.experiment_id,
+        task_id=run.task_id,
+        language=plan.language,
+        repetition_index=run.repetition_index,
+        workflow=run.workflow,
+        provider=Provider.CODEX,
+        execution_mode="live",
+        overall_status="passed",
+        failure_kind="none",
+        started_at=T0,
+        completed_at=T0,
+        reviewed_commit=plan.reviewed_commit,
+        spec_sha256=spec_sha256,
+        plan_sha256=plan_sha256,
+        fixture_sha256=plan.fixture_sha256,
+        fixture_manifest_sha256=plan.fixture_manifest_sha256,
+        fixture_acceptance_sha256=plan.fixture_acceptance_sha256,
+        diff_policy_sha256=plan.diff_policy_sha256,
+        toolchain_fingerprint=plan.toolchain_fingerprint,
+        prompt_sha256=prompt_sha256,
+        prompt_bytes=prompt_bytes,
+        prompt_redacted=True,
+        runner=spec.runner,
+        codex=codex,
+        gate_executed=True,
+        gate_not_executed_reason=None,
+        gate_commands=_passing_gate_commands(),
+        diff={
+            "changed_files": [],
+            "binary_files": [],
+            "added_lines": 0,
+            "deleted_lines": 0,
+            "unified_diff": "",
+            "diff_truncated": False,
+            "line_counts_complete": True,
+            "collection_error": None,
+        },
+        metrics=metrics,
+        workspace_lifecycle=WorkspaceLifecycle.REMOVED,
+        recording_sha256=recording_sha256,
+        raw_provider_output_persisted=False,
+    )
+    return artifact, recording, recording_sha256
+
+
+def _cross_artifact_case(
+    tmp_path: Path,
+) -> tuple[
+    PrimarySuiteSource,
+    WorkflowExperimentSpecV2_1,
+    WorkflowPlanV1_2,
+    LoadedPhase6Campaign,
+    list[LiveRunArtifactV1_2],
+    list[Phase6Recording],
+]:
+    fixture_manifest, policy, acceptance = _fixture_contracts()
+    spec_path, spec = _phase6_spec(tmp_path)
+    plan = _minimal_plan(
+        _phase6_plan(
+            tmp_path,
+            spec_path,
+            spec,
+            fixture_manifest,
+            policy,
+            acceptance,
+        )
+    )
+    plan_sha256 = hashlib.sha256(canonical_json_bytes(plan)).hexdigest()
+    events: list[Any] = [
+        Phase6CampaignStartedEvent(
+            schema_version="1.2",
+            sequence=0,
+            event_type="campaign_started",
+            experiment_id=plan.experiment_id,
+            plan_sha256=plan_sha256,
+            fixture_manifest_sha256=plan.fixture_manifest_sha256,
+            fixture_acceptance_sha256=plan.fixture_acceptance_sha256,
+            diff_policy_sha256=plan.diff_policy_sha256,
+            toolchain_fingerprint=plan.toolchain_fingerprint,
+            planned_run_count=2,
+            planned_provider_call_count=2,
+            occurred_at=T0,
+        )
+    ]
+    artifacts: list[LiveRunArtifactV1_2] = []
+    recordings: list[Phase6Recording] = []
+    recording_hashes: list[str] = []
+    for index, run in enumerate(plan.runs):
+        events.extend(
+            (
+                Phase6CampaignRunEvent(
+                    schema_version="1.2",
+                    sequence=1 + index * 2,
+                    event_type="run_state",
+                    run_id=run.run_id,
+                    task_id=run.task_id,
+                    workflow=run.workflow,
+                    repetition_index=run.repetition_index,
+                    status=CampaignRunStatus.STARTED,
+                    outcome=None,
+                    stop_reason=None,
+                    provider_call_count=None,
+                    gate_executed=False,
+                    counted_failure=False,
+                    fail_fast_applies=False,
+                    max_failures_applies=False,
+                    failure_kind=None,
+                    occurred_at=T0,
+                ),
+                Phase6CampaignRunEvent(
+                    schema_version="1.2",
+                    sequence=2 + index * 2,
+                    event_type="run_state",
+                    run_id=run.run_id,
+                    task_id=run.task_id,
+                    workflow=run.workflow,
+                    repetition_index=run.repetition_index,
+                    status=CampaignRunStatus.COMPLETED,
+                    outcome=Phase6CampaignOutcome.SUCCESS,
+                    stop_reason=None,
+                    provider_call_count=1,
+                    gate_executed=True,
+                    counted_failure=False,
+                    fail_fast_applies=False,
+                    max_failures_applies=False,
+                    failure_kind=Phase6FailureKind.NONE,
+                    occurred_at=T0,
+                ),
+            )
+        )
+        artifact, recording, recording_hash = _successful_live_pair(
+            spec=spec,
+            spec_sha256=hashlib.sha256(spec_path.read_bytes()).hexdigest(),
+            plan=plan,
+            plan_sha256=plan_sha256,
+            run=run,
+        )
+        artifacts.append(artifact)
+        recordings.append(recording)
+        recording_hashes.append(recording_hash)
+    events.append(
+        Phase6CampaignFinishedEvent(
+            schema_version="1.2",
+            sequence=5,
+            event_type="campaign_finished",
+            experiment_id=plan.experiment_id,
+            stop_reason=CampaignStopReason.NONE,
+            attempted_run_count=2,
+            provider_call_count=2,
+            provider_call_count_unknown_runs=0,
+            counted_failure_count=0,
+            retry_count=0,
+            occurred_at=T1,
+        )
+    )
+    campaign = LoadedPhase6Campaign(tuple(events))
+    source = PrimarySuiteSource(
+        source_class=SourceClass.PRIMARY,
+        language=Language.PYTHON,
+        expected_language_status=LanguageStatus.EVALUATED,
+        spec=ArtifactReference(
+            role="spec",
+            path="workflow.yaml",
+            sha256=hashlib.sha256(spec_path.read_bytes()).hexdigest(),
+        ),
+        fixture_manifest=ArtifactReference(
+            role="fixture_manifest",
+            path="fixture.manifest.json",
+            sha256=plan.fixture_manifest_sha256,
+        ),
+        fixture_acceptance=ArtifactReference(
+            role="fixture_acceptance",
+            path="fixture.acceptance.json",
+            sha256=plan.fixture_acceptance_sha256,
+        ),
+        diff_policy=ArtifactReference(
+            role="diff_policy",
+            path="diff-policy.json",
+            sha256=plan.diff_policy_sha256,
+        ),
+        plan=ArtifactReference(
+            role="plan",
+            path="plan.json",
+            sha256=plan_sha256,
+        ),
+        campaign=ArtifactReference(
+            role="campaign",
+            path="campaign.jsonl",
+            sha256=HASH_A,
+        ),
+        evidence=[
+            ArtifactReference(
+                role="evidence",
+                path=f"evidence/{artifact.run_id}.json",
+                sha256=hashlib.sha256(
+                    canonical_json_bytes(artifact)
+                ).hexdigest(),
+            )
+            for artifact in artifacts
+        ],
+        recordings=[
+            ArtifactReference(
+                role="recording",
+                path=f"recordings/{recording.started.run_id}.jsonl",
+                sha256=recording_hash,
+            )
+            for recording, recording_hash in zip(
+                recordings,
+                recording_hashes,
+                strict=True,
+            )
+        ],
+    )
+    return source, spec, plan, campaign, artifacts, recordings
+
+
 def test_compatible_loaders_keep_spec_2_0_and_plan_1_1(
     tmp_path: Path,
 ) -> None:
@@ -555,6 +1055,248 @@ def test_cleanup_failure_has_priority_over_other_failure_kinds() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("reviewed_commit", "2" * 40),
+        ("spec_sha256", HASH_B),
+    ],
+)
+def test_cross_validator_rejects_artifact_provenance_mismatch(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    source, spec, plan, campaign, artifacts, recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    changed = list(artifacts)
+    changed[0] = changed[0].model_copy(update={field: value})
+
+    with pytest.raises(Phase6ContractError, match="identities differ"):
+        _validate_primary_live_bindings(
+            source=source,
+            spec=spec,
+            plan=plan,
+            campaign=campaign,
+            evidence=changed,
+            recordings=recordings,
+        )
+
+
+def test_cross_validator_rejects_campaign_artifact_outcome_mismatch(
+    tmp_path: Path,
+) -> None:
+    source, spec, plan, campaign, artifacts, recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    events = list(campaign.events)
+    terminal = events[2]
+    assert isinstance(terminal, Phase6CampaignRunEvent)
+    events[2] = terminal.model_copy(
+        update={
+            "outcome": Phase6CampaignOutcome.QUALITY_GATE_FAILURE,
+            "counted_failure": True,
+            "fail_fast_applies": True,
+            "max_failures_applies": True,
+            "failure_kind": Phase6FailureKind.QUALITY_GATE_FAILURE,
+        }
+    )
+
+    with pytest.raises(Phase6ContractError, match="identities differ"):
+        _validate_primary_live_bindings(
+            source=source,
+            spec=spec,
+            plan=plan,
+            campaign=LoadedPhase6Campaign(tuple(events)),
+            evidence=artifacts,
+            recordings=recordings,
+        )
+
+
+def test_cross_validator_requires_exact_plan_campaign_run_ids(
+    tmp_path: Path,
+) -> None:
+    source, spec, plan, campaign, artifacts, recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    events = list(campaign.events)
+    terminal = events[2]
+    assert isinstance(terminal, Phase6CampaignRunEvent)
+    events[2] = terminal.model_copy(update={"run_id": "unexpected-run"})
+
+    with pytest.raises(Phase6ContractError, match="run IDs"):
+        _validate_primary_live_bindings(
+            source=source,
+            spec=spec,
+            plan=plan,
+            campaign=LoadedPhase6Campaign(tuple(events)),
+            evidence=artifacts,
+            recordings=recordings,
+        )
+
+
+@pytest.mark.parametrize("case", ["missing", "duplicate"])
+def test_cross_validator_derives_required_artifact_set_from_campaign(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    source, spec, plan, campaign, artifacts, recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    if case == "missing":
+        artifacts = artifacts[:-1]
+        recordings = recordings[:-1]
+    else:
+        artifacts = [*artifacts, artifacts[0]]
+        recordings = [*recordings, recordings[0]]
+
+    with pytest.raises(Phase6ContractError, match="incomplete or duplicated"):
+        _validate_primary_live_bindings(
+            source=source,
+            spec=spec,
+            plan=plan,
+            campaign=campaign,
+            evidence=artifacts,
+            recordings=recordings,
+        )
+
+
+@pytest.mark.parametrize("mismatch", ["metrics", "codex"])
+def test_cross_validator_rejects_recording_artifact_evidence_mismatch(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    source, spec, plan, campaign, artifacts, recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    changed = list(recordings)
+    terminal = changed[0].terminal
+    if mismatch == "metrics":
+        assert terminal.metrics is not None
+        metrics = terminal.metrics.model_copy(
+            update={
+                "evaluation_duration_ms": 1,
+                "total_duration_ms": 11,
+            }
+        )
+        terminal = terminal.model_copy(update={"metrics": metrics})
+    else:
+        codex = terminal.codex.model_copy(update={"stdout_bytes": 2})
+        terminal = terminal.model_copy(update={"codex": codex})
+    changed[0] = Phase6Recording(changed[0].started, terminal)
+
+    with pytest.raises(Phase6ContractError, match="identities differ"):
+        _validate_primary_live_bindings(
+            source=source,
+            spec=spec,
+            plan=plan,
+            campaign=campaign,
+            evidence=artifacts,
+            recordings=changed,
+        )
+
+
+def test_campaign_rejects_terminal_before_started(tmp_path: Path) -> None:
+    campaign = _completed_campaign()
+    original = campaign.events
+    reordered = (
+        original[0],
+        original[2].model_copy(update={"sequence": 1}),
+        original[1].model_copy(update={"sequence": 2}),
+        original[3],
+        original[4],
+        original[5],
+    )
+    path = tmp_path / "campaign.jsonl"
+    path.write_bytes(_campaign_jsonl(reordered))
+
+    with pytest.raises(Phase6ContractError, match="must precede"):
+        load_campaign_contract(path)
+
+
+def test_campaign_rejects_started_terminal_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    campaign = _completed_campaign()
+    events = list(campaign.events)
+    events[1] = events[1].model_copy(update={"task_id": "other-task"})
+    path = tmp_path / "campaign.jsonl"
+    path.write_bytes(_campaign_jsonl(tuple(events)))
+
+    with pytest.raises(Phase6ContractError, match="identities differ"):
+        load_campaign_contract(path)
+
+
+def test_campaign_rejects_decreasing_timestamps(tmp_path: Path) -> None:
+    campaign = _completed_campaign()
+    events = list(campaign.events)
+    events[2] = events[2].model_copy(
+        update={"occurred_at": datetime.fromisoformat(T1.replace("Z", "+00:00"))}
+    )
+    path = tmp_path / "campaign.jsonl"
+    path.write_bytes(_campaign_jsonl(tuple(events)))
+
+    with pytest.raises(Phase6ContractError, match="non-decreasing"):
+        load_campaign_contract(path)
+
+
+def test_campaign_finished_reason_must_match_not_run_reason(
+    tmp_path: Path,
+) -> None:
+    campaign = _completed_campaign()
+    first_started = campaign.events[1]
+    first_terminal = campaign.events[2]
+    second_terminal = campaign.events[4]
+    assert isinstance(first_started, Phase6CampaignRunEvent)
+    assert isinstance(first_terminal, Phase6CampaignRunEvent)
+    assert isinstance(second_terminal, Phase6CampaignRunEvent)
+    not_run = Phase6CampaignRunEvent(
+        schema_version="1.2",
+        sequence=3,
+        event_type="run_state",
+        run_id=second_terminal.run_id,
+        task_id=second_terminal.task_id,
+        workflow=second_terminal.workflow,
+        repetition_index=second_terminal.repetition_index,
+        status=CampaignRunStatus.NOT_RUN,
+        outcome=Phase6CampaignOutcome.STOP_CONDITION,
+        stop_reason=CampaignStopReason.MAX_FAILURES,
+        provider_call_count=0,
+        gate_executed=False,
+        counted_failure=False,
+        fail_fast_applies=False,
+        max_failures_applies=False,
+        failure_kind=None,
+        occurred_at=T0,
+    )
+    finished = Phase6CampaignFinishedEvent(
+        schema_version="1.2",
+        sequence=4,
+        event_type="campaign_finished",
+        experiment_id=campaign.started.experiment_id,
+        stop_reason=CampaignStopReason.FAIL_FAST,
+        attempted_run_count=1,
+        provider_call_count=1,
+        provider_call_count_unknown_runs=0,
+        counted_failure_count=0,
+        retry_count=0,
+        occurred_at=T1,
+    )
+    events = (
+        campaign.events[0],
+        first_started,
+        first_terminal,
+        not_run,
+        finished,
+    )
+    path = tmp_path / "campaign.jsonl"
+    path.write_bytes(_campaign_jsonl(events))
+
+    with pytest.raises(Phase6ContractError, match="stop reason differs"):
+        load_campaign_contract(path)
+
+
 def test_typescript_fixture_requires_node_and_compiler_components() -> None:
     python_toolchain = _toolchain()
     with pytest.raises(ValidationError, match="exact toolchain roles"):
@@ -566,6 +1308,44 @@ def test_typescript_fixture_requires_node_and_compiler_components() -> None:
             gate_contract_sha256=HASH_B,
             toolchain=python_toolchain,
         )
+
+
+def test_live_artifact_and_recording_reject_input_changed(
+    tmp_path: Path,
+) -> None:
+    _source, _spec, _plan, _campaign, artifacts, recordings = (
+        _cross_artifact_case(tmp_path)
+    )
+    artifact_payload = artifacts[0].model_dump(mode="json")
+    artifact_payload.update(
+        {
+            "overall_status": "rejected",
+            "failure_kind": "output_contract_violation",
+            "started_at": T0,
+            "completed_at": T0,
+            "gate_executed": False,
+            "gate_not_executed_reason": "input_changed",
+            "gate_commands": [],
+            "metrics": None,
+        }
+    )
+    with pytest.raises(ValidationError, match="must not create"):
+        LiveRunArtifactV1_2.model_validate(artifact_payload)
+
+    terminal_payload = recordings[0].terminal.model_dump(mode="json")
+    terminal_payload.update(
+        {
+            "event_type": "run_failed",
+            "occurred_at": T0,
+            "overall_status": "rejected",
+            "failure_kind": "output_contract_violation",
+            "gate_executed": False,
+            "gate_not_executed_reason": "input_changed",
+            "metrics": None,
+        }
+    )
+    with pytest.raises(ValidationError, match="must not create"):
+        Phase6RecordingTerminalEvent.model_validate(terminal_payload)
 
 
 def test_language_status_is_derived_without_public_run_record() -> None:
@@ -833,6 +1613,28 @@ def test_public_language_report_retains_input_changed_reason() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"acceptance_passed": 1, "acceptance_total": 0},
+        {
+            "overall_status": "passed",
+            "failure_kind": "none",
+            "gate_not_executed_reason": "provider_failure",
+        },
+        {"run_metrics_available": True},
+    ],
+)
+def test_public_run_record_rejects_contradictory_state(
+    changes: dict[str, Any],
+) -> None:
+    payload = _public_output_record_payload()
+    payload.update(changes)
+
+    with pytest.raises(ValidationError):
+        PublicRunRecord.model_validate(payload)
+
+
 def test_nested_codex_evidence_1_5_is_required_without_mutating_it() -> None:
     codex = CodexExecutionEvidence.model_construct(
         schema_version="1.4",
@@ -980,6 +1782,7 @@ def test_all_public_json_contracts_have_canonical_strict_loaders(
         provider_call_count=1,
         gate_executed=False,
         gate_not_executed_reason="output_contract_violation",
+        run_metrics_available=False,
         acceptance_passed=0,
         acceptance_total=0,
         regression_failures=0,
@@ -1047,9 +1850,11 @@ def test_all_public_json_contracts_have_canonical_strict_loaders(
         assert loader(path) == model
 
 
-def test_suite_cross_validator_accepts_ready_not_run_bound_inputs(
+def _write_ready_suite(
     tmp_path: Path,
-) -> None:
+    *,
+    mismatched_spec_paths: bool = False,
+) -> tuple[Path, Any]:
     fixture_manifest, policy, acceptance = _fixture_contracts()
     spec_path, spec = _phase6_spec(tmp_path)
     plan = _phase6_plan(
@@ -1060,9 +1865,19 @@ def test_suite_cross_validator_accepts_ready_not_run_bound_inputs(
         policy,
         acceptance,
     )
+    manifest_name = (
+        "alternate-manifest.json"
+        if mismatched_spec_paths
+        else "fixture.manifest.json"
+    )
+    acceptance_name = (
+        "alternate-acceptance.json"
+        if mismatched_spec_paths
+        else "fixture.acceptance.json"
+    )
     paths_and_models = {
-        "fixture-manifest.json": fixture_manifest,
-        "fixture-acceptance.json": acceptance,
+        manifest_name: fixture_manifest,
+        acceptance_name: acceptance,
         "diff-policy.json": policy,
         "plan.json": plan,
     }
@@ -1079,14 +1894,14 @@ def test_suite_cross_validator_accepts_ready_not_run_bound_inputs(
         ),
         fixture_manifest=ArtifactReference(
             role="fixture_manifest",
-            path="fixture-manifest.json",
+            path=manifest_name,
             sha256=hashlib.sha256(
                 canonical_json_bytes(fixture_manifest)
             ).hexdigest(),
         ),
         fixture_acceptance=ArtifactReference(
             role="fixture_acceptance",
-            path="fixture-acceptance.json",
+            path=acceptance_name,
             sha256=hashlib.sha256(canonical_json_bytes(acceptance)).hexdigest(),
         ),
         diff_policy=ArtifactReference(
@@ -1103,8 +1918,14 @@ def test_suite_cross_validator_accepts_ready_not_run_bound_inputs(
     suite_manifest = _suite_manifest(source)
     manifest_path = tmp_path / "suite-manifest.json"
     manifest_path.write_bytes(canonical_json_bytes(suite_manifest))
+    return manifest_path, load_public_suite_inputs(manifest_path, root=tmp_path)
 
-    loaded = load_public_suite_inputs(manifest_path, root=tmp_path)
+
+def test_suite_cross_validator_accepts_ready_not_run_bound_inputs(
+    tmp_path: Path,
+) -> None:
+    _manifest_path, loaded = _write_ready_suite(tmp_path)
+
     validated = validate_public_suite_inputs(loaded)
 
     assert validated.derived_language_status == {
@@ -1113,3 +1934,45 @@ def test_suite_cross_validator_accepts_ready_not_run_bound_inputs(
     assert validated.data_cutoff_at == datetime.fromisoformat(
         T0.replace("Z", "+00:00")
     )
+
+
+def test_suite_manifest_itself_must_not_be_a_symlink(
+    tmp_path: Path,
+) -> None:
+    source = PrimarySuiteSource(
+        source_class=SourceClass.PRIMARY,
+        language=Language.PYTHON,
+        expected_language_status=LanguageStatus.NOT_READY,
+    )
+    real = tmp_path / "real-suite.json"
+    real.write_bytes(canonical_json_bytes(_suite_manifest(source)))
+    link = tmp_path / "suite.json"
+    link.symlink_to(real)
+
+    with pytest.raises(Phase6PathError, match="symlink"):
+        load_public_suite_inputs(link, root=tmp_path)
+
+
+def test_suite_rejects_file_replacement_after_hash_verification(
+    tmp_path: Path,
+) -> None:
+    _manifest_path, loaded = _write_ready_suite(tmp_path)
+    target = loaded.paths["diff-policy.json"]
+    replacement = tmp_path / "replacement.json"
+    replacement.write_bytes(loaded.bytes_by_path["diff-policy.json"])
+    os.replace(replacement, target)
+
+    with pytest.raises(Phase6PathError, match="changed after Manifest load"):
+        validate_public_suite_inputs(loaded)
+
+
+def test_suite_rejects_spec_and_manifest_reference_path_mismatch(
+    tmp_path: Path,
+) -> None:
+    _manifest_path, loaded = _write_ready_suite(
+        tmp_path,
+        mismatched_spec_paths=True,
+    )
+
+    with pytest.raises(Phase6ContractError, match="Spec input path differs"):
+        validate_public_suite_inputs(loaded)

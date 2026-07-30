@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import stat
 from collections.abc import Sequence
@@ -41,9 +42,11 @@ from agentlab.campaign import (
 from agentlab.models import (
     CodexExecutionEvidence,
     CommandEvidence,
+    CommandStatus,
     ContractModel,
     DiffEvidence,
     ExecutionMode,
+    GateKind,
     LiveRunArtifact,
     Provider,
     ProviderExecutionStatus,
@@ -58,9 +61,7 @@ from agentlab.workflow import (
     LoadedWorkflowSpec,
     WorkflowExperimentSpec,
     WorkflowPlan,
-    WorkflowPlanError,
     WorkflowSpecError,
-    _strict_json,
     load_workflow_plan,
 )
 
@@ -77,6 +78,25 @@ class Phase6ContractError(ValueError):
 
 class Phase6PathError(Phase6ContractError):
     """Raised when a listed Phase 6 path crosses its fixed root."""
+
+
+@dataclass(frozen=True)
+class FileIdentity:
+    device: int
+    inode: int
+    mode: int
+    link_count: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+
+@dataclass(frozen=True)
+class FileSnapshot:
+    path: Path
+    identity: FileIdentity
+    content: bytes
+    sha256: str
 
 
 class Language(StrEnum):
@@ -194,6 +214,93 @@ def _relative_file(value: str, field_name: str) -> str:
     ):
         raise ValueError(f"{field_name} must remain below the fixed root")
     return value
+
+
+def _identity(metadata: os.stat_result) -> FileIdentity:
+    return FileIdentity(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        mode=metadata.st_mode,
+        link_count=metadata.st_nlink,
+        size=metadata.st_size,
+        modified_ns=metadata.st_mtime_ns,
+        changed_ns=metadata.st_ctime_ns,
+    )
+
+
+def _read_stable_regular_file(path: Path, label: str) -> FileSnapshot:
+    """Read one regular non-link file while detecting replacement or mutation."""
+    try:
+        before_path = path.lstat()
+    except OSError as error:
+        raise Phase6PathError(f"{label} is unavailable") from error
+    if stat.S_ISLNK(before_path.st_mode):
+        raise Phase6PathError(f"{label} must not be a symlink")
+    if not stat.S_ISREG(before_path.st_mode):
+        raise Phase6PathError(f"{label} must be a regular file")
+    if before_path.st_nlink != 1:
+        raise Phase6PathError(f"{label} hardlink is not allowed")
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        before_open = os.fstat(descriptor)
+        if (
+            before_open.st_dev,
+            before_open.st_ino,
+        ) != (
+            before_path.st_dev,
+            before_path.st_ino,
+        ):
+            raise Phase6PathError(f"{label} changed before reading")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after_open = os.fstat(descriptor)
+    except Phase6PathError:
+        raise
+    except OSError as error:
+        raise Phase6PathError(f"{label} could not be read safely") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    try:
+        after_path = path.lstat()
+    except OSError as error:
+        raise Phase6PathError(f"{label} changed after reading") from error
+    identities = {
+        _identity(before_path),
+        _identity(before_open),
+        _identity(after_open),
+        _identity(after_path),
+    }
+    if len(identities) != 1:
+        raise Phase6PathError(f"{label} changed while being read")
+    content = b"".join(chunks)
+    if len(content) != after_open.st_size:
+        raise Phase6PathError(f"{label} size changed while being read")
+    return FileSnapshot(
+        path=path,
+        identity=_identity(after_open),
+        content=content,
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
+
+
+def _require_snapshot_unchanged(snapshot: FileSnapshot, label: str) -> None:
+    current = _read_stable_regular_file(snapshot.path, label)
+    if (
+        current.identity != snapshot.identity
+        or current.sha256 != snapshot.sha256
+        or current.content != snapshot.content
+    ):
+        raise Phase6PathError(f"{label} changed after Manifest load")
 
 
 class ToolchainComponent(ContractModel):
@@ -786,18 +893,25 @@ class Phase6RecordingTerminalEvent(ContractModel):
 
     @model_validator(mode="after")
     def terminal_state_is_coherent(self) -> Phase6RecordingTerminalEvent:
+        if self.gate_not_executed_reason is GateNotExecutedReason.INPUT_CHANGED:
+            raise ValueError("input_changed must not create a Recording")
         if self.event_type == "run_completed":
             if (
-                self.overall_status
+                (
+                    self.overall_status is Phase6OverallStatus.PASSED
+                    and self.failure_kind is not Phase6FailureKind.NONE
+                )
+                or (
+                    self.overall_status is Phase6OverallStatus.FAILED
+                    and self.failure_kind
+                    is not Phase6FailureKind.QUALITY_GATE_FAILURE
+                )
+                or self.overall_status
                 not in {Phase6OverallStatus.PASSED, Phase6OverallStatus.FAILED}
-                or self.failure_kind
-                not in {
-                    Phase6FailureKind.NONE,
-                    Phase6FailureKind.QUALITY_GATE_FAILURE,
-                }
                 or not self.gate_executed
                 or self.gate_not_executed_reason is not None
                 or self.metrics is None
+                or self.codex.status is not ProviderExecutionStatus.SUCCEEDED
             ):
                 raise ValueError("run_completed requires a complete quality result")
             return self
@@ -836,6 +950,65 @@ class Phase6RecordingTerminalEvent(ContractModel):
         ):
             raise ValueError(
                 "output_contract_violation requires successful Codex and no Gate"
+            )
+        provider_failures = {
+            Phase6FailureKind.PROVIDER_TURN_FAILED,
+            Phase6FailureKind.PROVIDER_CLI_NONZERO,
+            Phase6FailureKind.PROVIDER_SIGNAL_TERMINATION,
+            Phase6FailureKind.PROVIDER_TIMEOUT,
+            Phase6FailureKind.PROVIDER_UNAVAILABLE,
+            Phase6FailureKind.PROVIDER_SPAWN_ERROR,
+            Phase6FailureKind.PROVIDER_INPUT_ERROR,
+            Phase6FailureKind.PROVIDER_PROTOCOL_ERROR,
+            Phase6FailureKind.PROVIDER_OUTPUT_LIMIT,
+        }
+        harness_failures = {
+            Phase6FailureKind.PROCESS_CLEANUP_ERROR,
+            Phase6FailureKind.GATE_HARNESS_ERROR,
+            Phase6FailureKind.EVIDENCE_ERROR,
+            Phase6FailureKind.UNSUPPORTED_PLATFORM,
+        }
+        if (
+            self.overall_status is Phase6OverallStatus.PROVIDER_ERROR
+        ) is not (self.failure_kind in provider_failures):
+            raise ValueError(
+                "provider_error status must match a Provider failure kind"
+            )
+        if (
+            self.overall_status is Phase6OverallStatus.HARNESS_ERROR
+        ) is not (self.failure_kind in harness_failures):
+            raise ValueError(
+                "harness_error status must match a Harness failure kind"
+            )
+        if (
+            self.overall_status is Phase6OverallStatus.PROVIDER_ERROR
+            and self.codex.failure_kind.value != self.failure_kind.value
+        ):
+            raise ValueError(
+                "Recording and Codex Provider failure kinds must match"
+            )
+        if self.overall_status is Phase6OverallStatus.PROVIDER_ERROR:
+            expected_reason = (
+                GateNotExecutedReason.PROVIDER_TIMEOUT
+                if self.failure_kind is Phase6FailureKind.PROVIDER_TIMEOUT
+                else GateNotExecutedReason.PROVIDER_FAILURE
+            )
+            if (
+                self.codex.status is not ProviderExecutionStatus.FAILED
+                or self.gate_executed
+                or self.gate_not_executed_reason is not expected_reason
+            ):
+                raise ValueError(
+                    "Provider failure requires failed Codex and its fixed Gate reason"
+                )
+        if (
+            self.overall_status is Phase6OverallStatus.HARNESS_ERROR
+            and not self.gate_executed
+            and self.gate_not_executed_reason
+            is not GateNotExecutedReason.PRE_GATE_HARNESS_FAILURE
+        ):
+            raise ValueError(
+                "pre-Gate Harness failure requires its fixed Gate reason"
             )
         if self.gate_executed is (
             self.gate_not_executed_reason is not None
@@ -917,8 +1090,26 @@ class LiveRunArtifactV1_2(ContractModel):
 
     @model_validator(mode="after")
     def artifact_state_is_coherent(self) -> LiveRunArtifactV1_2:
+        if self.gate_not_executed_reason is GateNotExecutedReason.INPUT_CHANGED:
+            raise ValueError("input_changed must not create a LiveRunArtifact")
         if self.completed_at < self.started_at:
             raise ValueError("completed_at must not precede started_at")
+        if not (
+            self.started_at
+            <= self.codex.started_at
+            <= self.codex.completed_at
+            <= self.completed_at
+        ):
+            raise ValueError(
+                "Codex timestamps must remain inside Artifact timestamps"
+            )
+        if (
+            self.codex.stdin_bytes_total is not None
+            and self.codex.stdin_bytes_total != self.prompt_bytes
+        ):
+            raise ValueError(
+                "Codex stdin byte total must match Prompt byte count"
+            )
         if self.gate_executed != bool(self.gate_commands):
             raise ValueError("gate_executed must match Gate Evidence presence")
         if self.gate_executed is (
@@ -953,8 +1144,14 @@ class LiveRunArtifactV1_2(ContractModel):
         if self.overall_status in {
             Phase6OverallStatus.PASSED,
             Phase6OverallStatus.FAILED,
-        } and (not self.gate_executed or self.metrics is None):
-            raise ValueError("quality result requires Gate Evidence and Metrics")
+        } and (
+            not self.gate_executed
+            or self.metrics is None
+            or self.codex.status is not ProviderExecutionStatus.SUCCEEDED
+        ):
+            raise ValueError(
+                "quality result requires successful Codex, Gate Evidence, and Metrics"
+            )
         if (
             self.overall_status is Phase6OverallStatus.PASSED
             and self.failure_kind is not Phase6FailureKind.NONE
@@ -976,6 +1173,152 @@ class LiveRunArtifactV1_2(ContractModel):
             or self.metrics is not None
         ):
             raise ValueError("non-quality failures must not contain Metrics")
+        provider_failures = {
+            Phase6FailureKind.PROVIDER_TURN_FAILED,
+            Phase6FailureKind.PROVIDER_CLI_NONZERO,
+            Phase6FailureKind.PROVIDER_SIGNAL_TERMINATION,
+            Phase6FailureKind.PROVIDER_TIMEOUT,
+            Phase6FailureKind.PROVIDER_UNAVAILABLE,
+            Phase6FailureKind.PROVIDER_SPAWN_ERROR,
+            Phase6FailureKind.PROVIDER_INPUT_ERROR,
+            Phase6FailureKind.PROVIDER_PROTOCOL_ERROR,
+            Phase6FailureKind.PROVIDER_OUTPUT_LIMIT,
+        }
+        harness_failures = {
+            Phase6FailureKind.PROCESS_CLEANUP_ERROR,
+            Phase6FailureKind.GATE_HARNESS_ERROR,
+            Phase6FailureKind.EVIDENCE_ERROR,
+            Phase6FailureKind.UNSUPPORTED_PLATFORM,
+        }
+        if (
+            self.overall_status is Phase6OverallStatus.PROVIDER_ERROR
+        ) is not (self.failure_kind in provider_failures):
+            raise ValueError(
+                "provider_error status must match a Provider failure kind"
+            )
+        if (
+            self.overall_status is Phase6OverallStatus.HARNESS_ERROR
+        ) is not (self.failure_kind in harness_failures):
+            raise ValueError(
+                "harness_error status must match a Harness failure kind"
+            )
+        if (
+            self.overall_status is Phase6OverallStatus.PROVIDER_ERROR
+            and self.codex.failure_kind.value != self.failure_kind.value
+        ):
+            raise ValueError(
+                "Artifact and Codex Provider failure kinds must match"
+            )
+        if self.overall_status is Phase6OverallStatus.PROVIDER_ERROR:
+            expected_reason = (
+                GateNotExecutedReason.PROVIDER_TIMEOUT
+                if self.failure_kind is Phase6FailureKind.PROVIDER_TIMEOUT
+                else GateNotExecutedReason.PROVIDER_FAILURE
+            )
+            if (
+                self.codex.status is not ProviderExecutionStatus.FAILED
+                or self.gate_executed
+                or self.gate_not_executed_reason is not expected_reason
+            ):
+                raise ValueError(
+                    "Provider failure requires failed Codex and its fixed Gate reason"
+                )
+        if (
+            self.overall_status is Phase6OverallStatus.HARNESS_ERROR
+            and not self.gate_executed
+            and self.gate_not_executed_reason
+            is not GateNotExecutedReason.PRE_GATE_HARNESS_FAILURE
+        ):
+            raise ValueError(
+                "pre-Gate Harness failure requires its fixed Gate reason"
+            )
+        if self.metrics is not None and (
+            self.metrics.agent_duration_ms != self.codex.duration_ms
+            or self.metrics.total_duration_ms
+            != self.metrics.agent_duration_ms
+            + self.metrics.evaluation_duration_ms
+            or self.metrics.agent_call_count != 1
+            or self.metrics.retry_count != 0
+            or self.metrics.changed_files != self.diff.changed_files
+            or self.metrics.added_lines != self.diff.added_lines
+            or self.metrics.deleted_lines != self.diff.deleted_lines
+            or self.metrics.usage_metrics != self.codex.usage_metrics
+        ):
+            raise ValueError(
+                "Artifact Metrics must match Codex and diff observations"
+            )
+        if self.metrics is not None:
+            acceptance = [
+                command
+                for command in self.gate_commands
+                if command.gate is GateKind.ACCEPTANCE
+            ]
+            regression = [
+                command
+                for command in self.gate_commands
+                if command.gate is GateKind.REGRESSION
+            ]
+            lint = [
+                command
+                for command in self.gate_commands
+                if command.gate is GateKind.LINT
+            ]
+            typecheck = [
+                command
+                for command in self.gate_commands
+                if command.gate is GateKind.TYPECHECK
+            ]
+            expected_counts = (
+                sum(
+                    command.status is CommandStatus.PASSED
+                    for command in acceptance
+                ),
+                len(acceptance),
+                sum(
+                    command.status is CommandStatus.FAILED
+                    for command in regression
+                ),
+                sum(
+                    command.status is CommandStatus.FAILED
+                    for command in lint
+                ),
+                sum(
+                    command.status is CommandStatus.FAILED
+                    for command in typecheck
+                ),
+            )
+            actual_counts = (
+                self.metrics.acceptance_tests_passed,
+                self.metrics.acceptance_tests_total,
+                self.metrics.regression_failures,
+                self.metrics.lint_errors,
+                self.metrics.typecheck_errors,
+            )
+            expected_quality_pass = all(
+                command.status is CommandStatus.PASSED
+                for command in self.gate_commands
+            )
+            if (
+                actual_counts != expected_counts
+                or self.metrics.quality_gate_pass is not expected_quality_pass
+            ):
+                raise ValueError(
+                    "Artifact Metrics must match Gate command observations"
+                )
+        if self.gate_commands:
+            if not any(
+                command.gate.value == "acceptance"
+                for command in self.gate_commands
+            ):
+                raise ValueError("executed Gate requires acceptance commands")
+            if any(
+                command.started_at < self.codex.completed_at
+                or command.completed_at > self.completed_at
+                for command in self.gate_commands
+            ):
+                raise ValueError(
+                    "Gate timestamps must follow Codex and remain in the Artifact"
+                )
         return self
 
 
@@ -1212,6 +1555,7 @@ class PublicRunRecord(ContractModel):
     provider_call_count: Literal[1]
     gate_executed: StrictBool
     gate_not_executed_reason: GateNotExecutedReason | None
+    run_metrics_available: StrictBool
     acceptance_passed: StrictInt = Field(ge=0)
     acceptance_total: StrictInt = Field(ge=0)
     regression_failures: StrictInt = Field(ge=0)
@@ -1241,6 +1585,10 @@ class PublicRunRecord(ContractModel):
     def public_allowlist_values_are_coherent(self) -> PublicRunRecord:
         if self.completed_at < self.started_at:
             raise ValueError("completed_at must not precede started_at")
+        if self.acceptance_passed > self.acceptance_total:
+            raise ValueError(
+                "acceptance_passed must not exceed acceptance_total"
+            )
         if self.gate_executed is (
             self.gate_not_executed_reason is not None
         ):
@@ -1250,6 +1598,131 @@ class PublicRunRecord(ContractModel):
         if self.gate_not_executed_reason is GateNotExecutedReason.INPUT_CHANGED:
             raise ValueError(
                 "input_changed has no Provider call and belongs only in aggregate counts"
+            )
+        gate_values = (
+            self.acceptance_passed,
+            self.acceptance_total,
+            self.regression_failures,
+            self.lint_errors,
+            self.typecheck_errors,
+        )
+        if not self.gate_executed and any(gate_values):
+            raise ValueError("unexecuted Gate requires zero Gate result counts")
+
+        metric_values = (
+            self.agent_duration_ms,
+            self.evaluation_duration_ms,
+            self.total_duration_ms,
+            self.changed_file_count,
+            self.added_lines,
+            self.deleted_lines,
+        )
+        if self.run_metrics_available is not all(
+            value is not None for value in metric_values
+        ):
+            raise ValueError(
+                "run_metrics_available must match complete Metrics fields"
+            )
+        if not self.run_metrics_available and any(
+            value is not None for value in metric_values
+        ):
+            raise ValueError("missing RunMetrics requires null Metrics fields")
+        if self.run_metrics_available:
+            assert self.agent_duration_ms is not None
+            assert self.evaluation_duration_ms is not None
+            assert self.total_duration_ms is not None
+            if (
+                self.total_duration_ms
+                != self.agent_duration_ms + self.evaluation_duration_ms
+            ):
+                raise ValueError("total duration must equal Agent plus evaluation")
+
+        provider_failures = {
+            Phase6FailureKind.PROVIDER_TURN_FAILED,
+            Phase6FailureKind.PROVIDER_CLI_NONZERO,
+            Phase6FailureKind.PROVIDER_SIGNAL_TERMINATION,
+            Phase6FailureKind.PROVIDER_TIMEOUT,
+            Phase6FailureKind.PROVIDER_UNAVAILABLE,
+            Phase6FailureKind.PROVIDER_SPAWN_ERROR,
+            Phase6FailureKind.PROVIDER_INPUT_ERROR,
+            Phase6FailureKind.PROVIDER_PROTOCOL_ERROR,
+            Phase6FailureKind.PROVIDER_OUTPUT_LIMIT,
+        }
+        harness_failures = {
+            Phase6FailureKind.PROCESS_CLEANUP_ERROR,
+            Phase6FailureKind.GATE_HARNESS_ERROR,
+            Phase6FailureKind.EVIDENCE_ERROR,
+            Phase6FailureKind.UNSUPPORTED_PLATFORM,
+        }
+        if self.overall_status in {
+            Phase6OverallStatus.PASSED,
+            Phase6OverallStatus.FAILED,
+        }:
+            expected_failure = (
+                Phase6FailureKind.NONE
+                if self.overall_status is Phase6OverallStatus.PASSED
+                else Phase6FailureKind.QUALITY_GATE_FAILURE
+            )
+            if (
+                self.failure_kind is not expected_failure
+                or not self.gate_executed
+                or not self.run_metrics_available
+                or self.acceptance_total == 0
+            ):
+                raise ValueError(
+                    "quality status requires matching failure, Gate, and Metrics"
+                )
+            quality_passed = (
+                self.acceptance_passed == self.acceptance_total
+                and self.regression_failures == 0
+                and self.lint_errors == 0
+                and self.typecheck_errors == 0
+            )
+            if (
+                self.overall_status is Phase6OverallStatus.PASSED
+            ) is not quality_passed:
+                raise ValueError(
+                    "quality status must match the published Gate counts"
+                )
+        elif self.overall_status is Phase6OverallStatus.REJECTED:
+            if (
+                self.failure_kind
+                is not Phase6FailureKind.OUTPUT_CONTRACT_VIOLATION
+                or self.gate_executed
+                or self.gate_not_executed_reason
+                is not GateNotExecutedReason.OUTPUT_CONTRACT_VIOLATION
+                or self.run_metrics_available
+            ):
+                raise ValueError(
+                    "rejected status requires output_contract_violation and no Gate"
+                )
+        elif self.overall_status is Phase6OverallStatus.PROVIDER_ERROR:
+            expected_reason = (
+                GateNotExecutedReason.PROVIDER_TIMEOUT
+                if self.failure_kind is Phase6FailureKind.PROVIDER_TIMEOUT
+                else GateNotExecutedReason.PROVIDER_FAILURE
+            )
+            if (
+                self.failure_kind not in provider_failures
+                or self.gate_executed
+                or self.gate_not_executed_reason is not expected_reason
+                or self.run_metrics_available
+            ):
+                raise ValueError(
+                    "provider_error requires a Provider failure and no Gate"
+                )
+        elif (
+            self.overall_status is not Phase6OverallStatus.HARNESS_ERROR
+            or self.failure_kind not in harness_failures
+            or self.run_metrics_available
+            or (
+                not self.gate_executed
+                and self.gate_not_executed_reason
+                is not GateNotExecutedReason.PRE_GATE_HARNESS_FAILURE
+            )
+        ):
+            raise ValueError(
+                "harness_error requires a Harness failure and no RunMetrics"
             )
         usage_values = (
             self.input_tokens,
@@ -1447,15 +1920,24 @@ def _load_canonical_model[TContract: ContractModel](
     model: type[TContract],
     label: str,
 ) -> TContract:
+    snapshot = _read_stable_regular_file(path, label)
+    return _load_canonical_model_bytes(snapshot.content, model, label)
+
+
+def _load_canonical_model_bytes[TContract: ContractModel](
+    content: bytes,
+    model: type[TContract],
+    label: str,
+) -> TContract:
     try:
-        raw = _strict_json(path, label)
-    except WorkflowPlanError as error:
-        raise Phase6ContractError(str(error)) from error
+        raw = _strict_json_bytes(content, label)
+    except Phase6ContractError:
+        raise
     try:
         validated = model.model_validate(raw)
     except ValidationError as error:
         raise Phase6ContractError(f"invalid {label}: {error}") from error
-    if path.read_bytes() != canonical_json_bytes(validated):
+    if content != canonical_json_bytes(validated):
         raise Phase6ContractError(f"{label} must use canonical JSON serialization")
     return validated
 
@@ -1525,10 +2007,16 @@ def load_external_checksum_anchor(path: Path) -> ExternalChecksumAnchor:
 
 
 def load_workflow_spec_contract(path: Path) -> LoadedWorkflowSpecContract:
+    snapshot = _read_stable_regular_file(path, "Workflow Spec")
+    return _load_workflow_spec_contract_bytes(snapshot.content)
+
+
+def _load_workflow_spec_contract_bytes(
+    source: bytes,
+) -> LoadedWorkflowSpecContract:
     try:
-        source = path.read_bytes()
         raw: Any = yaml.safe_load(source.decode("utf-8"))
-    except (OSError, UnicodeError, yaml.YAMLError) as error:
+    except (UnicodeError, yaml.YAMLError) as error:
         raise WorkflowSpecError(f"could not read Workflow Spec YAML: {error}") from error
     if not isinstance(raw, dict):
         raise WorkflowSpecError("Workflow Spec must be a YAML mapping")
@@ -1550,19 +2038,25 @@ def load_workflow_spec_contract(path: Path) -> LoadedWorkflowSpecContract:
 
 
 def load_workflow_plan_contract(path: Path) -> WorkflowPlanContract:
-    try:
-        raw = _strict_json(path, "Workflow Plan")
-    except WorkflowPlanError as error:
-        raise Phase6ContractError(str(error)) from error
+    snapshot = _read_stable_regular_file(path, "Workflow Plan")
+    raw = _strict_json_bytes(snapshot.content, "Workflow Plan")
     if raw.get("schema_version") == "1.1":
         return load_workflow_plan(path)
+    return _load_workflow_plan_1_2_bytes(snapshot.content)
+
+
+def _load_workflow_plan_1_2_bytes(content: bytes) -> WorkflowPlanV1_2:
+    try:
+        raw = _strict_json_bytes(content, "Workflow Plan")
+    except Phase6ContractError:
+        raise
     if raw.get("schema_version") != "1.2":
         raise Phase6ContractError("unsupported Workflow Plan schema_version")
     try:
         plan = WorkflowPlanV1_2.model_validate(raw)
     except ValidationError as error:
         raise Phase6ContractError(f"invalid Workflow Plan: {error}") from error
-    if path.read_bytes() != canonical_json_bytes(plan):
+    if content != canonical_json_bytes(plan):
         raise Phase6ContractError("Workflow Plan must use canonical JSON serialization")
     return plan
 
@@ -1584,10 +2078,31 @@ def _reject_non_finite(value: str) -> NoReturn:
     raise ValueError(f"non-finite JSON number {value}")
 
 
-def _load_jsonl_objects(path: Path, label: str) -> list[dict[str, Any]]:
+def _strict_json_bytes(content: bytes, label: str) -> dict[str, Any]:
     try:
-        lines = path.read_bytes().decode("utf-8").splitlines()
-    except (OSError, UnicodeError) as error:
+        raw = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=_unique_object,
+            parse_constant=_reject_non_finite,
+        )
+    except _DuplicateKeyError as error:
+        raise Phase6ContractError(
+            f"{label} contains duplicate key {error}"
+        ) from error
+    except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise Phase6ContractError(f"could not read strict {label} JSON") from error
+    if not isinstance(raw, dict):
+        raise Phase6ContractError(f"{label} must be a JSON object")
+    return raw
+
+
+def _load_jsonl_objects_bytes(
+    content: bytes,
+    label: str,
+) -> list[dict[str, Any]]:
+    try:
+        lines = content.decode("utf-8").splitlines()
+    except UnicodeError as error:
         raise Phase6ContractError(f"could not read {label}") from error
     if not lines or any(not line.strip() for line in lines):
         raise Phase6ContractError(f"{label} must be non-empty JSONL without blank lines")
@@ -1610,10 +2125,21 @@ def _load_jsonl_objects(path: Path, label: str) -> list[dict[str, Any]]:
 
 
 def load_campaign_contract(path: Path) -> CampaignContract:
-    raw_events = _load_jsonl_objects(path, "Campaign")
+    snapshot = _read_stable_regular_file(path, "Campaign")
+    raw_events = _load_jsonl_objects_bytes(snapshot.content, "Campaign")
     version = raw_events[0].get("schema_version")
     if version == "1.1":
         return load_campaign(path)
+    return _load_phase6_campaign_bytes(snapshot.content, raw_events)
+
+
+def _load_phase6_campaign_bytes(
+    content: bytes,
+    raw_events: list[dict[str, Any]] | None = None,
+) -> LoadedPhase6Campaign:
+    if raw_events is None:
+        raw_events = _load_jsonl_objects_bytes(content, "Campaign")
+    version = raw_events[0].get("schema_version")
     if version != "1.2" or any(
         event.get("schema_version") != "1.2" for event in raw_events
     ):
@@ -1626,7 +2152,7 @@ def load_campaign_contract(path: Path) -> CampaignContract:
             raise Phase6ContractError(f"invalid Campaign 1.2 event: {error}") from error
     _validate_phase6_campaign(events)
     canonical = b"".join(_canonical_jsonl_line(event) for event in events)
-    if path.read_bytes() != canonical:
+    if content != canonical:
         raise Phase6ContractError("Campaign 1.2 must use canonical JSONL serialization")
     return LoadedPhase6Campaign(tuple(events))
 
@@ -1640,6 +2166,12 @@ def _validate_phase6_campaign(events: list[Phase6CampaignEvent]) -> None:
         raise Phase6ContractError("Campaign 1.2 requires started and finished boundaries")
     if [event.sequence for event in events] != list(range(len(events))):
         raise Phase6ContractError("Campaign 1.2 sequence must be contiguous")
+    if [event.occurred_at for event in events] != sorted(
+        event.occurred_at for event in events
+    ):
+        raise Phase6ContractError(
+            "Campaign 1.2 timestamps must be non-decreasing"
+        )
     started = events[0]
     finished = events[-1]
     assert isinstance(started, Phase6CampaignStartedEvent)
@@ -1653,6 +2185,10 @@ def _validate_phase6_campaign(events: list[Phase6CampaignEvent]) -> None:
     started_events = [
         event for event in runs if event.status is CampaignRunStatus.STARTED
     ]
+    started_by_id = {event.run_id: event for event in started_events}
+    sequence_by_started_id = {
+        event.run_id: event.sequence for event in started_events
+    }
     terminal = [
         event for event in runs if event.status is not CampaignRunStatus.STARTED
     ]
@@ -1677,22 +2213,61 @@ def _validate_phase6_campaign(events: list[Phase6CampaignEvent]) -> None:
         for event in terminal
     ):
         raise Phase6ContractError("attempted terminal state requires a started event")
-    input_changed = [
-        event
+    for event in terminal:
+        if event.status is CampaignRunStatus.NOT_RUN:
+            if event.run_id in started_ids:
+                raise Phase6ContractError(
+                    "not_run state must not have a started event"
+                )
+            continue
+        started_event = started_by_id[event.run_id]
+        if sequence_by_started_id[event.run_id] >= event.sequence:
+            raise Phase6ContractError(
+                "run started event must precede its terminal event"
+            )
+        if (
+            started_event.task_id != event.task_id
+            or started_event.workflow is not event.workflow
+            or started_event.repetition_index != event.repetition_index
+        ):
+            raise Phase6ContractError(
+                "run started and terminal identities differ"
+            )
+
+    not_run_reasons = {
+        event.stop_reason
         for event in terminal
-        if event.stop_reason is CampaignStopReason.INPUT_CHANGED
-    ]
-    if input_changed and finished.stop_reason is not CampaignStopReason.INPUT_CHANGED:
+        if event.status is CampaignRunStatus.NOT_RUN
+    }
+    if not_run_reasons and not_run_reasons != {finished.stop_reason}:
         raise Phase6ContractError(
-            "input_changed run requires input_changed Campaign stop reason"
+            "Campaign finished stop reason differs from not_run reason"
+        )
+    if (
+        finished.stop_reason is CampaignStopReason.INPUT_CHANGED
+        and CampaignStopReason.INPUT_CHANGED not in not_run_reasons
+    ):
+        raise Phase6ContractError(
+            "input_changed Campaign finish requires an input_changed not_run state"
         )
 
 
 def load_recording_contract(path: Path) -> RecordingContract:
-    raw_events = _load_jsonl_objects(path, "Recording")
+    snapshot = _read_stable_regular_file(path, "Recording")
+    raw_events = _load_jsonl_objects_bytes(snapshot.content, "Recording")
     version = raw_events[0].get("schema_version")
     if version in {"1.0", "1.1"}:
         return load_replay_recording(path)
+    return _load_phase6_recording_bytes(snapshot.content, raw_events)
+
+
+def _load_phase6_recording_bytes(
+    content: bytes,
+    raw_events: list[dict[str, Any]] | None = None,
+) -> Phase6Recording:
+    if raw_events is None:
+        raw_events = _load_jsonl_objects_bytes(content, "Recording")
+    version = raw_events[0].get("schema_version")
     if (
         version != "1.2"
         or len(raw_events) != 2
@@ -1717,26 +2292,38 @@ def load_recording_contract(path: Path) -> RecordingContract:
     canonical = b"".join(
         _canonical_jsonl_line(event) for event in (started, terminal)
     )
-    if path.read_bytes() != canonical:
+    if content != canonical:
         raise Phase6ContractError("Recording 1.2 must use canonical JSONL serialization")
     return Phase6Recording(started, terminal)
 
 
 def load_live_run_artifact_contract(path: Path) -> LiveRunArtifactContract:
-    raw = _strict_json(path, "LiveRunArtifact")
+    snapshot = _read_stable_regular_file(path, "LiveRunArtifact")
+    raw = _strict_json_bytes(snapshot.content, "LiveRunArtifact")
     version = raw.get("schema_version")
-    selected: type[LiveRunArtifact] | type[LiveRunArtifactV1_2]
     if version in {"1.0", "1.1"}:
-        selected = LiveRunArtifact
-    elif version == "1.2":
-        selected = LiveRunArtifactV1_2
-    else:
+        try:
+            return LiveRunArtifact.model_validate(raw)
+        except ValidationError as error:
+            raise Phase6ContractError(
+                f"invalid LiveRunArtifact: {error}"
+            ) from error
+    return _load_live_run_artifact_1_2_bytes(snapshot.content, raw)
+
+
+def _load_live_run_artifact_1_2_bytes(
+    content: bytes,
+    raw: dict[str, Any] | None = None,
+) -> LiveRunArtifactV1_2:
+    if raw is None:
+        raw = _strict_json_bytes(content, "LiveRunArtifact")
+    if raw.get("schema_version") != "1.2":
         raise Phase6ContractError("unsupported LiveRunArtifact schema_version")
     try:
-        artifact = selected.model_validate(raw)
+        artifact = LiveRunArtifactV1_2.model_validate(raw)
     except ValidationError as error:
         raise Phase6ContractError(f"invalid LiveRunArtifact: {error}") from error
-    if version == "1.2" and path.read_bytes() != canonical_json_bytes(artifact):
+    if content != canonical_json_bytes(artifact):
         raise Phase6ContractError(
             "LiveRunArtifact 1.2 must use canonical JSON serialization"
         )
@@ -1867,8 +2454,10 @@ def _safe_listed_file(root: Path, relative: str) -> Path:
 class LoadedPublicSuiteInputs:
     manifest: PublicSuiteManifest
     root: Path
+    manifest_snapshot: FileSnapshot
     paths: dict[str, Path]
     bytes_by_path: dict[str, bytes]
+    snapshots_by_path: dict[str, FileSnapshot]
 
 
 @dataclass(frozen=True)
@@ -1886,33 +2475,49 @@ def load_public_suite_inputs(
     """Load exactly the Manifest and its explicitly listed input files."""
     resolved_root = _safe_root(root)
     try:
-        relative_manifest = manifest_path.resolve(strict=True).relative_to(
-            resolved_root
-        ).as_posix()
-    except (OSError, RuntimeError, ValueError) as error:
+        lexical_manifest = Path(os.path.abspath(manifest_path))
+        relative_manifest = lexical_manifest.relative_to(resolved_root).as_posix()
+    except (OSError, ValueError) as error:
         raise Phase6PathError("Public Suite Manifest must remain below root") from error
     safe_manifest = _safe_listed_file(resolved_root, relative_manifest)
-    manifest = _load_canonical_model(
+    manifest_snapshot = _read_stable_regular_file(
         safe_manifest,
+        "Public Suite Manifest",
+    )
+    manifest = _load_canonical_model_bytes(
+        manifest_snapshot.content,
         PublicSuiteManifest,
         "Public Suite Manifest",
     )
     paths: dict[str, Path] = {}
     bytes_by_path: dict[str, bytes] = {}
+    snapshots_by_path: dict[str, FileSnapshot] = {}
+    identities = {manifest_snapshot.identity}
     for reference in _manifest_references(manifest):
         path = _safe_listed_file(resolved_root, reference.path)
-        content = path.read_bytes()
-        if hashlib.sha256(content).hexdigest() != reference.sha256:
+        snapshot = _read_stable_regular_file(
+            path,
+            f"listed Artifact {reference.path}",
+        )
+        if snapshot.identity in identities:
+            raise Phase6PathError(
+                "Manifest and listed Artifacts must have distinct file identities"
+            )
+        identities.add(snapshot.identity)
+        if snapshot.sha256 != reference.sha256:
             raise Phase6ContractError(
                 f"listed Artifact hash differs: {reference.path}"
             )
         paths[reference.path] = path
-        bytes_by_path[reference.path] = content
+        bytes_by_path[reference.path] = snapshot.content
+        snapshots_by_path[reference.path] = snapshot
     return LoadedPublicSuiteInputs(
         manifest=manifest,
         root=resolved_root,
+        manifest_snapshot=manifest_snapshot,
         paths=paths,
         bytes_by_path=bytes_by_path,
+        snapshots_by_path=snapshots_by_path,
     )
 
 
@@ -2078,6 +2683,7 @@ def validate_public_suite_inputs(
     loaded: LoadedPublicSuiteInputs,
 ) -> ValidatedPublicSuiteInputs:
     """Strict-load and cross-check every explicitly listed Suite input."""
+    _require_loaded_inputs_unchanged(loaded)
     statuses: dict[Language, LanguageStatus] = {}
     acceptances: list[FixtureAcceptanceRecord] = []
     campaigns: list[CampaignContract] = []
@@ -2087,32 +2693,50 @@ def validate_public_suite_inputs(
 
     for source in loaded.manifest.primary_sources:
         spec = (
-            load_workflow_spec_contract(loaded.paths[source.spec.path])
+            _load_workflow_spec_contract_bytes(
+                loaded.bytes_by_path[source.spec.path]
+            )
             if source.spec is not None
             else None
         )
         fixture_manifest = (
-            load_fixture_manifest(loaded.paths[source.fixture_manifest.path])
+            _load_canonical_model_bytes(
+                loaded.bytes_by_path[source.fixture_manifest.path],
+                FixtureManifest,
+                "Fixture Manifest",
+            )
             if source.fixture_manifest is not None
             else None
         )
         acceptance = (
-            load_fixture_acceptance(loaded.paths[source.fixture_acceptance.path])
+            _load_canonical_model_bytes(
+                loaded.bytes_by_path[source.fixture_acceptance.path],
+                FixtureAcceptanceRecord,
+                "Fixture Acceptance Record",
+            )
             if source.fixture_acceptance is not None
             else None
         )
         policy = (
-            load_diff_policy(loaded.paths[source.diff_policy.path])
+            _load_canonical_model_bytes(
+                loaded.bytes_by_path[source.diff_policy.path],
+                DiffPolicy,
+                "Diff Policy",
+            )
             if source.diff_policy is not None
             else None
         )
         plan = (
-            load_workflow_plan_contract(loaded.paths[source.plan.path])
+            _load_workflow_plan_1_2_bytes(
+                loaded.bytes_by_path[source.plan.path]
+            )
             if source.plan is not None
             else None
         )
         campaign = (
-            load_campaign_contract(loaded.paths[source.campaign.path])
+            _load_phase6_campaign_bytes(
+                loaded.bytes_by_path[source.campaign.path]
+            )
             if source.campaign is not None
             else None
         )
@@ -2137,6 +2761,12 @@ def validate_public_suite_inputs(
             assert source.fixture_manifest is not None
             assert source.fixture_acceptance is not None
             assert source.diff_policy is not None
+            assert source.spec is not None
+            _validate_spec_path_bindings(
+                loaded=loaded,
+                source=source,
+                spec=spec.spec,
+            )
             validate_plan_bindings(
                 loaded_spec=spec,
                 plan=plan,
@@ -2160,24 +2790,21 @@ def validate_public_suite_inputs(
 
         evidence: list[LiveRunArtifactV1_2] = []
         for reference in source.evidence:
-            artifact = load_live_run_artifact_contract(loaded.paths[reference.path])
-            if not isinstance(artifact, LiveRunArtifactV1_2):
-                raise Phase6ContractError(
-                    "Primary Phase 6 Evidence must use LiveRunArtifact 1.2"
-                )
+            artifact = _load_live_run_artifact_1_2_bytes(
+                loaded.bytes_by_path[reference.path]
+            )
             evidence.append(artifact)
             live_artifacts.append(artifact)
         recordings: list[Phase6Recording] = []
         for reference in source.recordings:
-            recording = load_recording_contract(loaded.paths[reference.path])
-            if not isinstance(recording, Phase6Recording):
-                raise Phase6ContractError(
-                    "Primary Phase 6 Recording must use schema 1.2"
-                )
+            recording = _load_phase6_recording_bytes(
+                loaded.bytes_by_path[reference.path]
+            )
             recordings.append(recording)
             live_recordings.append(recording)
         _validate_primary_live_bindings(
             source=source,
+            spec=spec.spec if spec is not None else None,
             plan=plan,
             campaign=campaign,
             evidence=evidence,
@@ -2191,8 +2818,10 @@ def validate_public_suite_inputs(
         statuses[source.language] = status
 
     for historical_source in loaded.manifest.historical_sources:
-        record = load_historical_verification(
-            loaded.paths[historical_source.verification_record.path]
+        record = _load_canonical_model_bytes(
+            loaded.bytes_by_path[historical_source.verification_record.path],
+            HistoricalVerificationRecord,
+            "Historical Verification Record",
         )
         if (
             record.language is not historical_source.language
@@ -2217,6 +2846,7 @@ def validate_public_suite_inputs(
         live_artifacts=live_artifacts,
         recordings=live_recordings,
     )
+    _require_loaded_inputs_unchanged(loaded)
     return ValidatedPublicSuiteInputs(
         loaded=loaded,
         derived_language_status=statuses,
@@ -2224,9 +2854,58 @@ def validate_public_suite_inputs(
     )
 
 
+def _require_loaded_inputs_unchanged(
+    loaded: LoadedPublicSuiteInputs,
+) -> None:
+    _require_snapshot_unchanged(
+        loaded.manifest_snapshot,
+        "Public Suite Manifest",
+    )
+    for relative, snapshot in loaded.snapshots_by_path.items():
+        _require_snapshot_unchanged(
+            snapshot,
+            f"listed Artifact {relative}",
+        )
+
+
+def _validate_spec_path_bindings(
+    *,
+    loaded: LoadedPublicSuiteInputs,
+    source: PrimarySuiteSource,
+    spec: WorkflowExperimentSpecV2_1,
+) -> None:
+    assert source.spec is not None
+    assert source.fixture_manifest is not None
+    assert source.fixture_acceptance is not None
+    assert source.diff_policy is not None
+    spec_path = loaded.paths[source.spec.path]
+    bindings = (
+        (spec.fixture_manifest_path, source.fixture_manifest),
+        (spec.fixture_acceptance_path, source.fixture_acceptance),
+        (spec.diff_policy_path, source.diff_policy),
+    )
+    for spec_relative, reference in bindings:
+        try:
+            lexical = Path(os.path.abspath(spec_path.parent / spec_relative))
+            relative = lexical.relative_to(loaded.root).as_posix()
+        except (OSError, ValueError) as error:
+            raise Phase6PathError(
+                "Workflow Spec input path escapes the fixed Suite root"
+            ) from error
+        suite_path = loaded.paths[reference.path]
+        if (
+            relative != reference.path
+            or loaded.snapshots_by_path[reference.path].path != suite_path
+        ):
+            raise Phase6ContractError(
+                "Workflow Spec input path differs from Suite Artifact reference"
+            )
+
+
 def _validate_primary_live_bindings(
     *,
     source: PrimarySuiteSource,
+    spec: WorkflowSpecContract | None,
     plan: WorkflowPlanContract | None,
     campaign: CampaignContract | None,
     evidence: list[LiveRunArtifactV1_2],
@@ -2238,9 +2917,10 @@ def _validate_primary_live_bindings(
                 "Evidence and Recording require a listed Campaign"
             )
         return
-    if not isinstance(plan, WorkflowPlanV1_2) or not isinstance(
-        campaign,
-        LoadedPhase6Campaign,
+    if (
+        not isinstance(spec, WorkflowExperimentSpecV2_1)
+        or not isinstance(plan, WorkflowPlanV1_2)
+        or not isinstance(campaign, LoadedPhase6Campaign)
     ):
         raise Phase6ContractError(
             "Primary Campaign requires Workflow Plan 1.2 and Campaign 1.2"
@@ -2267,6 +2947,22 @@ def _validate_primary_live_bindings(
         if isinstance(event, Phase6CampaignRunEvent)
         and event.status is not CampaignRunStatus.STARTED
     }
+    campaign_run_starts = {
+        event.run_id: event
+        for event in campaign.events
+        if isinstance(event, Phase6CampaignRunEvent)
+        and event.status is CampaignRunStatus.STARTED
+    }
+    if set(planned) != set(terminal):
+        raise Phase6ContractError(
+            "Workflow Plan run IDs and Campaign terminal run IDs differ"
+        )
+    required_artifact_ids = {
+        run_id
+        for run_id, event in terminal.items()
+        if event.status
+        in {CampaignRunStatus.COMPLETED, CampaignRunStatus.FAILED}
+    }
     evidence_by_run = {artifact.run_id: artifact for artifact in evidence}
     recording_by_run = {
         recording.started.run_id: recording for recording in recordings
@@ -2275,7 +2971,7 @@ def _validate_primary_live_bindings(
         len(evidence_by_run) != len(evidence)
         or len(recording_by_run) != len(recordings)
         or set(evidence_by_run) != set(recording_by_run)
-        or not set(evidence_by_run).issubset(terminal)
+        or set(evidence_by_run) != required_artifact_ids
     ):
         raise Phase6ContractError(
             "Evidence and Recording run identities are incomplete or duplicated"
@@ -2299,15 +2995,30 @@ def _validate_primary_live_bindings(
     for run_id, artifact in evidence_by_run.items():
         run = planned.get(run_id)
         event = terminal[run_id]
+        campaign_run_started = campaign_run_starts[run_id]
         recording = recording_by_run[run_id]
         if run is None:
             raise Phase6ContractError("Evidence run is absent from Workflow Plan")
+        expected_prompt_sha256 = (
+            plan.one_shot_prompt_sha256
+            if run.workflow is Workflow.ONE_SHOT
+            else plan.staged_prompt_sha256
+        )
+        expected_prompt_bytes = (
+            plan.one_shot_prompt_bytes
+            if run.workflow is Workflow.ONE_SHOT
+            else plan.staged_prompt_bytes
+        )
+        expected_state = _campaign_artifact_state(event)
         if (
             artifact.experiment_id != plan.experiment_id
             or artifact.language is not source.language
             or artifact.task_id != run.task_id
             or artifact.workflow is not run.workflow
             or artifact.repetition_index != run.repetition_index
+            or artifact.reviewed_commit != plan.reviewed_commit
+            or source.spec is None
+            or artifact.spec_sha256 != source.spec.sha256
             or artifact.plan_sha256 != source.plan.sha256
             or artifact.fixture_sha256 != plan.fixture_sha256
             or artifact.fixture_manifest_sha256 != plan.fixture_manifest_sha256
@@ -2315,8 +3026,19 @@ def _validate_primary_live_bindings(
             != plan.fixture_acceptance_sha256
             or artifact.diff_policy_sha256 != plan.diff_policy_sha256
             or artifact.toolchain_fingerprint != plan.toolchain_fingerprint
+            or artifact.prompt_sha256 != expected_prompt_sha256
+            or artifact.prompt_bytes != expected_prompt_bytes
+            or artifact.runner != spec.runner
+            or artifact.codex.requested_model != plan.model
+            or artifact.codex.requested_reasoning_effort
+            is not plan.reasoning_effort
             or artifact.recording_sha256 != recording_hash_by_run.get(run_id)
+            or artifact.overall_status is not expected_state[0]
+            or artifact.failure_kind is not expected_state[1]
+            or artifact.gate_executed is not event.gate_executed
             or recording.started.task_id != run.task_id
+            or recording.started.experiment_id != plan.experiment_id
+            or recording.started.language is not source.language
             or recording.started.workflow is not run.workflow
             or recording.started.repetition_index != run.repetition_index
             or recording.started.plan_sha256 != source.plan.sha256
@@ -2326,13 +3048,36 @@ def _validate_primary_live_bindings(
             or recording.started.fixture_acceptance_sha256
             != plan.fixture_acceptance_sha256
             or recording.started.diff_policy_sha256 != plan.diff_policy_sha256
+            or recording.started.prompt_sha256 != expected_prompt_sha256
+            or recording.started.prompt_bytes != expected_prompt_bytes
+            or recording.started.requested_model != plan.model
+            or recording.started.requested_reasoning_effort
+            is not plan.reasoning_effort
             or recording.terminal.overall_status is not artifact.overall_status
             or recording.terminal.failure_kind is not artifact.failure_kind
+            or recording.terminal.codex != artifact.codex
+            or recording.terminal.metrics != artifact.metrics
+            or recording.terminal.gate_executed is not artifact.gate_executed
+            or recording.terminal.gate_not_executed_reason
+            is not artifact.gate_not_executed_reason
+            or recording.started.occurred_at != artifact.started_at
             or recording.terminal.occurred_at != artifact.completed_at
             or evidence_hash_by_run.get(run_id) is None
             or event.task_id != run.task_id
             or event.workflow is not run.workflow
             or event.repetition_index != run.repetition_index
+            or event.failure_kind is not artifact.failure_kind
+            or campaign_run_started.occurred_at > artifact.started_at
+            or (
+                (
+                    event.status is CampaignRunStatus.COMPLETED
+                    and recording.terminal.event_type != "run_completed"
+                )
+                or (
+                    event.status is CampaignRunStatus.FAILED
+                    and recording.terminal.event_type != "run_failed"
+                )
+            )
         ):
             raise Phase6ContractError(
                 "Plan, Campaign, Evidence, and Recording identities differ"
@@ -2341,6 +3086,38 @@ def _validate_primary_live_bindings(
             raise Phase6ContractError(
                 "Campaign terminal timestamp precedes a run terminal timestamp"
             )
+        if event.occurred_at < artifact.completed_at:
+            raise Phase6ContractError(
+                "Campaign run terminal timestamp precedes Artifact completion"
+            )
+
+
+def _campaign_artifact_state(
+    event: Phase6CampaignRunEvent,
+) -> tuple[Phase6OverallStatus, Phase6FailureKind]:
+    if event.outcome is None:
+        raise Phase6ContractError(
+            "Campaign state does not permit a LiveRunArtifact"
+        )
+    expected_status = {
+        Phase6CampaignOutcome.SUCCESS: Phase6OverallStatus.PASSED,
+        Phase6CampaignOutcome.QUALITY_GATE_FAILURE: Phase6OverallStatus.FAILED,
+        Phase6CampaignOutcome.OUTPUT_CONTRACT_VIOLATION:
+        Phase6OverallStatus.REJECTED,
+        Phase6CampaignOutcome.PROVIDER_FAILURE:
+        Phase6OverallStatus.PROVIDER_ERROR,
+        Phase6CampaignOutcome.PROVIDER_TIMEOUT:
+        Phase6OverallStatus.PROVIDER_ERROR,
+        Phase6CampaignOutcome.HARNESS_FAILURE:
+        Phase6OverallStatus.HARNESS_ERROR,
+        Phase6CampaignOutcome.CLEANUP_FAILURE:
+        Phase6OverallStatus.HARNESS_ERROR,
+    }.get(event.outcome)
+    if expected_status is None or event.failure_kind is None:
+        raise Phase6ContractError(
+            "Campaign state does not permit a LiveRunArtifact"
+        )
+    return expected_status, event.failure_kind
 
 
 def _validate_provider_coverage(

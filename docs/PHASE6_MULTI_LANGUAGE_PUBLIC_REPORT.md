@@ -71,6 +71,10 @@ commit、SpecとPlanの`reviewed_commit`は完全一致しなければならな�
 fixture revision、Fixture／Gate／reference solution／toolchainのhashも全契約で一致させる。
 reference solutionはProvider Workspaceへ含めない。
 
+Spec 2.1の`fixture_manifest_path`、`fixture_acceptance_path`、`diff_policy_path`はSpecの
+親directoryを基準に解決する。Public Suite側の対応するArtifact referenceはSuite rootを
+基準に解決し、両者が同一の列挙済みfileを指す場合だけ受理する。
+
 Slice 6B以降では、Fixture Acceptance後のPlan生成時と、各Provider call直前に同じ
 validatorを使用し、Plan-bound source bytesが変化していないことを確認する。不一致時は
 Plan生成またはProvider callを開始しない。
@@ -120,6 +124,11 @@ strict-load済みEvidenceのrun identityから`derived_language_status`を計算
 | LiveRunArtifact / Recording | 生成しない |
 | Public Language Report | `not_run_runs`と`gate_not_executed_reason.input_changed`へ保持 |
 
+Campaign 1.2はevent timestampの非減少順、runごとのstarted→terminal順、
+run ID／task／Workflow／repetition identity、Planと全terminal run IDの完全一致を要求する。
+`not_run`の理由はCampaign finishedのstop reasonと一致させる。Evidence／Recordingの必要集合は
+`completed`／`failed` Campaign状態から導出し、不足、余分、重複を拒否する。
+
 ## Output contract rejection
 
 `output_contract_violation`はProvider成功後、期待した安全な出力契約を満たさず、Gateを
@@ -144,6 +153,12 @@ loaderは呼出側が渡した固定rootを基準とし、Manifest自身と列�
 path、`..`、非canonical path、正規化後重複、symlink、hardlink、特殊file、root外参照を
 拒否し、各fileのSHA-256をManifestへ照合する。
 
+Manifest自身はresolve前にsymlinkを拒否する。Manifestと各入力はopen前、descriptor読取前後、
+close後のdevice／inode／mode／link count／size／mtime／ctimeが一致する場合だけsnapshot化
+する。strict loaderはhash検証済みsnapshot bytesだけをparseし、pathから再読込しない。
+cross-artifact validationの開始時と終了時に同一pathを再検証し、Manifest load後の差し替えや
+内容変更を拒否する。
+
 ## Public allowlist and checksum trust
 
 Public Run Record 1.0はreviewed commit、experiment／run／task ID、language、exact model ID、
@@ -154,6 +169,10 @@ diff統計、Usage欠測状態、実行期間だけを許可する。
 Prompt本文、raw Provider output、agent message、reasoning、thread ID、絶対path、
 認証情報、secretはfieldとして持たない。Usage欠損を0へ変換せず、`missing`と`null`で保つ。
 `input_changed`はProvider callがないためPublic Run Recordを生成せず、言語集計だけに残す。
+`run_metrics_available`はduration／diff統計の完全な有無と一致させる。Gate未実行時は
+Acceptance／Regression／lint／typecheck値をすべて0とし、`acceptance_passed`は
+`acceptance_total`を超えてはならない。overall status、failure kind、Gate状態、Metrics、
+Gate非実行理由は双方向に整合させる。
 
 `checksums.json`は`release-metadata.json`を含む全予定出力を対象とし、自身だけを対象外と
 する。`checksums.json`自身のSHA-256はbundle外のExternal Checksum Anchor 1.0へ固定する。
