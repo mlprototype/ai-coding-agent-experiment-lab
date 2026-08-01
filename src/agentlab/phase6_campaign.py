@@ -30,6 +30,7 @@ from agentlab.codex_provider import (
     preflight_failure_evidence,
     unsupported_platform_evidence,
 )
+from agentlab.live import PromptInput
 from agentlab.models import (
     CodexCleanupState,
     CodexExecutionEvidence,
@@ -38,6 +39,7 @@ from agentlab.models import (
     CommandStatus,
     DiffEvidence,
     ExecutionMode,
+    FailureKind,
     GateKind,
     LiveFailureKind,
     LiveSettings,
@@ -69,16 +71,14 @@ from agentlab.phase6 import (
     WorkflowExperimentSpecV2_1,
     WorkflowPlanV1_2,
     _canonical_jsonl_line,
+    _load_canonical_model_bytes,
+    _load_workflow_plan_1_2_bytes,
+    _load_workflow_spec_contract_bytes,
     _read_stable_regular_file,
     canonical_json_bytes,
     load_campaign_contract,
-    load_diff_policy,
-    load_fixture_acceptance,
-    load_fixture_manifest,
     load_live_run_artifact_contract,
     load_recording_contract,
-    load_workflow_plan_contract,
-    load_workflow_spec_contract,
     validate_plan_bindings,
 )
 from agentlab.phase6_fixtures import (
@@ -101,19 +101,22 @@ from agentlab.phase6_fixtures import (
 )
 from agentlab.runner import LocalCommandRunner, UnsupportedRunnerPlatformError
 from agentlab.workflow import (
+    BuiltWorkflowPrompt,
     FixedWorkflowInputs,
     LoadedWorkflowSpec,
     WorkflowArtifactSettings,
     WorkflowPlanPublication,
     WorkflowPlanRun,
     WorkflowStopConditions,
+    _build_workflow_prompt_from_task,
     _publish_create_only_pair,
     build_workflow_plan_from_inputs,
-    capture_workflow_inputs,
     plan_publication_path,
 )
 from agentlab.workspace import (
+    DirectorySnapshot,
     SnapshotError,
+    _snapshot_hash,
     build_diff_evidence,
     incomplete_diff_evidence,
     prepare_disposable_workspace,
@@ -155,6 +158,7 @@ class PlanBoundInputs:
     repository_root: Path
     spec_path: Path
     plan_path: Path
+    artifact_root: Path
     loaded_spec: LoadedWorkflowSpecContract
     plan: WorkflowPlanV1_2
     plan_sha256: str
@@ -209,6 +213,111 @@ def _copy_tree_snapshot(snapshot: SecureTreeSnapshot, destination: Path) -> None
         path = destination / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
+
+
+def _fixed_inputs_from_snapshots(
+    *,
+    spec: WorkflowExperimentSpecV2_1,
+    prompt_path: Path,
+    prompt_bytes: bytes,
+    fixture: SecureTreeSnapshot,
+) -> FixedWorkflowInputs:
+    task = PromptInput(
+        path=prompt_path,
+        content=prompt_bytes,
+        sha256=_sha256(prompt_bytes),
+        byte_count=len(prompt_bytes),
+    )
+    prompts: dict[Workflow, BuiltWorkflowPrompt] = {
+        workflow: _build_workflow_prompt_from_task(spec, workflow, task)
+        for workflow in (Workflow.ONE_SHOT, Workflow.STAGED)
+    }
+    fixture_snapshot = DirectorySnapshot(
+        files=dict(fixture.files),
+        directories=fixture.directories,
+        sha256=_snapshot_hash(dict(fixture.files), fixture.directories),
+    )
+    return FixedWorkflowInputs(
+        fixture=fixture_snapshot,
+        task_prompt=task,
+        prompts=prompts,
+    )
+
+
+def _bounded_real_path(
+    root: Path,
+    candidate: Path,
+    label: str,
+    *,
+    final_may_be_file: bool = False,
+) -> Path:
+    """Reject symlink/non-directory components using lexical, not resolved, paths."""
+    lexical_root = Path(os.path.abspath(root))
+    lexical_candidate = Path(os.path.abspath(candidate))
+    try:
+        relative = lexical_candidate.relative_to(lexical_root)
+    except ValueError as error:
+        raise Phase6CampaignError(f"{label} escapes the fixed bundle root") from error
+    current = lexical_root
+    components = ("", *relative.parts)
+    for index, component in enumerate(components):
+        if component:
+            current /= component
+        if not os.path.lexists(current):
+            continue
+        try:
+            metadata = current.lstat()
+        except OSError as error:
+            raise Phase6CampaignError(f"could not inspect {label}") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise Phase6CampaignError(f"{label} path must not contain symlinks")
+        is_final = index == len(components) - 1
+        if not stat.S_ISDIR(metadata.st_mode) and not (final_may_be_file and is_final):
+            raise Phase6CampaignError(f"{label} parent must be a real directory")
+    return lexical_candidate
+
+
+def _validate_artifact_path(
+    inputs: PlanBoundInputs,
+    path: Path,
+    label: str,
+    *,
+    final_may_be_file: bool = True,
+) -> Path:
+    bounded = _bounded_real_path(
+        inputs.spec_path.parent,
+        path,
+        label,
+        final_may_be_file=final_may_be_file,
+    )
+    lexical_artifact_root = Path(os.path.abspath(inputs.artifact_root))
+    try:
+        bounded.relative_to(lexical_artifact_root)
+    except ValueError as error:
+        raise Phase6CampaignError(f"{label} escapes the Artifact root") from error
+    _bounded_real_path(
+        inputs.spec_path.parent,
+        inputs.artifact_root,
+        "Artifact root",
+    )
+    return bounded
+
+
+def _validate_artifact_reservations(
+    inputs: PlanBoundInputs,
+    *,
+    check_exists: bool,
+) -> None:
+    for run in inputs.plan.runs:
+        for configured in (run.recording_path, run.evidence_path, run.diagnostic_path):
+            candidate = inputs.spec_path.parent / configured
+            _validate_artifact_path(
+                inputs,
+                candidate,
+                "Artifact reservation",
+            )
+            if check_exists and os.path.lexists(candidate):
+                raise Phase6CampaignError("Artifact reservation already exists")
 
 
 def _spec_bytes(spec: WorkflowExperimentSpecV2_1) -> bytes:
@@ -350,9 +459,21 @@ def prepare_phase6_campaign(
     manifest_snapshot = _read_stable_regular_file(manifest_path, "Fixture Manifest")
     acceptance_snapshot = _read_stable_regular_file(acceptance_path, "Fixture Acceptance")
     policy_snapshot = _read_stable_regular_file(definition.policy_path, "Diff Policy")
-    manifest = load_fixture_manifest(manifest_path)
-    acceptance = load_fixture_acceptance(acceptance_path)
-    policy = load_diff_policy(definition.policy_path)
+    manifest = _load_canonical_model_bytes(
+        manifest_snapshot.content,
+        FixtureManifest,
+        "Fixture Manifest",
+    )
+    acceptance = _load_canonical_model_bytes(
+        acceptance_snapshot.content,
+        FixtureAcceptanceRecord,
+        "Fixture Acceptance",
+    )
+    policy = _load_canonical_model_bytes(
+        policy_snapshot.content,
+        DiffPolicy,
+        "Diff Policy",
+    )
     if (
         manifest.language is not language
         or acceptance.language is not language
@@ -414,9 +535,15 @@ def prepare_phase6_campaign(
         (inputs / "diff-policy.json").write_bytes(policy_snapshot.content)
         spec = _build_spec(language=language, reviewed_commit=commit, commands=commands)
         spec_path = staging / "workflow-spec.yaml"
-        spec_path.write_bytes(_spec_bytes(spec))
-        loaded = load_workflow_spec_contract(spec_path)
-        fixed = capture_workflow_inputs(spec_path, spec)
+        generated_spec_bytes = _spec_bytes(spec)
+        spec_path.write_bytes(generated_spec_bytes)
+        loaded = _load_workflow_spec_contract_bytes(generated_spec_bytes)
+        fixed = _fixed_inputs_from_snapshots(
+            spec=spec,
+            prompt_path=inputs / "task-prompt.md",
+            prompt_bytes=prompt.content,
+            fixture=fixture,
+        )
         plan = _build_plan(
             spec_path=spec_path,
             loaded=loaded,
@@ -450,7 +577,7 @@ def prepare_phase6_campaign(
                 )
             )
         )
-        if load_workflow_plan_contract(plan_path) != plan:
+        if _load_workflow_plan_1_2_bytes(plan_bytes) != plan:
             raise Phase6CampaignError("canonical Workflow Plan reload failed")
         _rename_directory_no_replace(staging, destination)
     except Exception:
@@ -480,15 +607,18 @@ def load_plan_bound_inputs(
     """Snapshot and cross-check every input before a Campaign is created."""
     repository = repository_root.resolve(strict=True)
     commit = verify_repository_provenance(repository)
-    loaded = load_workflow_spec_contract(spec_path)
-    plan = load_workflow_plan_contract(plan_path)
+    spec_snapshot = _read_stable_regular_file(spec_path, "Workflow Spec")
+    plan_snapshot = _read_stable_regular_file(plan_path, "Workflow Plan")
+    loaded = _load_workflow_spec_contract_bytes(spec_snapshot.content)
+    plan = _load_workflow_plan_1_2_bytes(plan_snapshot.content)
     if not isinstance(loaded.spec, WorkflowExperimentSpecV2_1) or not isinstance(
         plan, WorkflowPlanV1_2
     ):
         raise Phase6CampaignError("Slice 6C requires Workflow Spec 2.1 and Plan 1.2")
     if loaded.spec.reviewed_commit != commit or plan.reviewed_commit != commit:
         raise Phase6CampaignError("reviewed commit differs from clean HEAD")
-    base = spec_path.parent.resolve(strict=True)
+    base = Path(os.path.abspath(spec_path.parent))
+    _bounded_real_path(base, base, "Plan bundle root")
     manifest_path = _path_below(base, loaded.spec.fixture_manifest_path, "Fixture Manifest")
     acceptance_path = _path_below(base, loaded.spec.fixture_acceptance_path, "Fixture Acceptance")
     policy_path = _path_below(base, loaded.spec.diff_policy_path, "Diff Policy")
@@ -500,9 +630,22 @@ def load_plan_bound_inputs(
     manifest_snapshot = _read_stable_regular_file(manifest_path, "Fixture Manifest")
     acceptance_snapshot = _read_stable_regular_file(acceptance_path, "Fixture Acceptance")
     policy_snapshot = _read_stable_regular_file(policy_path, "Diff Policy")
-    manifest = load_fixture_manifest(manifest_path)
-    acceptance = load_fixture_acceptance(acceptance_path)
-    policy = load_diff_policy(policy_path)
+    prompt_snapshot = _read_stable_regular_file(prompt_path, "Task Prompt")
+    manifest = _load_canonical_model_bytes(
+        manifest_snapshot.content,
+        FixtureManifest,
+        "Fixture Manifest",
+    )
+    acceptance = _load_canonical_model_bytes(
+        acceptance_snapshot.content,
+        FixtureAcceptanceRecord,
+        "Fixture Acceptance",
+    )
+    policy = _load_canonical_model_bytes(
+        policy_snapshot.content,
+        DiffPolicy,
+        "Diff Policy",
+    )
     validate_plan_bindings(
         loaded_spec=loaded,
         plan=plan,
@@ -513,8 +656,13 @@ def load_plan_bound_inputs(
         diff_policy_bytes=policy_snapshot.content,
         diff_policy=policy,
     )
-    fixed = capture_workflow_inputs(spec_path, loaded.spec)
     fixture_secure = secure_tree_snapshot(fixture_source)
+    fixed = _fixed_inputs_from_snapshots(
+        spec=loaded.spec,
+        prompt_path=prompt_path,
+        prompt_bytes=prompt_snapshot.content,
+        fixture=fixture_secure,
+    )
     if (
         fixture_secure.sha256 != plan.fixture_sha256
         or fixed.fixture.files != fixture_secure.files
@@ -543,7 +691,6 @@ def load_plan_bound_inputs(
         != plan.gate_contract_sha256
     ):
         raise Phase6CampaignError("Gate contract differs from Plan")
-    plan_snapshot = _read_stable_regular_file(plan_path, "Workflow Plan")
     metadata_snapshot = _read_stable_regular_file(plan_publication_path(plan_path), "Plan metadata")
     try:
         metadata = WorkflowPlanPublication.model_validate_json(metadata_snapshot.content)
@@ -552,19 +699,27 @@ def load_plan_bound_inputs(
     if metadata.plan_sha256 != plan_snapshot.sha256:
         raise Phase6CampaignError("Plan publication metadata hash differs")
     artifact_root = base / loaded.spec.artifacts.root
+    _bounded_real_path(base, artifact_root, "Artifact root")
     for run in plan.runs:
         for configured in (run.recording_path, run.evidence_path, run.diagnostic_path):
-            candidate = base / configured
+            candidate = Path(os.path.abspath(base / configured))
             try:
-                candidate.resolve(strict=False).relative_to(artifact_root.resolve(strict=False))
-            except (OSError, RuntimeError, ValueError) as error:
+                candidate.relative_to(Path(os.path.abspath(artifact_root)))
+            except ValueError as error:
                 raise Phase6CampaignError("Artifact reservation escapes fixed root") from error
+            _bounded_real_path(
+                base,
+                candidate,
+                "Artifact reservation",
+                final_may_be_file=True,
+            )
             if check_reservations and os.path.lexists(candidate):
                 raise Phase6CampaignError("Artifact reservation already exists")
     return PlanBoundInputs(
         repository_root=repository,
         spec_path=spec_path,
         plan_path=plan_path,
+        artifact_root=artifact_root,
         loaded_spec=loaded,
         plan=plan,
         plan_sha256=plan_snapshot.sha256,
@@ -594,11 +749,17 @@ def revalidate_plan_bound_inputs(inputs: PlanBoundInputs) -> None:
     )
     stable = (
         current.loaded_spec.sha256 == inputs.loaded_spec.sha256
+        and current.loaded_spec.spec == inputs.loaded_spec.spec
         and current.plan_sha256 == inputs.plan_sha256
+        and current.plan == inputs.plan
         and current.manifest_bytes == inputs.manifest_bytes
+        and current.manifest == inputs.manifest
         and current.acceptance_bytes == inputs.acceptance_bytes
+        and current.acceptance == inputs.acceptance
         and current.policy_bytes == inputs.policy_bytes
+        and current.policy == inputs.policy
         and current.fixed.task_prompt.content == inputs.fixed.task_prompt.content
+        and current.fixed.prompts == inputs.fixed.prompts
         and current.fixture_secure == inputs.fixture_secure
         and current.reference_sha256 == inputs.reference_sha256
         and current.gate_commands == inputs.gate_commands
@@ -708,6 +869,13 @@ def _provider_terminal(
             Phase6CampaignOutcome.HARNESS_FAILURE,
             GateNotExecutedReason.PRE_GATE_HARNESS_FAILURE,
         )
+    if codex.failure_kind is LiveFailureKind.EVIDENCE_ERROR:
+        return (
+            Phase6OverallStatus.HARNESS_ERROR,
+            failure,
+            Phase6CampaignOutcome.HARNESS_FAILURE,
+            GateNotExecutedReason.PRE_GATE_HARNESS_FAILURE,
+        )
     reason = (
         GateNotExecutedReason.PROVIDER_TIMEOUT
         if codex.failure_kind is LiveFailureKind.PROVIDER_TIMEOUT
@@ -726,11 +894,11 @@ def _run_gates(
     workspace: Path,
     environment_root: Path,
     temporary_root: Path,
-) -> tuple[list[CommandEvidence], int, bool]:
+) -> tuple[list[CommandEvidence], int, FailureKind | None]:
     runner = LocalCommandRunner(inputs.loaded_spec.spec.runner)
     commands: list[CommandEvidence] = []
     started = datetime.now(UTC)
-    abnormal = False
+    harness_failure: FailureKind | None = None
     for index, (gate, argv) in enumerate(inputs.gate_commands):
         _verify_toolchain_binding(inputs.toolchain_binding, inputs.acceptance.toolchain)  # type: ignore[arg-type]
         result = runner.run(
@@ -748,10 +916,24 @@ def _run_gates(
             CommandStatus.PASSED,
             CommandStatus.FAILED,
         }:
-            abnormal = True
+            harness_failure = result.harness_failure or FailureKind.EVIDENCE_ERROR
             break
     elapsed = max(0, int((datetime.now(UTC) - started).total_seconds() * 1000))
-    return commands, elapsed, abnormal
+    return commands, elapsed, harness_failure
+
+
+def _rejected_output_diff_evidence() -> DiffEvidence:
+    """Represent an unsafe tree that was rejected before a safe diff was possible."""
+    return DiffEvidence(
+        changed_files=[],
+        binary_files=[],
+        added_lines=None,
+        deleted_lines=None,
+        unified_diff="",
+        diff_truncated=False,
+        line_counts_complete=False,
+        collection_error=None,
+    )
 
 
 def _metrics(
@@ -893,6 +1075,8 @@ def _write_run_outputs(
     )
     recording_path = inputs.spec_path.parent / run.recording_path
     evidence_path = inputs.spec_path.parent / run.evidence_path
+    _validate_artifact_path(inputs, recording_path, "Recording publication")
+    _validate_artifact_path(inputs, evidence_path, "Evidence publication")
     try:
         _publish_create_only_pair(
             recording_path,
@@ -959,21 +1143,21 @@ def run_phase6_campaign(
     """Execute one preregistered Campaign; never retries, resumes, or falls back."""
     if not confirm_live_codex:
         raise Phase6CampaignError("--confirm-live-codex is required")
-    raw_plan = load_workflow_plan_contract(plan_path)
-    if not isinstance(raw_plan, WorkflowPlanV1_2):
-        raise Phase6CampaignError("Workflow Plan 1.2 is required")
-    if confirm_provider_calls != raw_plan.planned_provider_call_count:
-        raise Phase6CampaignError("confirmed Provider-call budget differs from Plan")
     inputs = load_plan_bound_inputs(repository_root, spec_path, plan_path)
+    if confirm_provider_calls != inputs.plan.planned_provider_call_count:
+        raise Phase6CampaignError("confirmed Provider-call budget differs from Plan")
     spec = inputs.loaded_spec.spec
     assert isinstance(spec, WorkflowExperimentSpecV2_1)
+    _validate_artifact_reservations(inputs, check_exists=True)
     expected_campaign = spec_path.parent / spec.artifacts.root / "campaign.jsonl"
-    if campaign_path.resolve(strict=False) != expected_campaign.resolve(strict=False):
+    if Path(os.path.abspath(campaign_path)) != Path(os.path.abspath(expected_campaign)):
         raise Phase6CampaignError("Campaign path must use the Plan-bound Artifact root")
+    _validate_artifact_path(inputs, campaign_path, "Campaign output")
     if os.path.lexists(campaign_path):
         raise Phase6CampaignError("Campaign output already exists; resume is forbidden")
     revalidate_plan_bound_inputs(inputs)
     campaign_path.parent.mkdir(parents=True, exist_ok=True)
+    _validate_artifact_path(inputs, campaign_path, "Campaign output")
     sequence = 0
     started_at = datetime.now(UTC)
     _append_event(
@@ -1033,6 +1217,8 @@ def run_phase6_campaign(
         lifecycle = WorkspaceLifecycle.NOT_CREATED
         counted = False
         codex: CodexExecutionEvidence | None = None
+        gate_harness_failure: FailureKind | None = None
+        gate_workspace_error = False
         try:
             workspace = prepare_disposable_workspace(inputs.fixture_source, inputs.fixed.fixture)
             lifecycle = WorkspaceLifecycle.REMOVED
@@ -1074,6 +1260,8 @@ def run_phase6_campaign(
                         inputs.policy, inputs.fixture_secure, provider_secure
                     )
                 except FixtureAcceptanceError:
+                    if diff.collection_error is not None:
+                        diff = _rejected_output_diff_evidence()
                     overall = Phase6OverallStatus.REJECTED
                     failure = Phase6FailureKind.OUTPUT_CONTRACT_VIOLATION
                     campaign_outcome = Phase6CampaignOutcome.OUTPUT_CONTRACT_VIOLATION
@@ -1084,27 +1272,33 @@ def run_phase6_campaign(
                 else:
                     gate_environment = workspace.environment_root / "gates"
                     gate_environment.mkdir(parents=True, exist_ok=False)
-                    commands, evaluation_ms, abnormal = _run_gates(
+                    commands, evaluation_ms, gate_harness_failure = _run_gates(
                         inputs, workspace.workspace, gate_environment, workspace.temporary_root
                     )
                     try:
                         after_gate = secure_tree_snapshot(workspace.workspace)
                         if after_gate != provider_secure:
                             diff = incomplete_diff_evidence("Gate changed the Provider Workspace")
-                            abnormal = True
-                    except FixtureAcceptanceError:
+                            gate_workspace_error = True
+                    except (FixtureAcceptanceError, SnapshotError, OSError):
                         diff = incomplete_diff_evidence("Gate Workspace verification failed")
-                        abnormal = True
-                    if abnormal:
+                        gate_workspace_error = True
+                    if gate_harness_failure is not None:
                         overall = Phase6OverallStatus.HARNESS_ERROR
                         failure = (
-                            Phase6FailureKind.GATE_HARNESS_ERROR
-                            if any(
-                                item.status not in {CommandStatus.PASSED, CommandStatus.FAILED}
-                                for item in commands
-                            )
-                            else Phase6FailureKind.EVIDENCE_ERROR
+                            Phase6FailureKind.PROCESS_CLEANUP_ERROR
+                            if gate_harness_failure is FailureKind.PROCESS_CLEANUP_ERROR
+                            else Phase6FailureKind.GATE_HARNESS_ERROR
                         )
+                        campaign_outcome = (
+                            Phase6CampaignOutcome.CLEANUP_FAILURE
+                            if gate_harness_failure is FailureKind.PROCESS_CLEANUP_ERROR
+                            else Phase6CampaignOutcome.HARNESS_FAILURE
+                        )
+                        gate_reason = None
+                    elif gate_workspace_error:
+                        overall = Phase6OverallStatus.HARNESS_ERROR
+                        failure = Phase6FailureKind.EVIDENCE_ERROR
                         campaign_outcome = Phase6CampaignOutcome.HARNESS_FAILURE
                         gate_reason = None
                     else:
@@ -1141,6 +1335,7 @@ def run_phase6_campaign(
             lifecycle is WorkspaceLifecycle.CLEANUP_FAILED
             or codex.cleanup_state is CodexCleanupState.FAILED
             or not codex.termination.process_group_cleared
+            or gate_harness_failure is FailureKind.PROCESS_CLEANUP_ERROR
         ):
             overall = Phase6OverallStatus.HARNESS_ERROR
             failure = Phase6FailureKind.PROCESS_CLEANUP_ERROR

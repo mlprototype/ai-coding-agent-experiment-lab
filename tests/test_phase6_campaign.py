@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,10 +14,16 @@ import agentlab.phase6_campaign as campaign
 from agentlab.cli import app
 from agentlab.live import PromptInput
 from agentlab.models import (
+    CodexExecutionEvidence,
+    CodexFailureStage,
+    CodexTerminalEvent,
     CommandEvidence,
     CommandStatus,
+    FailureKind,
     GateKind,
+    LiveFailureKind,
     Provider,
+    ProviderExecutionStatus,
     TerminationEvidence,
     TerminationReason,
     Workflow,
@@ -39,8 +46,13 @@ from agentlab.phase6 import (
     load_live_run_artifact_contract,
 )
 from agentlab.phase6_campaign import Phase6CampaignError, PlanBoundInputs
-from agentlab.phase6_fixtures import secure_tree_snapshot
-from agentlab.workflow import BuiltWorkflowPrompt, FixedWorkflowInputs, WorkflowPlanRun
+from agentlab.phase6_fixtures import SecureTreeSnapshot, secure_tree_snapshot
+from agentlab.workflow import (
+    BuiltWorkflowPrompt,
+    FixedWorkflowInputs,
+    WorkflowPlanPublication,
+    WorkflowPlanRun,
+)
 from agentlab.workspace import snapshot_directory
 
 HASH = "a" * 64
@@ -205,6 +217,7 @@ def _inputs(tmp_path: Path) -> PlanBoundInputs:
         repository_root=tmp_path,
         spec_path=spec_path,
         plan_path=plan_path,
+        artifact_root=root / "campaign-artifacts",
         loaded_spec=LoadedWorkflowSpecContract(spec=spec, sha256=HASH),
         plan=plan,
         plan_sha256=HASH,
@@ -257,9 +270,127 @@ def _commands(codex_completed: datetime) -> list[CommandEvidence]:
 
 
 def _patch_inputs(monkeypatch: pytest.MonkeyPatch, inputs: PlanBoundInputs) -> None:
-    monkeypatch.setattr(campaign, "load_workflow_plan_contract", lambda _path: inputs.plan)
     monkeypatch.setattr(campaign, "load_plan_bound_inputs", lambda *_a, **_k: inputs)
     monkeypatch.setattr(campaign, "revalidate_plan_bound_inputs", lambda _inputs: None)
+
+
+def _materialize_plan_bundle(
+    inputs: PlanBoundInputs,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[WorkflowPlanV1_2, Path, Path]:
+    root = inputs.spec_path.parent
+    source = root / "inputs"
+    source.mkdir(parents=True, exist_ok=True)
+    prompt_path = source / "task-prompt.md"
+    manifest_path = source / "fixture-manifest.json"
+    acceptance_path = source / "fixture-acceptance.json"
+    policy_path = source / "diff-policy.json"
+    prompt_path.write_bytes(inputs.fixed.task_prompt.content)
+    manifest_path.write_bytes(inputs.manifest_bytes)
+    acceptance_path.write_bytes(inputs.acceptance_bytes)
+    policy_path.write_bytes(inputs.policy_bytes)
+    spec_bytes = campaign._spec_bytes(inputs.loaded_spec.spec)
+    fixed = campaign._fixed_inputs_from_snapshots(
+        spec=inputs.loaded_spec.spec,
+        prompt_path=prompt_path,
+        prompt_bytes=inputs.fixed.task_prompt.content,
+        fixture=inputs.fixture_secure,
+    )
+    plan = inputs.plan.model_copy(
+        update={
+            "experiment_spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
+            "fixture_acceptance_sha256": hashlib.sha256(inputs.acceptance_bytes).hexdigest(),
+            "one_shot_prompt_sha256": fixed.prompts[Workflow.ONE_SHOT].sha256,
+            "one_shot_prompt_bytes": fixed.prompts[Workflow.ONE_SHOT].byte_count,
+            "staged_prompt_sha256": fixed.prompts[Workflow.STAGED].sha256,
+            "staged_prompt_bytes": fixed.prompts[Workflow.STAGED].byte_count,
+        }
+    )
+    plan_bytes = canonical_json_bytes(plan)
+    inputs.spec_path.write_bytes(spec_bytes)
+    inputs.plan_path.write_bytes(plan_bytes)
+    campaign.plan_publication_path(inputs.plan_path).write_bytes(
+        canonical_json_bytes(
+            WorkflowPlanPublication(
+                schema_version="1.0",
+                plan_sha256=hashlib.sha256(plan_bytes).hexdigest(),
+                created_at="2026-08-01T00:00:00.000000Z",
+            )
+        )
+    )
+    original_secure_snapshot = campaign.secure_tree_snapshot
+
+    def secure_snapshot(path: Path) -> SecureTreeSnapshot:
+        if path == inputs.fixture_source:
+            return original_secure_snapshot(path)
+        return SecureTreeSnapshot(files={}, directories=(), sha256=HASH)
+
+    monkeypatch.setattr(campaign, "verify_repository_provenance", lambda _root: COMMIT)
+    monkeypatch.setattr(campaign, "secure_tree_snapshot", secure_snapshot)
+    monkeypatch.setattr(campaign, "_capture_toolchain_binding", lambda *_args: object())
+    monkeypatch.setattr(campaign, "_commands_for", lambda *_args: inputs.gate_commands)
+    monkeypatch.setattr(campaign, "_gate_contract_hash", lambda *_args: HASH)
+    return plan, policy_path, inputs.plan_path
+
+
+def _provider(
+    inputs: PlanBoundInputs,
+    mutation: Any | None = None,
+) -> Any:
+    def execute(**kwargs: Any) -> CodexExecutionEvidence:
+        if mutation is not None:
+            mutation(Path(kwargs["workspace"]))
+        now = datetime.now(UTC)
+        return _successful_codex(
+            model=inputs.plan.model,
+            reasoning_effort=inputs.plan.reasoning_effort,
+            prompt_bytes=len(kwargs["prompt"]),
+        ).model_copy(
+            update={
+                "preflight_checked_at": now,
+                "started_at": now,
+                "completed_at": now,
+            }
+        )
+
+    return execute
+
+
+def _failed_provider_evidence(
+    inputs: PlanBoundInputs,
+    failure: LiveFailureKind,
+    prompt_bytes: int,
+) -> CodexExecutionEvidence:
+    now = datetime.now(UTC)
+    success = _successful_codex(
+        model=inputs.plan.model,
+        reasoning_effort=inputs.plan.reasoning_effort,
+        prompt_bytes=prompt_bytes,
+    ).model_dump(mode="python")
+    success.update(
+        {
+            "status": ProviderExecutionStatus.FAILED,
+            "failure_kind": failure,
+            "failure_stage": CodexFailureStage.PROVIDER_PROCESS_COLLECTION,
+            "started_at": now,
+            "completed_at": now,
+            "preflight_checked_at": now,
+            "event_count": 2,
+            "terminal_event": CodexTerminalEvent.NONE,
+            "turn_completed_count": 0,
+            "exit_code": 1,
+        }
+    )
+    if failure is LiveFailureKind.PROVIDER_TIMEOUT:
+        success["exit_code"] = -15
+        success["termination"] = TerminationEvidence(
+            reason=TerminationReason.TIMEOUT,
+            sigterm_sent=True,
+            sigkill_sent=False,
+            process_group_cleared=True,
+            error=None,
+        )
+    return CodexExecutionEvidence.model_validate(success)
 
 
 def test_fake_campaign_accepts_allowed_diff_and_strict_reloads(
@@ -280,7 +411,7 @@ def test_fake_campaign_accepts_allowed_diff_and_strict_reloads(
     monkeypatch.setattr(
         campaign,
         "_run_gates",
-        lambda _i, _w, _e, _t: (_commands(datetime.now(UTC)), 0, False),
+        lambda _i, _w, _e, _t: (_commands(datetime.now(UTC)), 0, None),
     )
     campaign_path = inputs.spec_path.parent / "campaign-artifacts" / "campaign.jsonl"
     outcome = campaign.run_phase6_campaign(
@@ -339,7 +470,6 @@ def test_input_drift_before_first_call_has_zero_provider_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     inputs = _inputs(tmp_path)
-    monkeypatch.setattr(campaign, "load_workflow_plan_contract", lambda _path: inputs.plan)
     monkeypatch.setattr(campaign, "load_plan_bound_inputs", lambda *_a, **_k: inputs)
     checks = 0
 
@@ -370,6 +500,60 @@ def test_input_drift_before_first_call_has_zero_provider_calls(
     assert outcome.provider_call_count == 0
     assert provider_calls == 0
     assert outcome.stop_reason.value == "input_changed"
+
+
+@pytest.mark.parametrize("changed_input", ["plan", "policy"])
+def test_plan_bound_load_uses_one_stable_snapshot_and_revalidation_detects_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_input: str,
+) -> None:
+    inputs = _inputs(tmp_path)
+    plan, policy_path, plan_path = _materialize_plan_bundle(inputs, monkeypatch)
+    if changed_input == "plan":
+        target = plan_path
+        replacement = canonical_json_bytes(
+            plan.model_copy(update={"random_seed": plan.random_seed + 1})
+        )
+    else:
+        target = policy_path
+        replacement = canonical_json_bytes(
+            inputs.policy.model_copy(
+                update={
+                    "editable_paths": [
+                        EditablePathPolicy(
+                            path="target.py",
+                            allow_create=True,
+                            allow_delete=False,
+                        )
+                    ]
+                }
+            )
+        )
+    original_read = campaign._read_stable_regular_file
+    replaced = False
+
+    def replace_after_snapshot(path: Path, label: str) -> Any:
+        nonlocal replaced
+        snapshot = original_read(path, label)
+        if not replaced and path == target:
+            target.write_bytes(replacement)
+            replaced = True
+        return snapshot
+
+    monkeypatch.setattr(campaign, "_read_stable_regular_file", replace_after_snapshot)
+    loaded = campaign.load_plan_bound_inputs(
+        tmp_path,
+        inputs.spec_path,
+        inputs.plan_path,
+    )
+    assert replaced
+    if changed_input == "plan":
+        assert loaded.plan == plan
+    else:
+        assert loaded.policy == inputs.policy
+    with pytest.raises(ValueError):
+        campaign.revalidate_plan_bound_inputs(loaded)
 
 
 def test_phase6_cli_confirmation_stops_before_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -419,3 +603,427 @@ def test_run_cli_requires_live_confirmation_before_runtime() -> None:
         ["run-phase6-campaign", "missing.yaml", "--plan", "missing.json", "--campaign", "out"],
     )
     assert result.exit_code != 0
+
+
+def test_artifact_root_symlink_is_rejected_before_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = _inputs(tmp_path)
+    _patch_inputs(monkeypatch, inputs)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    inputs.artifact_root.symlink_to(outside, target_is_directory=True)
+    provider_calls = 0
+
+    def forbidden(**_kwargs: Any) -> Any:
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError
+
+    with pytest.raises(Phase6CampaignError, match="symlink"):
+        campaign.run_phase6_campaign(
+            tmp_path,
+            inputs.spec_path,
+            inputs.plan_path,
+            inputs.artifact_root / "campaign.jsonl",
+            confirm_live_codex=True,
+            confirm_provider_calls=2,
+            provider_executor=forbidden,
+        )
+    assert provider_calls == 0
+    assert list(outside.iterdir()) == []
+
+
+def test_artifact_reservation_parent_symlink_is_rejected_before_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = _inputs(tmp_path)
+    _patch_inputs(monkeypatch, inputs)
+    outside = tmp_path / "outside-recordings"
+    outside.mkdir()
+    inputs.artifact_root.mkdir()
+    (inputs.artifact_root / "recordings").symlink_to(outside, target_is_directory=True)
+    provider_calls = 0
+
+    def forbidden(**_kwargs: Any) -> Any:
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError
+
+    with pytest.raises(Phase6CampaignError, match="symlink"):
+        campaign.run_phase6_campaign(
+            tmp_path,
+            inputs.spec_path,
+            inputs.plan_path,
+            inputs.artifact_root / "campaign.jsonl",
+            confirm_live_codex=True,
+            confirm_provider_calls=2,
+            provider_executor=forbidden,
+        )
+    assert provider_calls == 0
+    assert list(outside.iterdir()) == []
+
+
+def test_artifact_reservation_conflict_stops_before_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = _inputs(tmp_path)
+    _patch_inputs(monkeypatch, inputs)
+    reserved = inputs.spec_path.parent / inputs.plan.runs[0].recording_path
+    reserved.parent.mkdir(parents=True)
+    reserved.write_text("existing", encoding="utf-8")
+    provider_calls = 0
+
+    def forbidden(**_kwargs: Any) -> Any:
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError
+
+    with pytest.raises(Phase6CampaignError, match="reservation already exists"):
+        campaign.run_phase6_campaign(
+            tmp_path,
+            inputs.spec_path,
+            inputs.plan_path,
+            inputs.artifact_root / "campaign.jsonl",
+            confirm_live_codex=True,
+            confirm_provider_calls=2,
+            provider_executor=forbidden,
+        )
+    assert provider_calls == 0
+
+
+def test_gate_process_cleanup_failure_has_priority_and_stops_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = _inputs(tmp_path)
+    _patch_inputs(monkeypatch, inputs)
+    uncleared = TerminationEvidence(
+        reason=TerminationReason.RESIDUAL_PROCESS,
+        sigterm_sent=True,
+        sigkill_sent=False,
+        process_group_cleared=False,
+        error="process group remains",
+    )
+
+    def gates(*_args: Any) -> Any:
+        commands = _commands(datetime.now(UTC))
+        commands[0] = commands[0].model_copy(update={"termination": uncleared})
+        return commands, 0, FailureKind.PROCESS_CLEANUP_ERROR
+
+    monkeypatch.setattr(
+        campaign,
+        "_run_gates",
+        gates,
+    )
+    path = inputs.artifact_root / "campaign.jsonl"
+    outcome = campaign.run_phase6_campaign(
+        tmp_path,
+        inputs.spec_path,
+        inputs.plan_path,
+        path,
+        confirm_live_codex=True,
+        confirm_provider_calls=2,
+        provider_executor=_provider(
+            inputs,
+            lambda workspace: (workspace / "target.py").write_text("value = 1\n", encoding="utf-8"),
+        ),
+    )
+    assert outcome.provider_call_count == 1
+    assert outcome.stop_reason.value == "cleanup_failure"
+    artifact = load_live_run_artifact_contract(
+        inputs.spec_path.parent / inputs.plan.runs[0].evidence_path
+    )
+    assert artifact.failure_kind.value == "process_cleanup_error"  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [LiveFailureKind.PROVIDER_CLI_NONZERO, LiveFailureKind.PROVIDER_TIMEOUT],
+)
+def test_provider_failure_and_timeout_run_zero_gates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: LiveFailureKind,
+) -> None:
+    inputs = _inputs(tmp_path)
+    _patch_inputs(monkeypatch, inputs)
+    gate_calls = 0
+
+    def gates(*_args: Any) -> Any:
+        nonlocal gate_calls
+        gate_calls += 1
+        raise AssertionError
+
+    monkeypatch.setattr(campaign, "_run_gates", gates)
+    path = inputs.artifact_root / "campaign.jsonl"
+    outcome = campaign.run_phase6_campaign(
+        tmp_path,
+        inputs.spec_path,
+        inputs.plan_path,
+        path,
+        confirm_live_codex=True,
+        confirm_provider_calls=2,
+        provider_executor=lambda **kwargs: _failed_provider_evidence(
+            inputs, failure, len(kwargs["prompt"])
+        ),
+    )
+    assert outcome.provider_call_count == 2
+    assert gate_calls == 0
+
+
+def test_provider_evidence_error_is_harness_failure_and_runs_zero_gates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = _inputs(tmp_path)
+    _patch_inputs(monkeypatch, inputs)
+    gate_calls = 0
+
+    def gates(*_args: Any) -> Any:
+        nonlocal gate_calls
+        gate_calls += 1
+        raise AssertionError
+
+    monkeypatch.setattr(campaign, "_run_gates", gates)
+    outcome = campaign.run_phase6_campaign(
+        tmp_path,
+        inputs.spec_path,
+        inputs.plan_path,
+        inputs.artifact_root / "campaign.jsonl",
+        confirm_live_codex=True,
+        confirm_provider_calls=2,
+        provider_executor=lambda **kwargs: _failed_provider_evidence(
+            inputs, LiveFailureKind.EVIDENCE_ERROR, len(kwargs["prompt"])
+        ),
+    )
+    assert outcome.provider_call_count == 1
+    assert outcome.counted_failure_count == 0
+    assert outcome.stop_reason.value == "harness_failure"
+    assert gate_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "runner_failure", "return_code", "termination"),
+    [
+        (
+            CommandStatus.TIMED_OUT,
+            FailureKind.TIMEOUT,
+            -15,
+            TerminationEvidence(
+                reason=TerminationReason.TIMEOUT,
+                sigterm_sent=True,
+                sigkill_sent=False,
+                process_group_cleared=True,
+                error=None,
+            ),
+        ),
+        (
+            CommandStatus.SIGNAL_TERMINATED,
+            FailureKind.SIGNAL_TERMINATION,
+            -15,
+            TerminationEvidence(
+                reason=TerminationReason.RESIDUAL_PROCESS,
+                sigterm_sent=True,
+                sigkill_sent=False,
+                process_group_cleared=True,
+                error=None,
+            ),
+        ),
+        (
+            CommandStatus.SPAWN_ERROR,
+            FailureKind.SPAWN_ERROR,
+            None,
+            TerminationEvidence(
+                reason=TerminationReason.NONE,
+                sigterm_sent=False,
+                sigkill_sent=False,
+                process_group_cleared=True,
+                error=None,
+            ),
+        ),
+        (
+            CommandStatus.COLLECTION_ERROR,
+            FailureKind.EVIDENCE_ERROR,
+            0,
+            TerminationEvidence(
+                reason=TerminationReason.NONE,
+                sigterm_sent=False,
+                sigkill_sent=False,
+                process_group_cleared=True,
+                error=None,
+            ),
+        ),
+    ],
+)
+def test_abnormal_gate_results_are_harness_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: CommandStatus,
+    runner_failure: FailureKind,
+    return_code: int | None,
+    termination: TerminationEvidence,
+) -> None:
+    inputs = _inputs(tmp_path)
+    _patch_inputs(monkeypatch, inputs)
+
+    def gates(*_args: Any) -> Any:
+        now = datetime.now(UTC)
+        command = CommandEvidence(
+            gate=GateKind.ACCEPTANCE,
+            command_index=0,
+            argv=["gate"],
+            status=status,
+            return_code=return_code,
+            started_at=now,
+            completed_at=now,
+            duration_ms=0,
+            stdout="",
+            stderr="",
+            stdout_truncated=False,
+            stderr_truncated=False,
+            stdout_decode_replaced=False,
+            stderr_decode_replaced=False,
+            termination=termination,
+            error=(
+                "gate harness failure"
+                if status in {CommandStatus.SPAWN_ERROR, CommandStatus.COLLECTION_ERROR}
+                else None
+            ),
+        )
+        return [command], 0, runner_failure
+
+    monkeypatch.setattr(
+        campaign,
+        "_run_gates",
+        gates,
+    )
+    path = inputs.artifact_root / "campaign.jsonl"
+    outcome = campaign.run_phase6_campaign(
+        tmp_path,
+        inputs.spec_path,
+        inputs.plan_path,
+        path,
+        confirm_live_codex=True,
+        confirm_provider_calls=2,
+        provider_executor=_provider(
+            inputs,
+            lambda workspace: (workspace / "target.py").write_text("value = 1\n", encoding="utf-8"),
+        ),
+    )
+    assert outcome.stop_reason.value == "harness_failure"
+    artifact = load_live_run_artifact_contract(
+        inputs.spec_path.parent / inputs.plan.runs[0].evidence_path
+    )
+    assert artifact.failure_kind.value == "gate_harness_error"  # type: ignore[union-attr]
+
+
+def test_gate_workspace_change_is_evidence_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = _inputs(tmp_path)
+    _patch_inputs(monkeypatch, inputs)
+
+    def gates(_inputs: Any, workspace: Path, *_args: Any) -> Any:
+        (workspace / "target.py").write_text("value = 2\n", encoding="utf-8")
+        return _commands(datetime.now(UTC)), 0, None
+
+    monkeypatch.setattr(campaign, "_run_gates", gates)
+    path = inputs.artifact_root / "campaign.jsonl"
+    outcome = campaign.run_phase6_campaign(
+        tmp_path,
+        inputs.spec_path,
+        inputs.plan_path,
+        path,
+        confirm_live_codex=True,
+        confirm_provider_calls=2,
+        provider_executor=_provider(
+            inputs,
+            lambda workspace: (workspace / "target.py").write_text("value = 1\n", encoding="utf-8"),
+        ),
+    )
+    assert outcome.stop_reason.value == "harness_failure"
+    artifact = load_live_run_artifact_contract(
+        inputs.spec_path.parent / inputs.plan.runs[0].evidence_path
+    )
+    assert artifact.failure_kind.value == "evidence_error"  # type: ignore[union-attr]
+
+
+def test_input_drift_before_second_call_preserves_first_call_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = _inputs(tmp_path)
+    monkeypatch.setattr(campaign, "load_plan_bound_inputs", lambda *_a, **_k: inputs)
+    checks = 0
+
+    def drift(_inputs: PlanBoundInputs) -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 3:
+            raise Phase6CampaignError("changed")
+
+    monkeypatch.setattr(campaign, "revalidate_plan_bound_inputs", drift)
+    monkeypatch.setattr(
+        campaign,
+        "_run_gates",
+        lambda *_args: (_commands(datetime.now(UTC)), 0, None),
+    )
+    provider_calls = 0
+
+    def provider(**kwargs: Any) -> Any:
+        nonlocal provider_calls
+        provider_calls += 1
+        return _provider(
+            inputs,
+            lambda workspace: (workspace / "target.py").write_text("value = 1\n", encoding="utf-8"),
+        )(**kwargs)
+
+    outcome = campaign.run_phase6_campaign(
+        tmp_path,
+        inputs.spec_path,
+        inputs.plan_path,
+        inputs.artifact_root / "campaign.jsonl",
+        confirm_live_codex=True,
+        confirm_provider_calls=2,
+        provider_executor=provider,
+    )
+    assert provider_calls == 1
+    assert outcome.provider_call_count == 1
+    assert outcome.stop_reason.value == "input_changed"
+
+
+@pytest.mark.parametrize("violation", ["create", "delete", "hardlink", "fifo"])
+def test_diff_policy_rejects_create_delete_hardlink_and_special_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    violation: str,
+) -> None:
+    inputs = _inputs(tmp_path)
+    _patch_inputs(monkeypatch, inputs)
+    gate_calls = 0
+
+    def mutate(workspace: Path) -> None:
+        if violation == "create":
+            (workspace / "extra.py").write_text("x\n", encoding="utf-8")
+        elif violation == "delete":
+            (workspace / "target.py").unlink()
+        elif violation == "hardlink":
+            os.link(workspace / "target.py", workspace / "extra.py")
+        else:
+            os.mkfifo(workspace / "pipe")
+
+    def gates(*_args: Any) -> Any:
+        nonlocal gate_calls
+        gate_calls += 1
+        raise AssertionError
+
+    monkeypatch.setattr(campaign, "_run_gates", gates)
+    outcome = campaign.run_phase6_campaign(
+        tmp_path,
+        inputs.spec_path,
+        inputs.plan_path,
+        inputs.artifact_root / "campaign.jsonl",
+        confirm_live_codex=True,
+        confirm_provider_calls=2,
+        provider_executor=_provider(inputs, mutate),
+    )
+    assert outcome.provider_call_count == 2
+    assert gate_calls == 0
