@@ -5,7 +5,7 @@
 **Phase 6: Current**
 
 - Slice 6A Contract / strict loader: implemented (offline)
-- Slice 6B Fixture Acceptance: not started
+- Slice 6B Fixture Acceptance: implemented (local-only; no status transition)
 - Slice 6C language-specific Campaign integration: not started
 - Slice 6D Public Suite renderer and atomic publication: not started
 - Slice 6E reviewed Live Campaign and public bundle: not started
@@ -25,6 +25,37 @@ Provider／Gate実行、Public Report生成、bundle publishは含まない。
 契約実装は`agentlab.phase6`へ分離し、既存runtimeが使うWorkflow Spec 2.0、Workflow Plan
 1.1、Campaign 1.1、Recording 1.0/1.1、LiveRunArtifact 1.0/1.1、
 CodexExecutionEvidence 1.5を変更しない。
+
+## Slice 6B Fixture Acceptance
+
+Slice 6BはPython、TypeScript、Javaごとに独立した、外部依存のないTag Normalizer Fixtureを
+提供する。3言語で、ASCII入力に限定した同じAcceptance／Regressionケースと次の機能要件を
+共有する。
+
+- 前後のASCII空白を除き、ASCII英字をlowercaseへ変換する。
+- ASCII空白とunderscoreの連続を1個のhyphenへ変換し、先頭・末尾のhyphenを除く。
+- 空文字を除外し、正規化後の重複を最初の出現順で除去する。
+
+各Fixtureで編集可能なのは実装file 1個だけである。Gate helperと設定はprotectedとし、
+未分類path、symlink、hardlink、特殊file、許可されない作成／削除を拒否する。TypeScriptの
+Workspaceには`node_modules`を置かず、JavaはMaven／Gradleを使わずJDKだけ、Pythonも標準
+runtimeだけを使う。lint／typecheckはFixture固有の決定的Gateであり、ESLint、mypy、
+Checkstyle等との同等性を主張しない。
+
+`accept-phase6-fixtures`は`--confirm-local-execution`がある場合だけ、固定絶対pathのversion
+commandと信頼済みFixture Gateを起動する。確認なしではsubprocessは0件である。baselineと
+referenceは別々の使い捨てWorkspaceで実行し、source Fixtureは直接実行しない。baselineは
+Acceptanceだけが通常終了の品質FAIL、Regression／lint／typecheckがPASSでなければならない。
+隔離されたreference overlayをeditable pathだけへ適用したWorkspaceでは全4 GateのPASSを
+要求する。reference solutionはbaseline、Prompt、Provider Workspace、生成Artifactに含めない。
+全process group、Workspaceの回収とsource不変を確認し、全条件成功時だけManifest 1.0と
+Acceptance Record 1.0を`.artifacts/phase6/fixture-acceptance`配下へcreate-onlyで生成する。
+
+実Acceptanceのprovenanceはclean worktreeのfull HEADへ固定し、Fixture／Policy／referenceが
+そのcommitのtracked fileであることを開始前に検証する。`acceptance_agentlab_commit`と
+`fixture_source_commit`は同じHEADである。1言語のblocker後も残りを独立して評価し、2言語を
+engineering minimum、3言語をfull targetとする。これはFixture受入条件であり、Slice 6Bだけで
+言語statusを`ready_not_run`へ変更せず、Live-readyやPhase 6 Completeも宣言しない。
 
 ## Versioned contracts
 
@@ -91,8 +122,33 @@ fingerprintはOS、architecture、順序固定したcomponent、Harness固定Gat
 - Javaは外部依存を持たない`javac`方式とし、Java runtimeとcompilerを分離する。
 
 各version commandは解決済み絶対pathをargv先頭に持つ。Gate PATHはHarness管理の絶対path
-だけから構成し、Workspace内の同名実行fileを探索しない。実toolchain受入はSlice 6Bであり、
-Slice 6A完了だけではいずれの言語もLive-readyにならない。
+だけから構成し、親processのPATHやWorkspace内の同名実行fileを探索しない。version確認にも
+timeout、64 KiB stream別出力上限、strict UTF-8、process group回収を適用する。signal、timeout、
+非0終了、truncation、decode置換、回収失敗は受け入れない。symlinkはrealpathへ解決し、通常file、
+実行権限、link count、実行前後のdevice／inode／mode／size／mtime／ctime／bytes hashを照合する。
+Javaの`java`／`javac`は同じJDK rootを必須とする。
+
+version出力hashはstdout／stderrのCRLFとCRをLFへ正規化し、`domain`、exit code、正規化後の
+stdout、stderrを持つcanonical JSON bytesのSHA-256とする。完全一致versionは非空のstdout、
+stderrの順で各末尾LFを1個だけ除き、両方がある場合はLFで結合するため、stderrへversionを出す
+Javaも保持できる。TypeScript compilerの`package_fingerprint`は専用hash domainのcanonical
+JSONに、package version、`package.json` hash、package tree hash、`lib/tsc.js` hash、tsc
+launcher hash、使用するNode component全体を含める。
+
+Slice 6Bで使うhash対象は次のとおり固定する。
+
+| Field | SHA-256 domain / bytes |
+|---|---|
+| `fixture_sha256` | domain `agentlab-phase6-tree-v1`、baseline treeの相対directory／file pathとfile bytes |
+| `fixture_manifest_sha256` | canonical Fixture Manifest 1.0 bytes |
+| `diff_policy_sha256` | canonical Diff Policy 1.0 bytes |
+| `gate_contract_sha256` | domain `agentlab-phase6-gate-contract-v1`、Gate順序／argv、Runner上限、固定Gate PATH |
+| `reference_solution_sha256` | baselineと同じtree domainによる隔離reference overlayの相対pathとbytes |
+| `toolchain_fingerprint` | 既存ToolchainIdentityのcanonical fingerprint |
+
+tree hashはdomain prefixに続き、sort済みentryごとに種別、UTF-8 path長、pathを、fileではさらに
+content長とbytesを長さ付きで連結する。Fixture Manifest、Acceptance Record、referenceは
+baseline tree外にあり、`fixture_sha256`へ含めない。自己参照hashは作らない。
 
 ## Language status
 
@@ -240,10 +296,11 @@ destinationを置換せず、途中bundleを残さない。このpublication処�
 
 ## Current acceptance boundary
 
-Slice 6Aの完了はoffline contractとunit testの完了だけを意味する。言語statusは現時点で
-`not_ready`であり、Live-readyでもPhase 6 Completeでもない。Slice 6B以降、Codex／
-Antigravity CLI、Provider call、Prompt送信、quota利用、Live Artifact、Public bundleの
-生成は別承認まで開始しない。
+Slice 6Aの完了とSlice 6B Fixture Acceptance実装だけでは、Spec 2.1／Plan 1.2生成runtimeと
+Campaign受入が未完了であるため、言語statusは`not_ready`のままであり、Live-readyでもPhase 6
+Completeでもない。Slice 6Bの実行はlocal version／Gateに限定し、Codex／Antigravity CLI、
+Provider call、Prompt送信、network、quota利用、Live Artifact、Public bundle生成は0件である。
+次はSlice 6Cだが、レビュー承認まで開始しない。
 
 Python、TypeScript、Javaは実装目標だが、Live-readyは最低2言語の実toolchain受入完了、
 Phase 6 Completeは最低2言語で各1 complete pairとPublic Suite bundle完成を条件とする。

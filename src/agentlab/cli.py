@@ -12,6 +12,10 @@ from agentlab.capabilities import doctor_report
 from agentlab.gates import RunGatesError, run_gates
 from agentlab.live import LiveCodexError, run_live_codex
 from agentlab.models import EvidenceOverallStatus, LiveOverallStatus
+from agentlab.phase6_fixtures import (
+    FixtureAcceptanceError,
+    accept_phase6_fixtures,
+)
 from agentlab.recording import RecordingLoadError
 from agentlab.replay import ReplayError, run_replay
 from agentlab.specs import SpecLoadError, load_experiment_spec
@@ -29,6 +33,72 @@ app = typer.Typer(
     help="Reproducible AI coding-agent experiment foundation.",
     no_args_is_help=True,
 )
+
+
+@app.command("accept-phase6-fixtures")
+def accept_phase6_fixtures_command(
+    repository_root: Annotated[
+        Path,
+        typer.Option(
+            "--repository-root",
+            exists=True,
+            file_okay=False,
+            resolve_path=True,
+            help="Clean repository containing the committed Phase 6 Fixtures.",
+        ),
+    ] = Path("."),
+    output_root: Annotated[
+        Path,
+        typer.Option(
+            "--output-root",
+            help="Create-only .artifacts root for canonical Acceptance records.",
+        ),
+    ] = Path(".artifacts/phase6/fixture-acceptance"),
+    confirm_local_execution: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-local-execution",
+            help=(
+                "Explicitly allow bounded local toolchain version commands and "
+                "trusted Fixture Gate subprocesses; no Provider is called."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Audit local toolchains and accept independent Phase 6 Fixtures offline."""
+    if not confirm_local_execution:
+        typer.echo(
+            "accept-phase6-fixtures stopped: --confirm-local-execution is required",
+            err=True,
+        )
+        typer.echo("local subprocesses executed: 0")
+        typer.echo("Provider calls, Prompt transmissions, network, and quota: 0")
+        raise typer.Exit(code=2)
+    try:
+        outcome = accept_phase6_fixtures(
+            repository_root,
+            output_root,
+            confirm_local_execution=confirm_local_execution,
+        )
+    except FixtureAcceptanceError as error:
+        typer.echo(f"accept-phase6-fixtures stopped: {error}", err=True)
+        typer.echo("Provider calls, Prompt transmissions, network, and quota: 0")
+        raise typer.Exit(code=2) from error
+
+    typer.echo(f"reviewed commit: {outcome.commit_sha}")
+    for result in outcome.results:
+        typer.echo(f"{result.language.value}: {result.status}")
+        if result.status == "accepted":
+            typer.echo(f"  manifest: {result.manifest_path}")
+            typer.echo(f"  acceptance: {result.acceptance_path}")
+        else:
+            typer.echo(f"  blocker: {result.blocker}")
+            typer.echo(f"  detail: {result.detail}")
+    typer.echo(f"engineering minimum met: {outcome.engineering_minimum_met}")
+    typer.echo(f"full target met: {outcome.full_target_met}")
+    typer.echo("Provider calls, Prompt transmissions, network, and quota: 0")
+    if not outcome.engineering_minimum_met:
+        raise typer.Exit(code=1)
 
 
 @app.command()

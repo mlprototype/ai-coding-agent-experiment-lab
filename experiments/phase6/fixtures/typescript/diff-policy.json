@@ -1,0 +1,26 @@
+{
+  "editable_paths": [
+    {
+      "allow_create": false,
+      "allow_delete": false,
+      "path": "tag_normalizer.ts"
+    }
+  ],
+  "fixture_revision": "tag-normalizer-typescript-v1",
+  "language": "typescript",
+  "protected_paths": [
+    {
+      "path": "fixture.json",
+      "role": "configuration"
+    },
+    {
+      "path": "gate_helper.mjs",
+      "role": "gate_helper"
+    }
+  ],
+  "reject_hardlinks": true,
+  "reject_special_files": true,
+  "reject_symlinks": true,
+  "reject_unclassified_paths": true,
+  "schema_version": "1.0"
+}
