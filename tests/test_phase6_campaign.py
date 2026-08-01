@@ -4,6 +4,7 @@ import hashlib
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -44,9 +45,14 @@ from agentlab.phase6 import (
     canonical_json_bytes,
     load_campaign_contract,
     load_live_run_artifact_contract,
+    load_recording_contract,
 )
 from agentlab.phase6_campaign import Phase6CampaignError, PlanBoundInputs
-from agentlab.phase6_fixtures import SecureTreeSnapshot, secure_tree_snapshot
+from agentlab.phase6_fixtures import (
+    FixtureAcceptanceError,
+    SecureTreeSnapshot,
+    secure_tree_snapshot,
+)
 from agentlab.workflow import (
     BuiltWorkflowPrompt,
     FixedWorkflowInputs,
@@ -411,7 +417,9 @@ def test_fake_campaign_accepts_allowed_diff_and_strict_reloads(
     monkeypatch.setattr(
         campaign,
         "_run_gates",
-        lambda _i, _w, _e, _t: (_commands(datetime.now(UTC)), 0, None),
+        lambda _i, _w, _e, _t: campaign.GateExecutionOutcome(
+            _commands(datetime.now(UTC)), 0, None, None
+        ),
     )
     campaign_path = inputs.spec_path.parent / "campaign-artifacts" / "campaign.jsonl"
     outcome = campaign.run_phase6_campaign(
@@ -708,7 +716,7 @@ def test_gate_process_cleanup_failure_has_priority_and_stops_campaign(
     def gates(*_args: Any) -> Any:
         commands = _commands(datetime.now(UTC))
         commands[0] = commands[0].model_copy(update={"termination": uncleared})
-        return commands, 0, FailureKind.PROCESS_CLEANUP_ERROR
+        return campaign.GateExecutionOutcome(commands, 0, FailureKind.PROCESS_CLEANUP_ERROR, None)
 
     monkeypatch.setattr(
         campaign,
@@ -734,6 +742,79 @@ def test_gate_process_cleanup_failure_has_priority_and_stops_campaign(
         inputs.spec_path.parent / inputs.plan.runs[0].evidence_path
     )
     assert artifact.failure_kind.value == "process_cleanup_error"  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    ("verification_failure_call", "expected_gate_count"),
+    [(1, 0), (2, 1)],
+)
+def test_toolchain_change_before_or_after_gate_finishes_canonical_harness_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    verification_failure_call: int,
+    expected_gate_count: int,
+) -> None:
+    inputs = _inputs(tmp_path)
+    _patch_inputs(monkeypatch, inputs)
+    verification_calls = 0
+    runner_calls = 0
+
+    def verify(*_args: Any) -> None:
+        nonlocal verification_calls
+        verification_calls += 1
+        if verification_calls == verification_failure_call:
+            raise FixtureAcceptanceError("toolchain changed")
+
+    class FakeGateRunner:
+        def run(self, **kwargs: Any) -> Any:
+            nonlocal runner_calls
+            runner_calls += 1
+            command = _commands(datetime.now(UTC))[kwargs["command_index"]].model_copy(
+                update={"argv": kwargs["argv"]}
+            )
+            return SimpleNamespace(evidence=command, harness_failure=None)
+
+    monkeypatch.setattr(campaign, "_verify_toolchain_binding", verify)
+    monkeypatch.setattr(campaign, "LocalCommandRunner", lambda _settings: FakeGateRunner())
+    campaign_path = inputs.artifact_root / "campaign.jsonl"
+    outcome = campaign.run_phase6_campaign(
+        tmp_path,
+        inputs.spec_path,
+        inputs.plan_path,
+        campaign_path,
+        confirm_live_codex=True,
+        confirm_provider_calls=2,
+        provider_executor=_provider(
+            inputs,
+            lambda workspace: (workspace / "target.py").write_text("value = 1\n", encoding="utf-8"),
+        ),
+    )
+    assert runner_calls == expected_gate_count
+    assert outcome.provider_call_count == 1
+    assert outcome.counted_failure_count == 0
+    assert outcome.stop_reason.value == "harness_failure"
+
+    run = inputs.plan.runs[0]
+    artifact = load_live_run_artifact_contract(inputs.spec_path.parent / run.evidence_path)
+    assert artifact.overall_status.value == "harness_error"  # type: ignore[union-attr]
+    assert artifact.failure_kind.value == "evidence_error"  # type: ignore[union-attr]
+    assert len(artifact.gate_commands) == expected_gate_count  # type: ignore[union-attr]
+    assert artifact.gate_executed is bool(expected_gate_count)  # type: ignore[union-attr]
+    assert artifact.diff.collection_error is not None  # type: ignore[union-attr]
+
+    recording = load_recording_contract(inputs.spec_path.parent / run.recording_path)
+    assert recording.terminal.failure_kind.value == "evidence_error"  # type: ignore[union-attr]
+    assert len(recording.terminal.gate_commands) == expected_gate_count  # type: ignore[union-attr]
+    loaded_campaign = load_campaign_contract(campaign_path)
+    assert loaded_campaign.finished.stop_reason.value == "harness_failure"  # type: ignore[union-attr]
+    terminal = next(
+        event
+        for event in loaded_campaign.events  # type: ignore[union-attr]
+        if getattr(event, "run_id", None) == run.run_id
+        and getattr(getattr(event, "status", None), "value", None) == "failed"
+    )
+    assert terminal.failure_kind.value == "evidence_error"  # type: ignore[union-attr]
+    assert terminal.gate_executed is bool(expected_gate_count)  # type: ignore[union-attr]
 
 
 @pytest.mark.parametrize(
@@ -889,7 +970,7 @@ def test_abnormal_gate_results_are_harness_failures(
                 else None
             ),
         )
-        return [command], 0, runner_failure
+        return campaign.GateExecutionOutcome([command], 0, runner_failure, None)
 
     monkeypatch.setattr(
         campaign,
@@ -924,7 +1005,7 @@ def test_gate_workspace_change_is_evidence_error(
 
     def gates(_inputs: Any, workspace: Path, *_args: Any) -> Any:
         (workspace / "target.py").write_text("value = 2\n", encoding="utf-8")
-        return _commands(datetime.now(UTC)), 0, None
+        return campaign.GateExecutionOutcome(_commands(datetime.now(UTC)), 0, None, None)
 
     monkeypatch.setattr(campaign, "_run_gates", gates)
     path = inputs.artifact_root / "campaign.jsonl"
@@ -964,7 +1045,7 @@ def test_input_drift_before_second_call_preserves_first_call_only(
     monkeypatch.setattr(
         campaign,
         "_run_gates",
-        lambda *_args: (_commands(datetime.now(UTC)), 0, None),
+        lambda *_args: campaign.GateExecutionOutcome(_commands(datetime.now(UTC)), 0, None, None),
     )
     provider_calls = 0
 

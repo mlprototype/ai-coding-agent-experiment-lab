@@ -177,6 +177,14 @@ class PlanBoundInputs:
     toolchain_binding: object
 
 
+@dataclass(frozen=True)
+class GateExecutionOutcome:
+    commands: list[CommandEvidence]
+    evaluation_duration_ms: int
+    harness_failure: FailureKind | None
+    evidence_collection_error: str | None
+
+
 def _sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
@@ -894,13 +902,22 @@ def _run_gates(
     workspace: Path,
     environment_root: Path,
     temporary_root: Path,
-) -> tuple[list[CommandEvidence], int, FailureKind | None]:
+) -> GateExecutionOutcome:
     runner = LocalCommandRunner(inputs.loaded_spec.spec.runner)
     commands: list[CommandEvidence] = []
     started = datetime.now(UTC)
     harness_failure: FailureKind | None = None
+    evidence_collection_error: str | None = None
     for index, (gate, argv) in enumerate(inputs.gate_commands):
-        _verify_toolchain_binding(inputs.toolchain_binding, inputs.acceptance.toolchain)  # type: ignore[arg-type]
+        try:
+            _verify_toolchain_binding(
+                inputs.toolchain_binding,  # type: ignore[arg-type]
+                inputs.acceptance.toolchain,
+            )
+        except Exception:
+            harness_failure = FailureKind.EVIDENCE_ERROR
+            evidence_collection_error = "Gate pre-execution toolchain verification failed"
+            break
         result = runner.run(
             gate=gate,
             command_index=index,
@@ -910,8 +927,16 @@ def _run_gates(
             temporary_root=temporary_root,
             parent_environment=_minimal_environment(inputs.acceptance.toolchain.gate_path_entries),
         )
-        _verify_toolchain_binding(inputs.toolchain_binding, inputs.acceptance.toolchain)  # type: ignore[arg-type]
         commands.append(result.evidence)
+        try:
+            _verify_toolchain_binding(
+                inputs.toolchain_binding,  # type: ignore[arg-type]
+                inputs.acceptance.toolchain,
+            )
+        except Exception:
+            harness_failure = result.harness_failure or FailureKind.EVIDENCE_ERROR
+            evidence_collection_error = "Gate post-execution toolchain verification failed"
+            break
         if result.harness_failure is not None or result.evidence.status not in {
             CommandStatus.PASSED,
             CommandStatus.FAILED,
@@ -919,7 +944,12 @@ def _run_gates(
             harness_failure = result.harness_failure or FailureKind.EVIDENCE_ERROR
             break
     elapsed = max(0, int((datetime.now(UTC) - started).total_seconds() * 1000))
-    return commands, elapsed, harness_failure
+    return GateExecutionOutcome(
+        commands=commands,
+        evaluation_duration_ms=elapsed,
+        harness_failure=harness_failure,
+        evidence_collection_error=evidence_collection_error,
+    )
 
 
 def _rejected_output_diff_evidence() -> DiffEvidence:
@@ -1272,9 +1302,14 @@ def run_phase6_campaign(
                 else:
                     gate_environment = workspace.environment_root / "gates"
                     gate_environment.mkdir(parents=True, exist_ok=False)
-                    commands, evaluation_ms, gate_harness_failure = _run_gates(
+                    gate_outcome = _run_gates(
                         inputs, workspace.workspace, gate_environment, workspace.temporary_root
                     )
+                    commands = gate_outcome.commands
+                    evaluation_ms = gate_outcome.evaluation_duration_ms
+                    gate_harness_failure = gate_outcome.harness_failure
+                    if gate_outcome.evidence_collection_error is not None:
+                        diff = incomplete_diff_evidence(gate_outcome.evidence_collection_error)
                     try:
                         after_gate = secure_tree_snapshot(workspace.workspace)
                         if after_gate != provider_secure:
@@ -1285,17 +1320,25 @@ def run_phase6_campaign(
                         gate_workspace_error = True
                     if gate_harness_failure is not None:
                         overall = Phase6OverallStatus.HARNESS_ERROR
-                        failure = (
-                            Phase6FailureKind.PROCESS_CLEANUP_ERROR
-                            if gate_harness_failure is FailureKind.PROCESS_CLEANUP_ERROR
-                            else Phase6FailureKind.GATE_HARNESS_ERROR
+                        abnormal_gate_observed = any(
+                            command.status not in {CommandStatus.PASSED, CommandStatus.FAILED}
+                            or not command.termination.process_group_cleared
+                            for command in commands
                         )
-                        campaign_outcome = (
-                            Phase6CampaignOutcome.CLEANUP_FAILURE
-                            if gate_harness_failure is FailureKind.PROCESS_CLEANUP_ERROR
-                            else Phase6CampaignOutcome.HARNESS_FAILURE
+                        if gate_harness_failure is FailureKind.PROCESS_CLEANUP_ERROR:
+                            failure = Phase6FailureKind.PROCESS_CLEANUP_ERROR
+                            campaign_outcome = Phase6CampaignOutcome.CLEANUP_FAILURE
+                        elif abnormal_gate_observed:
+                            failure = Phase6FailureKind.GATE_HARNESS_ERROR
+                            campaign_outcome = Phase6CampaignOutcome.HARNESS_FAILURE
+                        else:
+                            failure = Phase6FailureKind.EVIDENCE_ERROR
+                            campaign_outcome = Phase6CampaignOutcome.HARNESS_FAILURE
+                            if diff.collection_error is None:
+                                diff = incomplete_diff_evidence("Gate Evidence collection failed")
+                        gate_reason = (
+                            None if commands else GateNotExecutedReason.PRE_GATE_HARNESS_FAILURE
                         )
-                        gate_reason = None
                     elif gate_workspace_error:
                         overall = Phase6OverallStatus.HARNESS_ERROR
                         failure = Phase6FailureKind.EVIDENCE_ERROR
@@ -1323,6 +1366,22 @@ def run_phase6_campaign(
         except Exception:
             if codex is None:
                 raise
+            diff = incomplete_diff_evidence("Post-Codex harness processing failed")
+            overall = Phase6OverallStatus.HARNESS_ERROR
+            abnormal_gate_observed = any(
+                command.status not in {CommandStatus.PASSED, CommandStatus.FAILED}
+                or not command.termination.process_group_cleared
+                for command in commands
+            )
+            failure = (
+                Phase6FailureKind.GATE_HARNESS_ERROR
+                if abnormal_gate_observed
+                else Phase6FailureKind.EVIDENCE_ERROR
+            )
+            campaign_outcome = Phase6CampaignOutcome.HARNESS_FAILURE
+            gate_reason = None if commands else GateNotExecutedReason.PRE_GATE_HARNESS_FAILURE
+            metrics = None
+            counted = False
         finally:
             if workspace is not None:
                 removed, _detail = remove_disposable_workspace(workspace)

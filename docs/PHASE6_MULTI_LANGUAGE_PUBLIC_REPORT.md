@@ -319,7 +319,9 @@ Provider process groupの回収確認後、Gate起動前にDiff Policyを適用�
 禁止された作成・削除、link、特殊file、不完全なsnapshotは`output_contract_violation`として
 拒否し、Gateは0件とする。Policy PASS時だけAcceptance、Regression、lint、typecheckを固定
 toolchainと固定PATHで実行し、各command前後のtoolchain identity、Gate後Workspace、cleanupを
-再確認する。cleanup failureは他の結果より優先する。
+再確認する。Gate前のtoolchain再検証失敗はGate 0件、Gate後の失敗は実行済みCommand Evidenceを
+保持し、どちらも明示的なDiff collection errorを伴う`evidence_error / harness_failure`として
+canonical Campaignを完結する。cleanup failureは他の結果より優先する。
 
 engineering minimum用PlanはPython／Javaを独立に各1 task、one-shot／staged各1回、1 pair、2
 planned Provider calls（合計4 calls）とする。Plan生成成功後は両言語を`ready_not_run`とし、
