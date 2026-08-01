@@ -12,6 +12,12 @@ from agentlab.capabilities import doctor_report
 from agentlab.gates import RunGatesError, run_gates
 from agentlab.live import LiveCodexError, run_live_codex
 from agentlab.models import EvidenceOverallStatus, LiveOverallStatus
+from agentlab.phase6 import Language
+from agentlab.phase6_campaign import (
+    Phase6CampaignError,
+    prepare_phase6_campaign,
+    run_phase6_campaign,
+)
 from agentlab.phase6_fixtures import (
     FixtureAcceptanceError,
     accept_phase6_fixtures,
@@ -33,6 +39,84 @@ app = typer.Typer(
     help="Reproducible AI coding-agent experiment foundation.",
     no_args_is_help=True,
 )
+
+
+@app.command("prepare-phase6-campaign")
+def prepare_phase6_campaign_command(
+    language: Annotated[Language, typer.Option("--language")],
+    repository_root: Annotated[Path, typer.Option("--repository-root")] = Path("."),
+    acceptance_root: Annotated[Path, typer.Option("--acceptance-root")] = Path(
+        ".artifacts/phase6/fixture-acceptance"
+    ),
+    output_root: Annotated[Path, typer.Option("--output-root")] = Path(
+        ".artifacts/phase6/campaign-preparation"
+    ),
+    confirm_local_execution: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-local-execution",
+            help="Allow fixed local Git/toolchain checks; never calls a Provider.",
+        ),
+    ] = False,
+) -> None:
+    """Create one strict Phase 6 Spec 2.1 and Plan 1.2 offline."""
+    if not confirm_local_execution:
+        typer.echo(
+            "prepare-phase6-campaign stopped: --confirm-local-execution is required", err=True
+        )
+        typer.echo("local subprocesses executed: 0")
+        typer.echo("Provider calls and Prompt transmissions: 0")
+        raise typer.Exit(code=2)
+    try:
+        outcome = prepare_phase6_campaign(
+            repository_root,
+            acceptance_root,
+            output_root,
+            language=language,
+            confirm_local_execution=True,
+        )
+    except (Phase6CampaignError, FixtureAcceptanceError) as error:
+        typer.echo(f"prepare-phase6-campaign stopped: {error}", err=True)
+        typer.echo("Provider calls and Prompt transmissions: 0")
+        raise typer.Exit(code=2) from error
+    typer.echo(f"reviewed commit: {outcome.reviewed_commit}")
+    typer.echo(f"Spec 2.1: {outcome.spec_path}")
+    typer.echo(f"Plan 1.2: {outcome.plan_path}")
+    typer.echo(f"planned Provider calls: {outcome.plan.planned_provider_call_count}")
+    typer.echo("Provider calls and Prompt transmissions: 0")
+
+
+@app.command("run-phase6-campaign")
+def run_phase6_campaign_command(
+    spec_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    plan_path: Annotated[Path, typer.Option("--plan", exists=True, dir_okay=False)],
+    campaign_path: Annotated[Path, typer.Option("--campaign")],
+    repository_root: Annotated[Path, typer.Option("--repository-root")] = Path("."),
+    confirm_live_codex: Annotated[bool, typer.Option("--confirm-live-codex")] = False,
+    confirm_provider_calls: Annotated[int | None, typer.Option("--confirm-provider-calls")] = None,
+) -> None:
+    """Run a preregistered Phase 6 Campaign; never retry or resume."""
+    if not confirm_live_codex:
+        typer.echo("run-phase6-campaign stopped: --confirm-live-codex is required", err=True)
+        typer.echo("subprocesses and Provider calls executed: 0")
+        raise typer.Exit(code=2)
+    try:
+        outcome = run_phase6_campaign(
+            repository_root,
+            spec_path,
+            plan_path,
+            campaign_path,
+            confirm_live_codex=True,
+            confirm_provider_calls=confirm_provider_calls,
+        )
+    except Phase6CampaignError as error:
+        typer.echo(f"run-phase6-campaign stopped: {error}", err=True)
+        typer.echo("automatic retry/fallback/resume: 0")
+        raise typer.Exit(code=2) from error
+    typer.echo(f"campaign: {outcome.campaign_path}")
+    typer.echo(f"Provider calls: {outcome.provider_call_count}")
+    typer.echo(f"stop reason: {outcome.stop_reason.value}")
+    typer.echo("automatic retry/fallback/resume: 0")
 
 
 @app.command("accept-phase6-fixtures")
@@ -228,10 +312,7 @@ def run_workflow_campaign_command(
     typer.echo(f"campaign: {outcome.campaign_path}")
     typer.echo(f"attempted runs: {outcome.attempted_run_count}")
     typer.echo(f"Provider calls: {outcome.provider_call_count}")
-    typer.echo(
-        "Provider call count unknown runs: "
-        f"{outcome.provider_call_count_unknown_runs}"
-    )
+    typer.echo(f"Provider call count unknown runs: {outcome.provider_call_count_unknown_runs}")
     typer.echo(f"stop reason: {outcome.stop_reason.value}")
     typer.echo("automatic retry/fallback: 0")
     if outcome.stop_reason is not CampaignStopReason.NONE:

@@ -61,11 +61,14 @@ call数と分離します。この1 Task、固定Prompt／Fixture／Gate、各3�
 Phase 4はComplete、Phase 5はBlockedです。
 
 Phase 6はPhase 4 Completeへ依存し、Phase 5とは独立して開始しました。Slice 6Aのversion付き
-契約に加え、Slice 6BではPython／TypeScript／Javaの依存なしTag Normalizer Fixtureと、明示確認
-付きのlocal toolchain audit／Fixture Acceptance経路を実装しました。Acceptance Recordはcleanな
-commitに対する実測が全条件を満たした場合だけGit管理外へ保存します。Campaign runtime、Public
-Report生成、Liveは未着手で、Slice 6Bだけでは言語statusを`ready_not_run`へ進めず、Phase 6も
-Live-readyではありません。詳細と停止境界は
+契約とSlice 6Bのlocal Fixture Acceptanceに加え、Slice 6CではSpec 2.1／Plan 1.2のcreate-only
+準備とPlan-bound Campaign runtimeを実装しました。Plan生成時、Campaign開始前、各call直前に
+入力を照合し、Provider後・Gate前にDiff Policyを適用します。違反は
+`output_contract_violation`としてGate 0件で拒否し、Gate後もWorkspaceを再検証します。
+Python／Javaのengineering planは言語ごとに1 pair／2 planned callsで、生成成功後は
+`ready_not_run`です。TypeScriptは`typescript_compiler`未解決のため`not_ready`です。実Codex
+Provider／Prompt送信／Liveは0件で、Public renderer／publisherはSlice 6Dまで未着手です。
+したがってPhase 6はまだLive-readyでもCompleteでもありません。詳細と停止境界は
 [Phase 6詳細設計](docs/PHASE6_MULTI_LANGUAGE_PUBLIC_REPORT.md)を参照してください。
 
 Phase 4までに次を提供します。
@@ -266,8 +269,8 @@ macOSはlocal process-tree testで検証済みです。Linux実装経路は有�
 - Phase 4: Workflow A/B Experiment（完了、Campaign 002は3/3 complete pairs）
 - Phase 5: Antigravity CLI Provider（Blocked、Slice 5A offline実装済み、Slice 5B／5Cは
   上流artifact署名検証失敗により停止）
-- Phase 6: Multi-language Fixtures and Public Report（Current、Slice 6A承認済み、Slice 6B
-  Fixture Acceptance実装）
+- Phase 6: Multi-language Fixtures and Public Report（Current、Slice 6C offline runtime実装、
+  Live 0件、Public ReportはSlice 6D）
 - Phase 7: Optional Enhancements
 
 詳細は [docs/ROADMAP.md](docs/ROADMAP.md) を参照してください。

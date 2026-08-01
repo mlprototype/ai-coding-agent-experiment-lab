@@ -187,8 +187,12 @@ Manifest／Run Record／Report 1.0、canonical serialization、後方互換loade
 cross-artifact validatorをoffline実装した。Slice 6Bでは3言語の独立したTag Normalizer
 Fixture、local capability audit、baseline／reference Acceptance、create-only Record生成を
 実装した。実測Acceptanceはcleanな実装commitへ束縛し、結果をGit管理外へ保存する。
-Campaign runtime、renderer、publication、Liveは未実装である。Slice 6Bだけでは言語statusを
-`ready_not_run`へ変更せず、次のSlice 6Cは別レビュー承認まで開始しない。詳細は
+Slice 6CではSpec 2.1／Plan 1.2の決定的なcreate-only準備、Plan-bound入力のCampaign開始前・
+各call直前検証、Provider後・Gate前Diff enforcement、Campaign／Recording／LiveRunArtifact
+1.2 runtimeを実装した。`output_contract_violation`ではGateを0件に保ち、Gate後のWorkspaceと
+toolchainも再検証する。Python／Javaは各1 pair／2 planned calls、TypeScriptは`not_ready`の
+ままとし、実Provider／Prompt／Liveは0件である。renderer／publicationはSlice 6Dで、レビュー
+承認まで開始しない。詳細は
 [Phase 6詳細設計](PHASE6_MULTI_LANGUAGE_PUBLIC_REPORT.md)を参照する。
 
 **受入条件:** Live-readyには最低2言語の実toolchain Fixture受入が必要で、offline実装だけ

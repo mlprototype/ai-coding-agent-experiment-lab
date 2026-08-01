@@ -6,7 +6,7 @@
 
 - Slice 6A Contract / strict loader: implemented (offline)
 - Slice 6B Fixture Acceptance: implemented (local-only; no status transition)
-- Slice 6C language-specific Campaign integration: not started
+- Slice 6C Plan-bound Campaign execution: implemented (offline/fake accepted; Live 0)
 - Slice 6D Public Suite renderer and atomic publication: not started
 - Slice 6E reviewed Live Campaign and public bundle: not started
 
@@ -307,13 +307,31 @@ staging directoryを再`fsync`する。その後、排他的publish lock下でde
 destinationを置換せず、途中bundleを残さない。このpublication処理はSlice 6Aでは未実装で
 ある。
 
+## Slice 6C Plan-bound Campaign execution
+
+Slice 6CはWorkflow Spec 2.1とcanonical Workflow Plan 1.2をGit管理外へcreate-onlyで準備する。
+Plan生成時にFixture、Prompt、Manifest、Acceptance、Policy、Gate、reference、toolchain、reviewed
+commitを固定し、Campaign開始前と各Provider call直前に再読込してdriftを検出する。実行には開始時
+のin-memory snapshotだけを使い、drift時は`input_changed`、Provider call 0、Gate 0件で
+canonical Campaignを完結する。
+
+Provider process groupの回収確認後、Gate起動前にDiff Policyを適用する。protected／未分類path、
+禁止された作成・削除、link、特殊file、不完全なsnapshotは`output_contract_violation`として
+拒否し、Gateは0件とする。Policy PASS時だけAcceptance、Regression、lint、typecheckを固定
+toolchainと固定PATHで実行し、各command前後のtoolchain identity、Gate後Workspace、cleanupを
+再確認する。cleanup failureは他の結果より優先する。
+
+engineering minimum用PlanはPython／Javaを独立に各1 task、one-shot／staged各1回、1 pair、2
+planned Provider calls（合計4 calls）とする。Plan生成成功後は両言語を`ready_not_run`とし、
+TypeScriptは`typescript_compiler`未解決のため`not_ready`を維持する。実Codex Provider call、
+Prompt送信、Live Campaignは0件である。Slice 6C完了だけではPhase 6はLive-readyでもCompleteでも
+ない。Public renderer／publisherはSlice 6Dであり、レビュー承認まで開始しない。
+
 ## Current acceptance boundary
 
-Slice 6Aの完了とSlice 6B Fixture Acceptance実装だけでは、Spec 2.1／Plan 1.2生成runtimeと
-Campaign受入が未完了であるため、言語statusは`not_ready`のままであり、Live-readyでもPhase 6
-Completeでもない。Slice 6Bの実行はlocal version／Gateに限定し、Codex／Antigravity CLI、
-Provider call、Prompt送信、network、quota利用、Live Artifact、Public bundle生成は0件である。
-次はSlice 6Cだが、レビュー承認まで開始しない。
+Slice 6Cのoffline/fake受入完了だけではLive-readyでもPhase 6 Completeでもない。実Codex／
+Antigravity CLI、Provider call、Prompt送信、network、quota利用、Live Campaign、Public bundle生成
+は0件である。次はSlice 6Cレビューであり、Slice 6Dは承認まで開始しない。
 
 Python、TypeScript、Javaは実装目標だが、Live-readyは最低2言語の実toolchain受入完了、
 Phase 6 Completeは最低2言語で各1 complete pairとPublic Suite bundle完成を条件とする。
