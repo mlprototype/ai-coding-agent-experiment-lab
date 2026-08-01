@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sys
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -10,14 +11,18 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from test_phase6 import (
     COMMIT,
     T0,
     T1,
     _cross_artifact_case,
     _fixture_contracts,
+    _passing_gate_commands,
+    _passing_metrics,
     _phase6_plan,
     _phase6_spec,
+    _successful_codex,
 )
 from typer.testing import CliRunner
 
@@ -31,7 +36,17 @@ from agentlab.campaign import (
     CampaignStopReason,
 )
 from agentlab.cli import app
-from agentlab.models import Provider
+from agentlab.models import (
+    DiffEvidence,
+    ExecutionMode,
+    GateKindSummary,
+    LiveEvaluationSummary,
+    LiveFailureKind,
+    LiveOverallStatus,
+    LiveRunArtifact,
+    Provider,
+    WorkspaceLifecycle,
+)
 from agentlab.phase6 import (
     ArtifactReference,
     HistoricalVerificationRecord,
@@ -50,6 +65,7 @@ from agentlab.phase6 import (
     SourceClass,
     _canonical_jsonl_line,
     canonical_json_bytes,
+    load_historical_verification,
     load_public_suite_inputs,
     validate_public_suite_inputs,
 )
@@ -68,7 +84,13 @@ from agentlab.phase6_public import (
     render_public_suite,
     verify_phase6_historical,
 )
-from agentlab.workflow import build_workflow_plan, workflow_plan_bytes
+from agentlab.recording import LiveRunCompletedEvent, LiveRunStartedEvent
+from agentlab.workflow import (
+    build_workflow_plan,
+    load_workflow_spec,
+    workflow_plan_bytes,
+    workflow_prompt_fingerprint,
+)
 from agentlab.workflow_report import (
     aggregate_workflow_campaign,
     workflow_report_json_bytes,
@@ -76,6 +98,9 @@ from agentlab.workflow_report import (
 )
 
 HISTORICAL_REVIEWED_SPEC = "experiments/examples/workflow-ab.yaml"
+COMPLETED_HISTORICAL_SPEC = (
+    "experiments/phase4-live/workflow-ab-codex-live-002.yaml"
+)
 
 
 def _write(path: Path, content: bytes) -> None:
@@ -1072,6 +1097,242 @@ def _historical_fixture(root: Path) -> tuple[str, str, str, str]:
     return plan_path, campaign_path, report_json_path, report_markdown_path
 
 
+def _completed_historical_fixture(
+    repository: Path,
+) -> tuple[Path, str, str, str, str, Any]:
+    reviewed_spec = repository / COMPLETED_HISTORICAL_SPEC
+    reviewed_spec.parent.mkdir(parents=True)
+    source = yaml.safe_load(
+        Path(HISTORICAL_REVIEWED_SPEC).read_text(encoding="utf-8")
+    )
+    source["experiment_id"] = "workflow-ab-codex-live-002"
+    source["repetitions"] = 1
+    source["artifacts"]["root"] = ".artifacts/workflow-ab-codex-live-002"
+    reviewed_spec.write_text(
+        yaml.safe_dump(source, sort_keys=False),
+        encoding="utf-8",
+    )
+    _write(
+        reviewed_spec.parent / "prompts/codex-live-smoke.md",
+        Path("experiments/examples/prompts/codex-live-smoke.md").read_bytes(),
+    )
+    shutil.copytree(
+        Path("experiments/examples/fixtures/codex-live-smoke"),
+        reviewed_spec.parent / "fixtures/codex-live-smoke",
+    )
+
+    historical_root = reviewed_spec.parent
+    artifact_root = historical_root / ".artifacts/workflow-ab-codex-live-002"
+    plan = build_workflow_plan(reviewed_spec)
+    plan_bytes = workflow_plan_bytes(plan)
+    plan_path = ".artifacts/workflow-ab-codex-live-002/plan.json"
+    campaign_path = ".artifacts/workflow-ab-codex-live-002/campaign.jsonl"
+    report_json_path = ".artifacts/workflow-ab-codex-live-002/report.json"
+    report_markdown_path = ".artifacts/workflow-ab-codex-live-002/report.md"
+    _write(historical_root / plan_path, plan_bytes)
+
+    spec = load_workflow_spec(reviewed_spec).spec
+    timestamp = datetime.fromisoformat(T0.replace("Z", "+00:00"))
+    commands = _passing_gate_commands()
+    metrics = _passing_metrics()
+    diff = DiffEvidence(
+        changed_files=[],
+        binary_files=[],
+        added_lines=0,
+        deleted_lines=0,
+        unified_diff="",
+        diff_truncated=False,
+        line_counts_complete=True,
+        collection_error=None,
+    )
+    gate_summary = GateKindSummary(
+        command_count=1,
+        passed_count=1,
+        failed_count=0,
+    )
+    evaluation = LiveEvaluationSummary(
+        acceptance=gate_summary,
+        regression=gate_summary,
+        lint=gate_summary,
+        typecheck=gate_summary,
+        all_commands_completed_normally=True,
+        evaluation_duration_ms=0,
+        changed_files=[],
+        added_lines=0,
+        deleted_lines=0,
+        diff_line_counts_complete=True,
+        workspace_lifecycle=WorkspaceLifecycle.REMOVED,
+    )
+    campaign_events: list[Any] = [
+        CampaignStartedEvent(
+            schema_version="1.1",
+            sequence=0,
+            event_type="campaign_started",
+            experiment_id=plan.experiment_id,
+            plan_sha256=hashlib.sha256(plan_bytes).hexdigest(),
+            planned_run_count=plan.planned_run_count,
+            planned_provider_call_count=plan.planned_provider_call_count,
+            occurred_at=timestamp,
+        )
+    ]
+    sequence = 1
+    for run in plan.runs:
+        prompt_sha256, prompt_bytes = workflow_prompt_fingerprint(
+            plan,
+            run.workflow,
+        )
+        codex = _successful_codex(
+            model=plan.model,
+            reasoning_effort=plan.reasoning_effort,
+            prompt_bytes=prompt_bytes,
+        )
+        started = LiveRunStartedEvent(
+            schema_version="1.1",
+            sequence=0,
+            event_type="run_started",
+            run_id=run.run_id,
+            experiment_id=plan.experiment_id,
+            task_id=run.task_id,
+            workflow=run.workflow,
+            provider=Provider.CODEX,
+            repetition_index=run.repetition_index,
+            execution_mode=ExecutionMode.LIVE,
+            occurred_at=timestamp,
+            prompt_sha256=prompt_sha256,
+            prompt_bytes=prompt_bytes,
+            prompt_redacted=True,
+            requested_model=plan.model,
+            requested_reasoning_effort=plan.reasoning_effort,
+            cli_version=codex.cli_version,
+        )
+        completed = LiveRunCompletedEvent(
+            schema_version="1.1",
+            sequence=1,
+            event_type="run_completed",
+            run_id=run.run_id,
+            experiment_id=plan.experiment_id,
+            occurred_at=timestamp,
+            metrics=metrics,
+            codex=codex,
+            evaluation=evaluation,
+        )
+        recording_bytes = (
+            _canonical_jsonl_line(started) + _canonical_jsonl_line(completed)
+        )
+        artifact = LiveRunArtifact(
+            schema_version="1.1",
+            run_id=run.run_id,
+            experiment_id=plan.experiment_id,
+            task_id=run.task_id,
+            repetition_index=run.repetition_index,
+            workflow=run.workflow,
+            provider=Provider.CODEX,
+            execution_mode=ExecutionMode.LIVE,
+            overall_status=LiveOverallStatus.PASSED,
+            failure_kind=LiveFailureKind.NONE,
+            started_at=timestamp,
+            completed_at=timestamp,
+            spec_sha256=hashlib.sha256(reviewed_spec.read_bytes()).hexdigest(),
+            fixture_sha256=plan.fixture_sha256,
+            prompt_sha256=prompt_sha256,
+            prompt_bytes=prompt_bytes,
+            prompt_redacted=True,
+            runner=spec.runner,
+            codex=codex,
+            gate_commands=commands,
+            diff=diff,
+            metrics=metrics,
+            evaluation_duration_ms=0,
+            workspace_lifecycle=WorkspaceLifecycle.REMOVED,
+            recording_sha256=hashlib.sha256(recording_bytes).hexdigest(),
+            raw_provider_output_persisted=False,
+        )
+        _write(historical_root / run.recording_path, recording_bytes)
+        _write(
+            historical_root / run.evidence_path,
+            canonical_json_bytes(artifact),
+        )
+        campaign_events.extend(
+            [
+                CampaignRunEvent(
+                    schema_version="1.1",
+                    sequence=sequence,
+                    event_type="run_state",
+                    run_id=run.run_id,
+                    task_id=run.task_id,
+                    workflow=run.workflow,
+                    repetition_index=run.repetition_index,
+                    status=CampaignRunStatus.STARTED,
+                    outcome=None,
+                    stop_reason=None,
+                    provider_call_count=None,
+                    retry_count=0,
+                    live_failure_kind=None,
+                    adapter_cleanup_state=AdapterCleanupState.NOT_APPLICABLE,
+                    occurred_at=timestamp,
+                ),
+                CampaignRunEvent(
+                    schema_version="1.1",
+                    sequence=sequence + 1,
+                    event_type="run_state",
+                    run_id=run.run_id,
+                    task_id=run.task_id,
+                    workflow=run.workflow,
+                    repetition_index=run.repetition_index,
+                    status=CampaignRunStatus.COMPLETED,
+                    outcome=CampaignOutcome.SUCCESS,
+                    stop_reason=None,
+                    provider_call_count=1,
+                    retry_count=0,
+                    live_failure_kind=LiveFailureKind.NONE,
+                    adapter_cleanup_state=AdapterCleanupState.CLEARED,
+                    occurred_at=timestamp,
+                ),
+            ]
+        )
+        sequence += 2
+    campaign_events.append(
+        CampaignFinishedEvent(
+            schema_version="1.1",
+            sequence=sequence,
+            event_type="campaign_finished",
+            experiment_id=plan.experiment_id,
+            stop_reason=CampaignStopReason.NONE,
+            attempted_run_count=len(plan.runs),
+            provider_call_count=len(plan.runs),
+            provider_call_count_unknown_runs=0,
+            retry_count=0,
+            occurred_at=timestamp,
+        )
+    )
+    _write(
+        historical_root / campaign_path,
+        b"".join(_canonical_jsonl_line(event) for event in campaign_events),
+    )
+    report = aggregate_workflow_campaign(
+        reviewed_spec,
+        historical_root / plan_path,
+        historical_root / campaign_path,
+    )
+    _write(
+        historical_root / report_json_path,
+        workflow_report_json_bytes(report),
+    )
+    _write(
+        historical_root / report_markdown_path,
+        workflow_report_markdown(report).encode("utf-8"),
+    )
+    assert artifact_root.is_dir()
+    return (
+        historical_root,
+        plan_path,
+        campaign_path,
+        report_json_path,
+        report_markdown_path,
+        plan,
+    )
+
+
 def test_historical_verification_uses_saved_bytes_and_create_only_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1120,6 +1381,105 @@ def test_historical_verification_uses_saved_bytes_and_create_only_output(
             language=Language.PYTHON,
             confirm_local_execution=True,
         )
+
+
+def test_historical_verification_reaggregates_completed_nested_spec_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (
+        historical_root,
+        plan_path,
+        campaign_path,
+        report_json_path,
+        report_markdown_path,
+        plan,
+    ) = _completed_historical_fixture(repository)
+    output_parent = tmp_path / "records"
+    output_parent.mkdir()
+    output = output_parent / "verification.json"
+    real_aggregate = aggregate_workflow_campaign
+    mirrored_artifacts: list[Path] = []
+    mirrored_spec_parents: list[Path] = []
+
+    def aggregate_from_nested_mirror(
+        spec_path: Path,
+        saved_plan_path: Path,
+        saved_campaign_path: Path,
+    ) -> Any:
+        assert spec_path != repository / COMPLETED_HISTORICAL_SPEC
+        mirrored_spec_parents.append(spec_path.parent)
+        for run in plan.runs:
+            evidence = spec_path.parent / run.evidence_path
+            recording = spec_path.parent / run.recording_path
+            assert evidence.is_file()
+            assert recording.is_file()
+            mirrored_artifacts.extend([evidence, recording])
+        return real_aggregate(spec_path, saved_plan_path, saved_campaign_path)
+
+    execution_calls = {
+        "campaign": 0,
+        "provider": 0,
+        "external_process": 0,
+    }
+
+    def forbid_campaign(*_args: object, **_kwargs: object) -> None:
+        execution_calls["campaign"] += 1
+        raise AssertionError("Historical verification must not execute a Campaign")
+
+    def forbid_provider(*_args: object, **_kwargs: object) -> None:
+        execution_calls["provider"] += 1
+        raise AssertionError("Historical verification must not execute a Provider")
+
+    def forbid_process(*_args: object, **_kwargs: object) -> None:
+        execution_calls["external_process"] += 1
+        raise AssertionError("Historical verification must not execute a process")
+
+    monkeypatch.setattr(
+        "agentlab.phase6_public.aggregate_workflow_campaign",
+        aggregate_from_nested_mirror,
+    )
+    monkeypatch.setattr("agentlab.campaign.run_workflow_campaign", forbid_campaign)
+    monkeypatch.setattr("agentlab.live.run_live_codex", forbid_provider)
+    monkeypatch.setattr("subprocess.Popen", forbid_process)
+    monkeypatch.setattr("agentlab.phase6_public._clean_git_head", lambda _path: COMMIT)
+    monkeypatch.setattr(
+        "agentlab.phase6_public._source_reviewed_commit",
+        lambda _repository, _path, _bytes, _plan: COMMIT,
+    )
+
+    result = verify_phase6_historical(
+        repository=repository,
+        historical_root=historical_root,
+        reviewed_spec_path=COMPLETED_HISTORICAL_SPEC,
+        plan_path=plan_path,
+        campaign_path=campaign_path,
+        report_json_path=report_json_path,
+        report_markdown_path=report_markdown_path,
+        output_path=output,
+        language=Language.PYTHON,
+        confirm_local_execution=True,
+        now=lambda: datetime(2026, 7, 31, tzinfo=UTC),
+    )
+
+    assert len(mirrored_artifacts) == len(plan.runs) * 2
+    assert len(mirrored_spec_parents) == 1
+    assert mirrored_spec_parents[0].parts[-2:] == ("experiments", "phase4-live")
+    assert all(path.is_relative_to(mirrored_spec_parents[0]) for path in mirrored_artifacts)
+    assert execution_calls == {
+        "campaign": 0,
+        "provider": 0,
+        "external_process": 0,
+    }
+    assert load_historical_verification(output) == result.record
+    assert output.read_bytes() == canonical_json_bytes(result.record)
+    assert result.record.strict_schema_validation_passed is True
+    assert result.record.cross_artifact_validation_passed is True
+    assert result.record.artifact_regenerated is False
+    assert result.record.campaign_reexecuted is False
+    assert list(output_parent.iterdir()) == [output]
 
 
 def test_historical_source_commit_uses_explicit_repository_spec_path(

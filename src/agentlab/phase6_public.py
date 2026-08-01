@@ -525,8 +525,12 @@ def verify_phase6_historical(
         mirror_spec = mirror / reviewed_spec_path
         mirror_spec.parent.mkdir(parents=True, exist_ok=True)
         mirror_spec.write_bytes(reviewed_spec_bytes)
+        mirror_targets = {mirror_spec}
         for role, relative in relative_paths.items():
             target = mirror / relative
+            if target in mirror_targets:
+                raise Phase6PublicError("historical mirror paths must be distinct")
+            mirror_targets.add(target)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(contents[role])
         for run in plan.runs:
@@ -545,7 +549,12 @@ def verify_phase6_historical(
                         file_identities=file_identities,
                     )
                     all_contents[relative] = data
-                    target = mirror / relative
+                    target = mirror_spec.parent / relative
+                    if target in mirror_targets:
+                        raise Phase6PublicError(
+                            "historical mirror paths must be distinct"
+                        )
+                    mirror_targets.add(target)
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(data)
         try:
