@@ -1,0 +1,1107 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+from dataclasses import replace
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import pytest
+from test_phase6 import (
+    COMMIT,
+    T0,
+    T1,
+    _cross_artifact_case,
+    _fixture_contracts,
+    _phase6_plan,
+    _phase6_spec,
+)
+from typer.testing import CliRunner
+
+from agentlab.campaign import (
+    AdapterCleanupState,
+    CampaignFinishedEvent,
+    CampaignOutcome,
+    CampaignRunEvent,
+    CampaignRunStatus,
+    CampaignStartedEvent,
+    CampaignStopReason,
+)
+from agentlab.cli import app
+from agentlab.models import Provider
+from agentlab.phase6 import (
+    ArtifactReference,
+    HistoricalVerificationRecord,
+    Language,
+    LanguageStatus,
+    Phase6CampaignFinishedEvent,
+    Phase6CampaignOutcome,
+    Phase6CampaignRunEvent,
+    Phase6CampaignStartedEvent,
+    Phase6ContractError,
+    PrimarySuiteSource,
+    ProviderCoverage,
+    ProviderEvaluationStatus,
+    PublicSuiteManifest,
+    SourceClass,
+    _canonical_jsonl_line,
+    canonical_json_bytes,
+    load_public_suite_inputs,
+    validate_public_suite_inputs,
+)
+from agentlab.phase6_public import (
+    RENDERER_VERSION,
+    Phase6PublicError,
+    _clean_git_head,
+    _rename_no_replace,
+    _scan_public_bytes,
+    _write_staging_bundle,
+    publish_public_suite,
+    render_public_suite,
+    verify_phase6_historical,
+)
+from agentlab.workflow import build_workflow_plan, workflow_plan_bytes
+from agentlab.workflow_report import (
+    aggregate_workflow_campaign,
+    workflow_report_json_bytes,
+    workflow_report_markdown,
+)
+
+
+def _write(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+
+def _coverage(*, evaluated: bool) -> list[ProviderCoverage]:
+    return [
+        ProviderCoverage(
+            provider=Provider.CODEX,
+            evaluation_status=(
+                ProviderEvaluationStatus.EVALUATED
+                if evaluated
+                else ProviderEvaluationStatus.NOT_EVALUATED
+            ),
+            evaluated_languages=[Language.PYTHON] if evaluated else [],
+            blocker=None,
+        ),
+        ProviderCoverage(
+            provider=Provider.ANTIGRAVITY,
+            evaluation_status=ProviderEvaluationStatus.NOT_EVALUATED,
+            evaluated_languages=[],
+            blocker="upstream_artifact_signature_invalid",
+        ),
+    ]
+
+
+def _manifest(
+    source: PrimarySuiteSource,
+    *,
+    cutoff: str,
+    outputs: list[str],
+    evaluated: bool,
+) -> PublicSuiteManifest:
+    return PublicSuiteManifest(
+        schema_version="1.0",
+        suite_id="phase6-fake-suite",
+        renderer_version=RENDERER_VERSION,
+        data_cutoff_at=cutoff,
+        primary_sources=[source],
+        historical_sources=[],
+        provider_coverage=_coverage(evaluated=evaluated),
+        antigravity_blocker="upstream_artifact_signature_invalid",
+        zero_call_run_publication="aggregate_only_no_run_record",
+        planned_outputs=sorted(outputs),
+        automatic_winner_selected=False,
+        leaderboard_generated=False,
+        statistical_significance_claimed=False,
+    )
+
+
+def _ready_suite(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path / "inputs"
+    root.mkdir(parents=True)
+    fixture, policy, acceptance = _fixture_contracts()
+    spec_path, spec = _phase6_spec(root)
+    plan = _phase6_plan(root, spec_path, spec, fixture, policy, acceptance)
+    files = {
+        "fixture.manifest.json": canonical_json_bytes(fixture),
+        "fixture.acceptance.json": canonical_json_bytes(acceptance),
+        "diff-policy.json": canonical_json_bytes(policy),
+        "plan.json": canonical_json_bytes(plan),
+    }
+    for relative, content in files.items():
+        _write(root / relative, content)
+    source = PrimarySuiteSource(
+        source_class=SourceClass.PRIMARY,
+        language=Language.PYTHON,
+        expected_language_status=LanguageStatus.READY_NOT_RUN,
+        spec=ArtifactReference(
+            role="spec",
+            path="workflow.yaml",
+            sha256=hashlib.sha256(spec_path.read_bytes()).hexdigest(),
+        ),
+        fixture_manifest=ArtifactReference(
+            role="fixture_manifest",
+            path="fixture.manifest.json",
+            sha256=hashlib.sha256(files["fixture.manifest.json"]).hexdigest(),
+        ),
+        fixture_acceptance=ArtifactReference(
+            role="fixture_acceptance",
+            path="fixture.acceptance.json",
+            sha256=hashlib.sha256(files["fixture.acceptance.json"]).hexdigest(),
+        ),
+        diff_policy=ArtifactReference(
+            role="diff_policy",
+            path="diff-policy.json",
+            sha256=hashlib.sha256(files["diff-policy.json"]).hexdigest(),
+        ),
+        plan=ArtifactReference(
+            role="plan",
+            path="plan.json",
+            sha256=hashlib.sha256(files["plan.json"]).hexdigest(),
+        ),
+        campaign=None,
+        evidence=[],
+        recordings=[],
+    )
+    outputs = [
+        "checksums.json",
+        "languages/python/report.json",
+        "languages/python/report.md",
+        "provider-coverage.json",
+        "release-metadata.json",
+        "suite.json",
+        "suite.md",
+    ]
+    manifest = _manifest(
+        source,
+        cutoff=T0,
+        outputs=outputs,
+        evaluated=False,
+    )
+    manifest_path = root / "suite-manifest.json"
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    return root, manifest_path
+
+
+def _evaluated_suite(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path / "evaluated-inputs"
+    root.mkdir(parents=True)
+    source, _spec, plan, campaign, artifacts, recordings = _cross_artifact_case(root)
+    fixture, policy, acceptance = _fixture_contracts()
+    core = {
+        "fixture.manifest.json": canonical_json_bytes(fixture),
+        "fixture.acceptance.json": canonical_json_bytes(acceptance),
+        "diff-policy.json": canonical_json_bytes(policy),
+        "plan.json": canonical_json_bytes(plan),
+    }
+    for relative, content in core.items():
+        _write(root / relative, content)
+    campaign_bytes = b"".join(_canonical_jsonl_line(event) for event in campaign.events)
+    _write(root / "campaign.jsonl", campaign_bytes)
+    assert source.campaign is not None
+    source = source.model_copy(
+        update={
+            "campaign": source.campaign.model_copy(
+                update={"sha256": hashlib.sha256(campaign_bytes).hexdigest()}
+            )
+        }
+    )
+    recording_bytes = [
+        _canonical_jsonl_line(recording.started)
+        + _canonical_jsonl_line(recording.terminal)
+        for recording in recordings
+    ]
+    artifacts = [
+        artifact.model_copy(
+            update={"recording_sha256": hashlib.sha256(content).hexdigest()}
+        )
+        for artifact, content in zip(artifacts, recording_bytes, strict=True)
+    ]
+    evidence_references = []
+    for reference, artifact in zip(source.evidence, artifacts, strict=True):
+        content = canonical_json_bytes(artifact)
+        _write(root / reference.path, content)
+        evidence_references.append(
+            reference.model_copy(
+                update={"sha256": hashlib.sha256(content).hexdigest()}
+            )
+        )
+    recording_references = []
+    for reference, content in zip(source.recordings, recording_bytes, strict=True):
+        _write(root / reference.path, content)
+        recording_references.append(
+            reference.model_copy(
+                update={"sha256": hashlib.sha256(content).hexdigest()}
+            )
+        )
+    source = source.model_copy(
+        update={
+            "evidence": evidence_references,
+            "recordings": recording_references,
+        }
+    )
+    outputs = [
+        "checksums.json",
+        "languages/python/report.json",
+        "languages/python/report.md",
+        "provider-coverage.json",
+        "release-metadata.json",
+        "runs/python/000.json",
+        "runs/python/001.json",
+        "suite.json",
+        "suite.md",
+    ]
+    manifest = _manifest(
+        source,
+        cutoff=T1,
+        outputs=outputs,
+        evaluated=True,
+    )
+    manifest_path = root / "suite-manifest.json"
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    return root, manifest_path
+
+
+def _input_changed_suite(tmp_path: Path) -> tuple[Path, Path, int]:
+    root, manifest_path = _ready_suite(tmp_path)
+    manifest = PublicSuiteManifest.model_validate_json(manifest_path.read_bytes())
+    source = manifest.primary_sources[0]
+    assert source.plan is not None
+    plan = json.loads((root / source.plan.path).read_bytes())
+    runs = plan["runs"]
+    plan_sha256 = hashlib.sha256((root / source.plan.path).read_bytes()).hexdigest()
+    fixture = source.fixture_manifest
+    acceptance = source.fixture_acceptance
+    policy = source.diff_policy
+    assert fixture is not None and acceptance is not None and policy is not None
+    events: list[Any] = [
+        Phase6CampaignStartedEvent(
+            schema_version="1.2",
+            sequence=0,
+            event_type="campaign_started",
+            experiment_id=plan["experiment_id"],
+            plan_sha256=plan_sha256,
+            fixture_manifest_sha256=fixture.sha256,
+            fixture_acceptance_sha256=acceptance.sha256,
+            diff_policy_sha256=policy.sha256,
+            toolchain_fingerprint=plan["toolchain_fingerprint"],
+            planned_run_count=len(runs),
+            planned_provider_call_count=len(runs),
+            occurred_at=T0,
+        )
+    ]
+    for sequence, run in enumerate(runs, start=1):
+        events.append(
+            Phase6CampaignRunEvent(
+                schema_version="1.2",
+                sequence=sequence,
+                event_type="run_state",
+                run_id=run["run_id"],
+                task_id=run["task_id"],
+                workflow=run["workflow"],
+                repetition_index=run["repetition_index"],
+                status=CampaignRunStatus.NOT_RUN,
+                outcome=Phase6CampaignOutcome.STOP_CONDITION,
+                stop_reason=CampaignStopReason.INPUT_CHANGED,
+                provider_call_count=0,
+                gate_executed=False,
+                counted_failure=False,
+                fail_fast_applies=False,
+                max_failures_applies=False,
+                failure_kind=None,
+                occurred_at=T0,
+            )
+        )
+    events.append(
+        Phase6CampaignFinishedEvent(
+            schema_version="1.2",
+            sequence=len(events),
+            event_type="campaign_finished",
+            experiment_id=plan["experiment_id"],
+            stop_reason=CampaignStopReason.INPUT_CHANGED,
+            attempted_run_count=0,
+            provider_call_count=0,
+            provider_call_count_unknown_runs=0,
+            counted_failure_count=0,
+            retry_count=0,
+            occurred_at=T1,
+        )
+    )
+    campaign_bytes = b"".join(_canonical_jsonl_line(event) for event in events)
+    _write(root / "campaign.jsonl", campaign_bytes)
+    campaign_reference = ArtifactReference(
+        role="campaign",
+        path="campaign.jsonl",
+        sha256=hashlib.sha256(campaign_bytes).hexdigest(),
+    )
+    blocked_source = source.model_copy(
+        update={
+            "expected_language_status": LanguageStatus.BLOCKED,
+            "blocker": "input_changed",
+            "campaign": campaign_reference,
+        }
+    )
+    updated = manifest.model_copy(
+        update={
+            "data_cutoff_at": datetime.fromisoformat(T1.replace("Z", "+00:00")),
+            "primary_sources": [blocked_source],
+        }
+    )
+    manifest_path.write_bytes(canonical_json_bytes(updated))
+    return root, manifest_path, len(runs)
+
+
+def _validated(root: Path, manifest_path: Path) -> Any:
+    return validate_public_suite_inputs(
+        load_public_suite_inputs(manifest_path, root=root)
+    )
+
+
+def test_ready_not_run_render_is_deterministic_and_ignores_unlisted_secret(
+    tmp_path: Path,
+) -> None:
+    root, manifest_path = _ready_suite(tmp_path)
+    (root / "unlisted-broken-secret.json").write_text(
+        '{"prompt":"SECRET-SENTINEL", broken',
+        encoding="utf-8",
+    )
+    validated = _validated(root, manifest_path)
+
+    first = render_public_suite(validated)
+    second = render_public_suite(validated)
+
+    assert first.files == second.files
+    assert first.external_anchor_bytes == second.external_anchor_bytes
+    report = json.loads(first.files["languages/python/report.json"])
+    assert report["status"] == "ready_not_run"
+    assert report["scheduled_runs"] == 0
+    assert b"SECRET-SENTINEL" not in b"".join(first.files.values())
+    assert b"upstream_artifact_signature_invalid" in first.files["suite.json"]
+    assert b"winner" in first.files["suite.md"].lower()
+
+
+def test_evaluated_suite_emits_plan_indexed_allowlisted_run_records(
+    tmp_path: Path,
+) -> None:
+    root, manifest_path = _evaluated_suite(tmp_path)
+    rendered = render_public_suite(_validated(root, manifest_path))
+
+    assert "runs/python/000.json" in rendered.files
+    assert "runs/python/001.json" in rendered.files
+    record = json.loads(rendered.files["runs/python/000.json"])
+    assert record["provider_call_count"] == 1
+    assert record["run_metrics_available"] is True
+    assert "prompt" not in record
+    assert "raw_provider_output" not in record
+    assert "unified_diff" not in record
+    report = json.loads(rendered.files["languages/python/report.json"])
+    assert report["status"] == "evaluated"
+    assert report["complete_pair_count"] == 1
+
+
+def test_input_changed_is_zero_call_aggregate_only(tmp_path: Path) -> None:
+    root, manifest_path, run_count = _input_changed_suite(tmp_path)
+    rendered = render_public_suite(_validated(root, manifest_path))
+
+    assert not any(path.startswith("runs/") for path in rendered.files)
+    report = json.loads(rendered.files["languages/python/report.json"])
+    assert report["status"] == "blocked"
+    assert report["zero_call_runs"] == run_count
+    assert report["gate_not_executed_reason"] == {"input_changed": run_count}
+    assert report["estimability"] == "not_estimable"
+
+
+def test_not_ready_language_is_zero_count_and_not_estimable(tmp_path: Path) -> None:
+    root, manifest_path = _ready_suite(tmp_path)
+    manifest = PublicSuiteManifest.model_validate_json(manifest_path.read_bytes())
+    not_ready = PrimarySuiteSource(
+        source_class=SourceClass.PRIMARY,
+        language=Language.TYPESCRIPT,
+        expected_language_status=LanguageStatus.NOT_READY,
+    )
+    outputs = sorted(
+        [
+            *manifest.planned_outputs,
+            "languages/typescript/report.json",
+            "languages/typescript/report.md",
+        ]
+    )
+    updated = manifest.model_copy(
+        update={
+            "primary_sources": [manifest.primary_sources[0], not_ready],
+            "planned_outputs": outputs,
+        }
+    )
+    manifest_path.write_bytes(canonical_json_bytes(updated))
+
+    rendered = render_public_suite(_validated(root, manifest_path))
+    report = json.loads(rendered.files["languages/typescript/report.json"])
+    assert report["status"] == "not_ready"
+    assert report["scheduled_runs"] == 0
+    assert report["complete_pair_count"] == 0
+    assert report["estimability"] == "not_estimable"
+
+
+def test_renderer_rejects_planned_output_drift(tmp_path: Path) -> None:
+    root, manifest_path = _ready_suite(tmp_path)
+    raw = json.loads(manifest_path.read_bytes())
+    raw["planned_outputs"].append("unexpected.json")
+    raw["planned_outputs"].sort()
+    manifest_path.write_bytes(canonical_json_bytes(raw))
+
+    with pytest.raises(Phase6PublicError, match="planned_outputs"):
+        render_public_suite(_validated(root, manifest_path))
+
+
+def test_renderer_rejects_version_and_render_time_input_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, manifest_path = _ready_suite(tmp_path)
+    raw = json.loads(manifest_path.read_bytes())
+    raw["renderer_version"] = "future-renderer"
+    manifest_path.write_bytes(canonical_json_bytes(raw))
+    with pytest.raises(Phase6PublicError, match="renderer version"):
+        render_public_suite(_validated(root, manifest_path))
+
+    root, manifest_path = _ready_suite(tmp_path / "drift")
+    validated = _validated(root, manifest_path)
+    plan_path = root / "plan.json"
+    original_reload = __import__(
+        "agentlab.phase6_public",
+        fromlist=["_strict_reload_generated_json"],
+    )._strict_reload_generated_json
+    changed = False
+
+    def replace_input(path: str, content: bytes) -> None:
+        nonlocal changed
+        original_reload(path, content)
+        if not changed:
+            replacement = root / "replacement-plan.json"
+            replacement.write_bytes(plan_path.read_bytes())
+            replacement.replace(plan_path)
+            changed = True
+
+    monkeypatch.setattr(
+        "agentlab.phase6_public._strict_reload_generated_json",
+        replace_input,
+    )
+    with pytest.raises(Phase6ContractError, match="changed"):
+        render_public_suite(validated)
+
+
+def test_staging_rejects_hash_size_markdown_and_leak_tampering(
+    tmp_path: Path,
+) -> None:
+    root, manifest_path = _ready_suite(tmp_path)
+    rendered = render_public_suite(_validated(root, manifest_path))
+    changed_files = dict(rendered.files)
+    changed_files["suite.md"] += b"tamper\n"
+    tampered = replace(rendered, files=changed_files)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+
+    with pytest.raises(Phase6PublicError, match="checksum or size"):
+        _write_staging_bundle(staging, tampered)
+    assert list(staging.iterdir()) == []
+    with pytest.raises(Phase6PublicError, match="leak scan"):
+        _scan_public_bytes({"suite.md": b"Authorization: Bearer SECRET"}, b"")
+
+
+def test_identical_inputs_are_independent_of_time_environment_and_evidence_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, manifest_path = _evaluated_suite(tmp_path)
+    first = render_public_suite(_validated(root, manifest_path))
+    manifest = PublicSuiteManifest.model_validate_json(manifest_path.read_bytes())
+    source = manifest.primary_sources[0]
+    reversed_source = source.model_copy(
+        update={
+            "evidence": list(reversed(source.evidence)),
+            "recordings": list(reversed(source.recordings)),
+        }
+    )
+    manifest_path.write_bytes(
+        canonical_json_bytes(
+            manifest.model_copy(update={"primary_sources": [reversed_source]})
+        )
+    )
+    monkeypatch.setenv("TZ", "Pacific/Honolulu")
+    monkeypatch.setenv("LANG", "ja_JP.UTF-8")
+    monkeypatch.setenv("CODEX_HOME", "/private/SECRET-CODEX-HOME")
+    second = render_public_suite(_validated(root, manifest_path))
+
+    assert first.files == second.files
+    assert first.external_anchor_bytes == second.external_anchor_bytes
+    combined = b"".join([*second.files.values(), second.external_anchor_bytes])
+    assert b"SECRET-CODEX-HOME" not in combined
+
+
+def test_publication_is_create_only_and_checksum_anchor_is_external(
+    tmp_path: Path,
+) -> None:
+    root, manifest_path = _ready_suite(tmp_path)
+    publish_parent = tmp_path / "publication"
+    publish_parent.mkdir()
+    destination = publish_parent / "bundle"
+    anchor = publish_parent / "bundle.checksums.sha256.json"
+
+    outcome = publish_public_suite(
+        manifest_path=manifest_path,
+        root=root,
+        destination=destination,
+        external_anchor_path=anchor,
+        confirm_publication=True,
+    )
+
+    assert outcome.published_file_count == 7
+    assert destination.is_dir()
+    assert anchor.is_file()
+    anchor_json = json.loads(anchor.read_bytes())
+    assert anchor_json["checksum_manifest_sha256"] == hashlib.sha256(
+        (destination / "checksums.json").read_bytes()
+    ).hexdigest()
+    checksums = json.loads((destination / "checksums.json").read_bytes())
+    paths = {entry["path"] for entry in checksums["entries"]}
+    assert "release-metadata.json" in paths
+    assert "checksums.json" not in paths
+    with pytest.raises(Phase6PublicError, match="already exists"):
+        publish_public_suite(
+            manifest_path=manifest_path,
+            root=root,
+            destination=destination,
+            external_anchor_path=anchor,
+            confirm_publication=True,
+        )
+
+
+@pytest.mark.parametrize("existing_kind", ["file", "directory", "symlink"])
+def test_existing_destination_kinds_are_never_replaced(
+    tmp_path: Path,
+    existing_kind: str,
+) -> None:
+    root, manifest_path = _ready_suite(tmp_path)
+    publish_parent = tmp_path / "existing"
+    publish_parent.mkdir()
+    destination = publish_parent / "bundle"
+    anchor = publish_parent / "anchor.json"
+    target = publish_parent / "symlink-target"
+    if existing_kind == "file":
+        destination.write_bytes(b"keep-file")
+    elif existing_kind == "directory":
+        destination.mkdir()
+        (destination / "keep").write_bytes(b"keep-directory")
+    else:
+        target.write_bytes(b"keep-target")
+        destination.symlink_to(target)
+
+    with pytest.raises(Phase6PublicError, match="already exists"):
+        publish_public_suite(
+            manifest_path=manifest_path,
+            root=root,
+            destination=destination,
+            external_anchor_path=anchor,
+            confirm_publication=True,
+        )
+
+    if existing_kind == "file":
+        assert destination.read_bytes() == b"keep-file"
+    elif existing_kind == "directory":
+        assert (destination / "keep").read_bytes() == b"keep-directory"
+    else:
+        assert destination.is_symlink()
+        assert target.read_bytes() == b"keep-target"
+    assert not anchor.exists()
+
+
+def test_atomic_no_replace_preserves_empty_directory_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, manifest_path = _ready_suite(tmp_path)
+    publish_parent = tmp_path / "race"
+    publish_parent.mkdir()
+    destination = publish_parent / "bundle"
+    anchor = publish_parent / "anchor.json"
+    raced_identity: tuple[int, int] | None = None
+
+    def race(source: Path, target: Path) -> None:
+        nonlocal raced_identity
+        if target == destination and not target.exists():
+            target.mkdir()
+            metadata = target.lstat()
+            raced_identity = (metadata.st_dev, metadata.st_ino)
+        _rename_no_replace(source, target)
+
+    monkeypatch.setattr("agentlab.phase6_public._rename_no_replace", race)
+    with pytest.raises(Phase6PublicError, match="already exists"):
+        publish_public_suite(
+            manifest_path=manifest_path,
+            root=root,
+            destination=destination,
+            external_anchor_path=anchor,
+            confirm_publication=True,
+        )
+    metadata = destination.lstat()
+    assert (metadata.st_dev, metadata.st_ino) == raced_identity
+    assert list(destination.iterdir()) == []
+    assert not anchor.exists()
+
+
+def test_anchor_race_rolls_back_only_owned_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, manifest_path = _ready_suite(tmp_path)
+    publish_parent = tmp_path / "anchor-race"
+    publish_parent.mkdir()
+    destination = publish_parent / "bundle"
+    anchor = publish_parent / "anchor.json"
+    calls = 0
+
+    def race(source: Path, target: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            anchor.write_bytes(b"raced-anchor")
+        _rename_no_replace(source, target)
+
+    monkeypatch.setattr("agentlab.phase6_public._rename_no_replace", race)
+    with pytest.raises(Phase6PublicError, match="already exists"):
+        publish_public_suite(
+            manifest_path=manifest_path,
+            root=root,
+            destination=destination,
+            external_anchor_path=anchor,
+            confirm_publication=True,
+        )
+    assert not destination.exists()
+    assert anchor.read_bytes() == b"raced-anchor"
+
+
+def test_existing_publish_lock_is_preserved_and_staging_is_cleaned(
+    tmp_path: Path,
+) -> None:
+    root, manifest_path = _ready_suite(tmp_path)
+    publish_parent = tmp_path / "locked"
+    publish_parent.mkdir()
+    destination = publish_parent / "bundle"
+    anchor = publish_parent / "anchor.json"
+    lock = publish_parent / ".bundle.publish.lock"
+    lock.write_bytes(b"other-publisher")
+
+    with pytest.raises(Phase6PublicError, match="lock is held"):
+        publish_public_suite(
+            manifest_path=manifest_path,
+            root=root,
+            destination=destination,
+            external_anchor_path=anchor,
+            confirm_publication=True,
+        )
+
+    assert lock.read_bytes() == b"other-publisher"
+    assert not destination.exists()
+    assert not anchor.exists()
+    assert not list(publish_parent.glob(".bundle-staging-*"))
+    assert not list(publish_parent.glob(".phase6-anchor-*"))
+
+
+def test_parent_fsync_failure_rolls_back_bundle_and_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, manifest_path = _ready_suite(tmp_path)
+    publish_parent = tmp_path / "fsync-failure"
+    publish_parent.mkdir()
+    destination = publish_parent / "bundle"
+    anchor = publish_parent / "anchor.json"
+    module = __import__(
+        "agentlab.phase6_public",
+        fromlist=["_fsync_directory"],
+    )
+    original_fsync = module._fsync_directory
+    failed = False
+
+    def fail_after_both(path: Path) -> None:
+        nonlocal failed
+        if not failed and destination.exists() and anchor.exists():
+            failed = True
+            raise OSError("synthetic parent fsync failure")
+        original_fsync(path)
+
+    monkeypatch.setattr("agentlab.phase6_public._fsync_directory", fail_after_both)
+    with pytest.raises(Phase6PublicError, match="failed safely"):
+        publish_public_suite(
+            manifest_path=manifest_path,
+            root=root,
+            destination=destination,
+            external_anchor_path=anchor,
+            confirm_publication=True,
+        )
+    assert not destination.exists()
+    assert not anchor.exists()
+    assert not list(publish_parent.glob(".bundle-staging-*"))
+
+
+def test_no_replace_fails_closed_on_unsupported_platform(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "destination"
+    monkeypatch.setattr(sys, "platform", "unsupported")
+
+    with pytest.raises(Phase6PublicError, match="unsupported"):
+        _rename_no_replace(source, destination)
+
+    assert source.is_dir()
+    assert not destination.exists()
+
+
+def test_confirmation_flags_have_zero_side_effects(tmp_path: Path) -> None:
+    root, manifest_path = _ready_suite(tmp_path)
+    destination = tmp_path / "never-created" / "bundle"
+    anchor = tmp_path / "never-created" / "anchor.json"
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "publish-phase6-public-suite",
+            str(manifest_path),
+            "--root",
+            str(root),
+            "--destination",
+            str(destination),
+            "--external-anchor",
+            str(anchor),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "subprocesses" in result.output
+    assert not destination.parent.exists()
+
+
+def _historical_fixture(root: Path) -> tuple[str, str, str, str]:
+    plan = build_workflow_plan(Path("experiments/examples/workflow-ab.yaml"))
+    plan_bytes = workflow_plan_bytes(plan)
+    plan_path = "plan.json"
+    campaign_path = "campaign.jsonl"
+    report_json_path = "report.json"
+    report_markdown_path = "report.md"
+    _write(root / plan_path, plan_bytes)
+    timestamp = datetime(2026, 7, 30, 1, 2, 3, tzinfo=UTC)
+    events: list[Any] = [
+        CampaignStartedEvent(
+            schema_version="1.1",
+            sequence=0,
+            event_type="campaign_started",
+            experiment_id=plan.experiment_id,
+            plan_sha256=hashlib.sha256(plan_bytes).hexdigest(),
+            planned_run_count=plan.planned_run_count,
+            planned_provider_call_count=plan.planned_provider_call_count,
+            occurred_at=timestamp,
+        )
+    ]
+    for sequence, run in enumerate(plan.runs, start=1):
+        events.append(
+            CampaignRunEvent(
+                schema_version="1.1",
+                sequence=sequence,
+                event_type="run_state",
+                run_id=run.run_id,
+                task_id=run.task_id,
+                workflow=run.workflow,
+                repetition_index=run.repetition_index,
+                status=CampaignRunStatus.NOT_RUN,
+                outcome=CampaignOutcome.STOP_CONDITION,
+                stop_reason=CampaignStopReason.FAIL_FAST,
+                provider_call_count=0,
+                retry_count=0,
+                live_failure_kind=None,
+                adapter_cleanup_state=AdapterCleanupState.NOT_APPLICABLE,
+                occurred_at=timestamp,
+            )
+        )
+    events.append(
+        CampaignFinishedEvent(
+            schema_version="1.1",
+            sequence=len(events),
+            event_type="campaign_finished",
+            experiment_id=plan.experiment_id,
+            stop_reason=CampaignStopReason.FAIL_FAST,
+            attempted_run_count=0,
+            provider_call_count=0,
+            provider_call_count_unknown_runs=0,
+            retry_count=0,
+            occurred_at=timestamp,
+        )
+    )
+    campaign_bytes = b"".join(
+        (
+            json.dumps(
+                event.model_dump(mode="json"),
+                allow_nan=False,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        for event in events
+    )
+    _write(root / campaign_path, campaign_bytes)
+    report = aggregate_workflow_campaign(
+        root / f"{plan.experiment_id}.yaml",
+        root / plan_path,
+        root / campaign_path,
+    )
+    _write(root / report_json_path, workflow_report_json_bytes(report))
+    _write(
+        root / report_markdown_path,
+        workflow_report_markdown(report).encode("utf-8"),
+    )
+    return plan_path, campaign_path, report_json_path, report_markdown_path
+
+
+def test_historical_verification_uses_saved_bytes_and_create_only_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "historical"
+    root.mkdir()
+    plan, campaign, report_json, report_markdown = _historical_fixture(root)
+    output_parent = tmp_path / "records"
+    output_parent.mkdir()
+    output = output_parent / "verification.json"
+    monkeypatch.setattr("agentlab.phase6_public._clean_git_head", lambda _path: COMMIT)
+    monkeypatch.setattr(
+        "agentlab.phase6_public._source_reviewed_commit",
+        lambda _repository, _root, _plan: COMMIT,
+    )
+
+    result = verify_phase6_historical(
+        repository=tmp_path,
+        historical_root=root,
+        plan_path=plan,
+        campaign_path=campaign,
+        report_json_path=report_json,
+        report_markdown_path=report_markdown,
+        output_path=output,
+        language=Language.PYTHON,
+        confirm_local_execution=True,
+        now=lambda: datetime(2026, 7, 31, tzinfo=UTC),
+    )
+
+    loaded = HistoricalVerificationRecord.model_validate_json(output.read_bytes())
+    assert loaded == result.record
+    assert loaded.toolchain_version_status == "unknown"
+    assert loaded.artifact_regenerated is False
+    assert loaded.campaign_reexecuted is False
+    with pytest.raises(Phase6PublicError, match="already exists"):
+        verify_phase6_historical(
+            repository=tmp_path,
+            historical_root=root,
+            plan_path=plan,
+            campaign_path=campaign,
+            report_json_path=report_json,
+            report_markdown_path=report_markdown,
+            output_path=output,
+            language=Language.PYTHON,
+            confirm_local_execution=True,
+        )
+
+
+def test_historical_rejects_absolute_path_symlink_and_missing_confirmation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "historical"
+    root.mkdir()
+    plan, campaign, report_json, report_markdown = _historical_fixture(root)
+    output_parent = tmp_path / "records"
+    output_parent.mkdir()
+    output = output_parent / "verification.json"
+    with pytest.raises(Phase6PublicError, match="explicit confirmation"):
+        verify_phase6_historical(
+            repository=tmp_path,
+            historical_root=root,
+            plan_path=plan,
+            campaign_path=campaign,
+            report_json_path=report_json,
+            report_markdown_path=report_markdown,
+            output_path=output,
+            language=Language.PYTHON,
+            confirm_local_execution=False,
+        )
+    assert not output.exists()
+    with pytest.raises(Phase6PublicError, match="relative POSIX"):
+        verify_phase6_historical(
+            repository=tmp_path,
+            historical_root=root,
+            plan_path=str((root / plan).resolve()),
+            campaign_path=campaign,
+            report_json_path=report_json,
+            report_markdown_path=report_markdown,
+            output_path=output,
+            language=Language.PYTHON,
+            confirm_local_execution=True,
+        )
+
+
+def test_historical_rejects_json_markdown_and_hardlink_tampering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "historical"
+    root.mkdir()
+    plan, campaign, report_json, report_markdown = _historical_fixture(root)
+    output_parent = tmp_path / "records"
+    output_parent.mkdir()
+    output = output_parent / "verification.json"
+    monkeypatch.setattr("agentlab.phase6_public._clean_git_head", lambda _path: COMMIT)
+    monkeypatch.setattr(
+        "agentlab.phase6_public._source_reviewed_commit",
+        lambda _repository, _root, _plan: COMMIT,
+    )
+
+    original_markdown = (root / report_markdown).read_bytes()
+    (root / report_markdown).write_bytes(original_markdown + b"tamper\n")
+    with pytest.raises(Phase6PublicError, match="Markdown differs"):
+        verify_phase6_historical(
+            repository=tmp_path,
+            historical_root=root,
+            plan_path=plan,
+            campaign_path=campaign,
+            report_json_path=report_json,
+            report_markdown_path=report_markdown,
+            output_path=output,
+            language=Language.PYTHON,
+            confirm_local_execution=True,
+        )
+    (root / report_markdown).write_bytes(original_markdown)
+    report = json.loads((root / report_json).read_bytes())
+    report["pairing"]["complete_pair_count"] = 1
+    report["pairing"]["status"] = "estimable"
+    changed_report = __import__(
+        "agentlab.workflow_report",
+        fromlist=["WorkflowReport"],
+    ).WorkflowReport.model_validate(report)
+    (root / report_json).write_bytes(workflow_report_json_bytes(changed_report))
+    (root / report_markdown).write_bytes(
+        workflow_report_markdown(changed_report).encode("utf-8")
+    )
+    with pytest.raises(Phase6PublicError, match="offline aggregation"):
+        verify_phase6_historical(
+            repository=tmp_path,
+            historical_root=root,
+            plan_path=plan,
+            campaign_path=campaign,
+            report_json_path=report_json,
+            report_markdown_path=report_markdown,
+            output_path=output,
+            language=Language.PYTHON,
+            confirm_local_execution=True,
+        )
+
+    external = tmp_path / "external-plan.json"
+    external.write_bytes((root / plan).read_bytes())
+    (root / plan).unlink()
+    os.link(external, root / plan)
+    with pytest.raises(Phase6PublicError, match="single-link"):
+        verify_phase6_historical(
+            repository=tmp_path,
+            historical_root=root,
+            plan_path=plan,
+            campaign_path=campaign,
+            report_json_path=report_json,
+            report_markdown_path=report_markdown,
+            output_path=output,
+            language=Language.PYTHON,
+            confirm_local_execution=True,
+        )
+
+
+def test_historical_root_replacement_is_detected_before_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "historical"
+    root.mkdir()
+    plan, campaign, report_json, report_markdown = _historical_fixture(root)
+    output_parent = tmp_path / "records"
+    output_parent.mkdir()
+    output = output_parent / "verification.json"
+    moved = tmp_path / "historical-moved"
+
+    def replace_root(_repository: Path) -> str:
+        root.rename(moved)
+        root.symlink_to(moved, target_is_directory=True)
+        return COMMIT
+
+    monkeypatch.setattr("agentlab.phase6_public._clean_git_head", replace_root)
+    monkeypatch.setattr(
+        "agentlab.phase6_public._source_reviewed_commit",
+        lambda _repository, _root, _plan: COMMIT,
+    )
+    with pytest.raises(Phase6PublicError, match="directory changed type"):
+        verify_phase6_historical(
+            repository=tmp_path,
+            historical_root=root,
+            plan_path=plan,
+            campaign_path=campaign,
+            report_json_path=report_json,
+            report_markdown_path=report_markdown,
+            output_path=output,
+            language=Language.PYTHON,
+            confirm_local_execution=True,
+        )
+    assert not output.exists()
+    linked = tmp_path / "linked-historical"
+    linked.symlink_to(root, target_is_directory=True)
+    with pytest.raises(Phase6PublicError, match="symlinks"):
+        verify_phase6_historical(
+            repository=tmp_path,
+            historical_root=linked,
+            plan_path=plan,
+            campaign_path=campaign,
+            report_json_path=report_json,
+            report_markdown_path=report_markdown,
+            output_path=output,
+            language=Language.PYTHON,
+            confirm_local_execution=True,
+        )
+
+
+def test_historical_dirty_head_is_rejected_without_real_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "agentlab.phase6_public._git",
+        lambda _repository, *_arguments: b" M tracked-file\n",
+    )
+    with pytest.raises(Phase6PublicError, match="clean tracked tree"):
+        _clean_git_head(tmp_path)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="atomic no-replace needs POSIX")
+def test_no_replace_primitive_rejects_existing_empty_directory(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    inode = destination.stat().st_ino
+
+    with pytest.raises(Phase6PublicError, match="already exists"):
+        _rename_no_replace(source, destination)
+
+    assert destination.stat().st_ino == inode
+    assert source.is_dir()

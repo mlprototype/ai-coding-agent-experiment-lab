@@ -7,7 +7,7 @@
 - Slice 6A Contract / strict loader: implemented (offline)
 - Slice 6B Fixture Acceptance: implemented (local-only; no status transition)
 - Slice 6C Plan-bound Campaign execution: implemented (offline/fake accepted; Live 0)
-- Slice 6D Public Suite renderer and atomic publication: not started
+- Slice 6D Public Suite renderer and atomic publication: implemented (offline/fake; review pending)
 - Slice 6E reviewed Live Campaign and public bundle: not started
 
 Phase 6はPhase 4 Completeに依存し、Phase 5には依存しない。Phase 5、Slice 5B、
@@ -304,8 +304,48 @@ statusへ完全一致させる。
 Slice 6Dのpublisherは全fileを専用staging directoryで作成・strict再読込し、最終file作成後に
 staging directoryを再`fsync`する。その後、排他的publish lock下でdestination非存在を
 確認し、no-replace相当の方式で1回だけpublishし、親directoryを`fsync`する。既存
-destinationを置換せず、途中bundleを残さない。このpublication処理はSlice 6Aでは未実装で
-ある。
+destinationを置換せず、途中bundleを残さない。bundle外anchorを含むchecksum契約は整合性を
+提供するが、authenticityを保証しない。
+
+## Slice 6D deterministic public renderer
+
+Slice 6Dは`agentlab.phase6_public`へruntimeを分離し、Public schemaを変更せず、次の2 CLIを
+追加する。
+
+- `verify-phase6-historical`: 明示されたPlan 1.1、Campaign 1.1、保存Report JSON／Markdownを
+  固定rootからstable readし、同じbytesの一時mirrorでoffline再集計する。CampaignやGateは
+  再実行せず、toolchain versionは`unknown`のままHistorical Verification Record 1.0を
+  create-onlyで生成する。
+- `publish-phase6-public-suite`: `load_public_suite_inputs`と
+  `validate_public_suite_inputs`を通過した、Manifest列挙入力だけから決定的bundleを生成する。
+  directory探索や未列挙fileの自動採用は行わない。
+
+Public Run Recordは既存1.0 allowlistをfield単位で構築し、Evidenceから1 Provider callを
+確認できたrunだけをPlan index pathへ出力する。Prompt本文、raw output、agent message、
+reasoning、diff、stdout／stderr、thread／session ID、絶対path、secretは公開しない。0-call、
+preflight停止、`input_changed`はRun Recordを作らず、Public Language Report 1.1の
+`zero_call_runs`とGate非実行理由にaggregate-onlyで保持する。UsageとMetricsの欠測は0へ
+変換しない。
+
+Language Report 1.1とSuite Report 1.0はCampaign terminal eventからの再導出値を使う。
+PrimaryとHistoricalの分母は分離し、Historicalにはstrict-load済みVerification Recordだけを
+固定sort indexへ複製する。Campaign 002はHistorical候補だが、Slice 6D実装受入では再実行も
+Verification Record生成も行わない。Antigravity coverageは
+`not_evaluated / upstream_artifact_signature_invalid`に固定する。総合winner、leaderboard、
+統計的有意差は生成しない。
+
+JSONはcanonical serializer、Markdownはstrict-load済みJSON modelからの固定rendererで作る。
+全出力はUTF-8／LF／末尾newline 1個で、時刻は`data_cutoff_at`だけを使う。stagingでは全fileを
+fsyncし、JSON strict reload、Markdown byte再生成、allowlist leak scan、size／SHA-256再計算、
+`checksums.json`、External Checksum Anchorの順に検証する。排他的lock取得後にも入力不変と
+destination／anchor非存在を確認し、macOSの`renamex_np(RENAME_EXCL)`またはLinuxの
+`renameat2(RENAME_NOREPLACE)`だけでpublishする。unsupported platformはfail closedとする。
+
+Slice 6Dの実装受入は一時directoryのsynthetic Artifactだけである。実Historical Verification
+Record、実Public Suite bundle、実Codex／Antigravity CLI、Provider call、Prompt送信、Live、
+network、quota利用は0件である。Python／Javaは`ready_not_run`、TypeScriptは`not_ready`を
+維持する。Slice 6D完了だけではLive-readyでもPhase 6 Completeでもなく、Slice 6Eはレビュー
+承認まで開始しない。
 
 ## Slice 6C Plan-bound Campaign execution
 
@@ -327,13 +367,15 @@ engineering minimum用PlanはPython／Javaを独立に各1 task、one-shot／sta
 planned Provider calls（合計4 calls）とする。Plan生成成功後は両言語を`ready_not_run`とし、
 TypeScriptは`typescript_compiler`未解決のため`not_ready`を維持する。実Codex Provider call、
 Prompt送信、Live Campaignは0件である。Slice 6C完了だけではPhase 6はLive-readyでもCompleteでも
-ない。Public renderer／publisherはSlice 6Dであり、レビュー承認まで開始しない。
+ない。Public renderer／publisherは後続のSlice 6Dでoffline/fake実装し、現在はレビュー待ちで
+ある。
 
 ## Current acceptance boundary
 
-Slice 6Cのoffline/fake受入完了だけではLive-readyでもPhase 6 Completeでもない。実Codex／
-Antigravity CLI、Provider call、Prompt送信、network、quota利用、Live Campaign、Public bundle生成
-は0件である。次はSlice 6Cレビューであり、Slice 6Dは承認まで開始しない。
+Slice 6Dのoffline/fake受入完了だけではLive-readyでもPhase 6 Completeでもない。実Codex／
+Antigravity CLI、Provider call、Prompt送信、network、quota利用、Live Campaign、実Historical
+Verification Record、実Public bundle生成は0件である。次はSlice 6Dレビューであり、Slice 6Eは
+承認まで開始しない。
 
 Python、TypeScript、Javaは実装目標だが、Live-readyは最低2言語の実toolchain受入完了、
 Phase 6 Completeは最低2言語で各1 complete pairとPublic Suite bundle完成を条件とする。

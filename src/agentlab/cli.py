@@ -12,7 +12,7 @@ from agentlab.capabilities import doctor_report
 from agentlab.gates import RunGatesError, run_gates
 from agentlab.live import LiveCodexError, run_live_codex
 from agentlab.models import EvidenceOverallStatus, LiveOverallStatus
-from agentlab.phase6 import Language
+from agentlab.phase6 import Language, Phase6ContractError
 from agentlab.phase6_campaign import (
     Phase6CampaignError,
     prepare_phase6_campaign,
@@ -21,6 +21,11 @@ from agentlab.phase6_campaign import (
 from agentlab.phase6_fixtures import (
     FixtureAcceptanceError,
     accept_phase6_fixtures,
+)
+from agentlab.phase6_public import (
+    Phase6PublicError,
+    publish_public_suite,
+    verify_phase6_historical,
 )
 from agentlab.recording import RecordingLoadError
 from agentlab.replay import ReplayError, run_replay
@@ -39,6 +44,103 @@ app = typer.Typer(
     help="Reproducible AI coding-agent experiment foundation.",
     no_args_is_help=True,
 )
+
+
+@app.command("verify-phase6-historical")
+def verify_phase6_historical_command(
+    repository_root: Annotated[Path, typer.Option("--repository-root")],
+    historical_root: Annotated[Path, typer.Option("--historical-root")],
+    plan_path: Annotated[str, typer.Option("--plan")],
+    campaign_path: Annotated[str, typer.Option("--campaign")],
+    report_json_path: Annotated[str, typer.Option("--report-json")],
+    report_markdown_path: Annotated[str, typer.Option("--report-markdown")],
+    output_path: Annotated[Path, typer.Option("--output")],
+    language: Annotated[Language, typer.Option("--language")],
+    confirm_local_execution: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-local-execution",
+            help="Allow only bounded read-only Git verification; never rerun a Campaign.",
+        ),
+    ] = False,
+) -> None:
+    """Create one Historical Verification Record from saved Artifacts only."""
+    if not confirm_local_execution:
+        typer.echo(
+            "verify-phase6-historical stopped: "
+            "--confirm-local-execution is required",
+            err=True,
+        )
+        typer.echo("subprocesses executed: 0")
+        typer.echo("files or directories created: 0")
+        typer.echo("Provider calls, Prompt transmissions, and Gate executions: 0")
+        raise typer.Exit(code=2)
+    try:
+        result = verify_phase6_historical(
+            repository=repository_root,
+            historical_root=historical_root,
+            plan_path=plan_path,
+            campaign_path=campaign_path,
+            report_json_path=report_json_path,
+            report_markdown_path=report_markdown_path,
+            output_path=output_path,
+            language=language,
+            confirm_local_execution=True,
+        )
+    except Phase6PublicError as error:
+        typer.echo(f"verify-phase6-historical stopped: {error}", err=True)
+        typer.echo("Provider calls, Prompt transmissions, and Gate executions: 0")
+        raise typer.Exit(code=2) from error
+    typer.echo(f"Historical Verification Record: {result.output_path}")
+    typer.echo(f"source reviewed commit: {result.record.source_reviewed_commit}")
+    typer.echo(f"verification commit: {result.record.verification_agentlab_commit}")
+    typer.echo("Artifact regeneration and Campaign reexecution: 0")
+    typer.echo("Provider calls, Prompt transmissions, and Gate executions: 0")
+
+
+@app.command("publish-phase6-public-suite")
+def publish_phase6_public_suite_command(
+    manifest_path: Annotated[Path, typer.Argument()],
+    root: Annotated[Path, typer.Option("--root")],
+    destination: Annotated[Path, typer.Option("--destination")],
+    external_anchor_path: Annotated[
+        Path,
+        typer.Option("--external-anchor"),
+    ],
+    confirm_publication: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-publication",
+            help="Create one immutable offline bundle and checksum anchor.",
+        ),
+    ] = False,
+) -> None:
+    """Publish a deterministic Phase 6 public bundle from listed inputs only."""
+    if not confirm_publication:
+        typer.echo(
+            "publish-phase6-public-suite stopped: --confirm-publication is required",
+            err=True,
+        )
+        typer.echo("files or directories created: 0")
+        typer.echo("subprocesses, Provider calls, Prompt transmissions, and Gates: 0")
+        raise typer.Exit(code=2)
+    try:
+        result = publish_public_suite(
+            manifest_path=manifest_path,
+            root=root,
+            destination=destination,
+            external_anchor_path=external_anchor_path,
+            confirm_publication=True,
+        )
+    except (Phase6PublicError, Phase6ContractError) as error:
+        typer.echo(f"publish-phase6-public-suite stopped: {error}", err=True)
+        typer.echo("subprocesses, Provider calls, Prompt transmissions, and Gates: 0")
+        raise typer.Exit(code=2) from error
+    typer.echo(f"Public Suite bundle: {result.destination}")
+    typer.echo(f"External checksum anchor: {result.external_anchor_path}")
+    typer.echo(f"checksums.json SHA-256: {result.checksum_manifest_sha256}")
+    typer.echo(f"published files: {result.published_file_count}")
+    typer.echo("subprocesses, Provider calls, Prompt transmissions, and Gates: 0")
 
 
 @app.command("prepare-phase6-campaign")

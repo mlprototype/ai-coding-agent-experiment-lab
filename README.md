@@ -67,8 +67,11 @@ Phase 6はPhase 4 Completeへ依存し、Phase 5とは独立して開始しま�
 `output_contract_violation`としてGate 0件で拒否し、Gate後もWorkspaceを再検証します。
 Python／Javaのengineering planは言語ごとに1 pair／2 planned callsで、生成成功後は
 `ready_not_run`です。TypeScriptは`typescript_compiler`未解決のため`not_ready`です。実Codex
-Provider／Prompt送信／Liveは0件で、Public renderer／publisherはSlice 6Dまで未着手です。
-したがってPhase 6はまだLive-readyでもCompleteでもありません。詳細と停止境界は
+Provider／Prompt送信／Liveは0件です。Slice 6Dでは保存済みの列挙Artifactだけを読む決定的な
+Public Suite renderer、Historical offline verifier、checksum／外部anchor、atomic create-only
+publisherを実装し、synthetic Artifactだけで受け入れました。実Campaign 002のHistorical
+Verification Recordと実Public bundleは生成していません。したがってPhase 6はまだLive-ready
+でもCompleteでもなく、Slice 6Dはレビュー待ちです。詳細と停止境界は
 [Phase 6詳細設計](docs/PHASE6_MULTI_LANGUAGE_PUBLIC_REPORT.md)を参照してください。
 
 Phase 4までに次を提供します。
@@ -269,8 +272,8 @@ macOSはlocal process-tree testで検証済みです。Linux実装経路は有�
 - Phase 4: Workflow A/B Experiment（完了、Campaign 002は3/3 complete pairs）
 - Phase 5: Antigravity CLI Provider（Blocked、Slice 5A offline実装済み、Slice 5B／5Cは
   上流artifact署名検証失敗により停止）
-- Phase 6: Multi-language Fixtures and Public Report（Current、Slice 6C offline runtime実装、
-  Live 0件、Public ReportはSlice 6D）
+- Phase 6: Multi-language Fixtures and Public Report（Current、Slice 6D offline/fake実装、
+  Live／実Public bundle 0件、レビュー待ち）
 - Phase 7: Optional Enhancements
 
 詳細は [docs/ROADMAP.md](docs/ROADMAP.md) を参照してください。

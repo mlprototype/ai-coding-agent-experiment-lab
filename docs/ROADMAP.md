@@ -191,8 +191,11 @@ Slice 6CではSpec 2.1／Plan 1.2の決定的なcreate-only準備、Plan-bound�
 各call直前検証、Provider後・Gate前Diff enforcement、Campaign／Recording／LiveRunArtifact
 1.2 runtimeを実装した。`output_contract_violation`ではGateを0件に保ち、Gate後のWorkspaceと
 toolchainも再検証する。Python／Javaは各1 pair／2 planned calls、TypeScriptは`not_ready`の
-ままとし、実Provider／Prompt／Liveは0件である。renderer／publicationはSlice 6Dで、レビュー
-承認まで開始しない。詳細は
+ままとし、実Provider／Prompt／Liveは0件である。Slice 6DではManifestに明示列挙された保存済み
+ArtifactだけからPublic Run Record、Language／Suite JSON／Markdown、coverage、checksum、
+bundle外anchorを決定的に生成し、stagingからatomic no-replaceでcreate-only publishする
+offline runtimeを実装した。受入はsynthetic Artifactだけであり、実Campaign 002 Historical
+Verification Recordと実Public Suite bundleは0件のまま、レビュー待ちである。詳細は
 [Phase 6詳細設計](PHASE6_MULTI_LANGUAGE_PUBLIC_REPORT.md)を参照する。
 
 **受入条件:** Live-readyには最低2言語の実toolchain Fixture受入が必要で、offline実装だけ
