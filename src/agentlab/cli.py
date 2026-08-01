@@ -50,6 +50,7 @@ app = typer.Typer(
 def verify_phase6_historical_command(
     repository_root: Annotated[Path, typer.Option("--repository-root")],
     historical_root: Annotated[Path, typer.Option("--historical-root")],
+    reviewed_spec_path: Annotated[str, typer.Option("--reviewed-spec")],
     plan_path: Annotated[str, typer.Option("--plan")],
     campaign_path: Annotated[str, typer.Option("--campaign")],
     report_json_path: Annotated[str, typer.Option("--report-json")],
@@ -79,6 +80,7 @@ def verify_phase6_historical_command(
         result = verify_phase6_historical(
             repository=repository_root,
             historical_root=historical_root,
+            reviewed_spec_path=reviewed_spec_path,
             plan_path=plan_path,
             campaign_path=campaign_path,
             report_json_path=report_json_path,

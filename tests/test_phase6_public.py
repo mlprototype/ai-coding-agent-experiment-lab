@@ -37,6 +37,7 @@ from agentlab.phase6 import (
     HistoricalVerificationRecord,
     Language,
     LanguageStatus,
+    LiveRunArtifactV1_2,
     Phase6CampaignFinishedEvent,
     Phase6CampaignOutcome,
     Phase6CampaignRunEvent,
@@ -56,8 +57,12 @@ from agentlab.phase6_public import (
     RENDERER_VERSION,
     Phase6PublicError,
     _clean_git_head,
+    _eligible_run_records,
+    _gate_counts_from_commands,
+    _primary_context,
     _rename_no_replace,
     _scan_public_bytes,
+    _source_reviewed_commit,
     _write_staging_bundle,
     publish_public_suite,
     render_public_suite,
@@ -69,6 +74,8 @@ from agentlab.workflow_report import (
     workflow_report_json_bytes,
     workflow_report_markdown,
 )
+
+HISTORICAL_REVIEWED_SPEC = "experiments/examples/workflow-ab.yaml"
 
 
 def _write(path: Path, content: bytes) -> None:
@@ -404,6 +411,107 @@ def test_evaluated_suite_emits_plan_indexed_allowlisted_run_records(
     assert report["complete_pair_count"] == 1
 
 
+@pytest.mark.parametrize(
+    (
+        "failure_kind",
+        "command_change",
+        "diff_change",
+        "workspace_lifecycle",
+        "expected_gate_counts",
+    ),
+    [
+        (
+            "evidence_error",
+            None,
+            {
+                "added_lines": None,
+                "deleted_lines": None,
+                "line_counts_complete": False,
+                "collection_error": "synthetic post-Gate collection failure",
+            },
+            "removed",
+            (1, 1, 0, 0, 0),
+        ),
+        (
+            "gate_harness_error",
+            {
+                "status": "timed_out",
+                "return_code": None,
+                "termination": {
+                    "reason": "timeout",
+                    "sigterm_sent": True,
+                    "sigkill_sent": False,
+                    "process_group_cleared": True,
+                    "error": None,
+                },
+            },
+            None,
+            "removed",
+            (0, 1, 0, 0, 0),
+        ),
+        (
+            "process_cleanup_error",
+            {
+                "termination": {
+                    "reason": "residual_process",
+                    "sigterm_sent": True,
+                    "sigkill_sent": True,
+                    "process_group_cleared": False,
+                    "error": "synthetic cleanup failure",
+                },
+            },
+            None,
+            "cleanup_failed",
+            (1, 1, 0, 0, 0),
+        ),
+    ],
+)
+def test_public_gate_counts_survive_post_gate_harness_failures(
+    tmp_path: Path,
+    failure_kind: str,
+    command_change: dict[str, Any] | None,
+    diff_change: dict[str, Any] | None,
+    workspace_lifecycle: str,
+    expected_gate_counts: tuple[int, int, int, int, int],
+) -> None:
+    root, manifest_path = _evaluated_suite(tmp_path)
+    validated = _validated(root, manifest_path)
+    source = validated.loaded.manifest.primary_sources[0]
+    context = _primary_context(validated, source)
+    assert context.plan is not None
+    run = context.plan.runs[0]
+    evidence_reference, artifact = context.evidence[run.run_id]
+    raw = json.loads(canonical_json_bytes(artifact))
+    raw.update(
+        {
+            "overall_status": "harness_error",
+            "failure_kind": failure_kind,
+            "metrics": None,
+            "workspace_lifecycle": workspace_lifecycle,
+        }
+    )
+    if command_change is not None:
+        raw["gate_commands"][0].update(command_change)
+    if diff_change is not None:
+        raw["diff"].update(diff_change)
+    failed = LiveRunArtifactV1_2.model_validate(raw)
+    changed_evidence = dict(context.evidence)
+    changed_evidence[run.run_id] = (evidence_reference, failed)
+    changed_context = replace(context, evidence=changed_evidence)
+    records = dict(_eligible_run_records(validated, changed_context))
+
+    assert failed.metrics is None
+    assert _gate_counts_from_commands(failed) == expected_gate_counts
+    assert records[0].run_metrics_available is False
+    assert (
+        records[0].acceptance_passed,
+        records[0].acceptance_total,
+        records[0].regression_failures,
+        records[0].lint_errors,
+        records[0].typecheck_errors,
+    ) == expected_gate_counts
+
+
 def test_input_changed_is_zero_call_aggregate_only(tmp_path: Path) -> None:
     root, manifest_path, run_count = _input_changed_suite(tmp_path)
     rendered = render_public_suite(_validated(root, manifest_path))
@@ -511,6 +619,50 @@ def test_staging_rejects_hash_size_markdown_and_leak_tampering(
     assert list(staging.iterdir()) == []
     with pytest.raises(Phase6PublicError, match="leak scan"):
         _scan_public_bytes({"suite.md": b"Authorization: Bearer SECRET"}, b"")
+
+
+def test_publication_revalidates_actual_staging_bytes_before_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, manifest_path = _ready_suite(tmp_path)
+    publish_parent = tmp_path / "staging-race"
+    publish_parent.mkdir()
+    destination = publish_parent / "bundle"
+    anchor = publish_parent / "anchor.json"
+    module = __import__(
+        "agentlab.phase6_public",
+        fromlist=["_validate_staging_bundle"],
+    )
+    original_validate = module._validate_staging_bundle
+    calls = 0
+
+    def change_staging_before_final_check(
+        staging: Path,
+        rendered: Any,
+    ) -> tuple[int, int, int]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            (staging / "suite.md").write_bytes(b"tampered staged Markdown\n")
+        return original_validate(staging, rendered)
+
+    monkeypatch.setattr(
+        "agentlab.phase6_public._validate_staging_bundle",
+        change_staging_before_final_check,
+    )
+    with pytest.raises(Phase6PublicError, match=r"checksum or size|bytes differ"):
+        publish_public_suite(
+            manifest_path=manifest_path,
+            root=root,
+            destination=destination,
+            external_anchor_path=anchor,
+            confirm_publication=True,
+        )
+
+    assert not destination.exists()
+    assert not anchor.exists()
+    assert not list(publish_parent.glob(".bundle-staging-*"))
 
 
 def test_identical_inputs_are_independent_of_time_environment_and_evidence_order(
@@ -749,6 +901,52 @@ def test_parent_fsync_failure_rolls_back_bundle_and_anchor(
     assert not list(publish_parent.glob(".bundle-staging-*"))
 
 
+@pytest.mark.parametrize("failed_target", ["bundle", "anchor"])
+def test_post_rename_identity_failure_rolls_back_all_owned_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_target: str,
+) -> None:
+    root, manifest_path = _ready_suite(tmp_path)
+    publish_parent = tmp_path / f"identity-{failed_target}"
+    publish_parent.mkdir()
+    destination = publish_parent / "bundle"
+    anchor = publish_parent / "anchor.json"
+    module = __import__(
+        "agentlab.phase6_public",
+        fromlist=["_published_identity"],
+    )
+    original_identity = module._published_identity
+    failed = False
+
+    def fail_after_rename(path: Path, directory: bool) -> tuple[int, int, int]:
+        nonlocal failed
+        target = destination if failed_target == "bundle" else anchor
+        if path == target and path.exists() and not failed:
+            failed = True
+            raise OSError("synthetic post-rename identity failure")
+        return original_identity(path, directory)
+
+    monkeypatch.setattr(
+        "agentlab.phase6_public._published_identity",
+        fail_after_rename,
+    )
+    with pytest.raises(Phase6PublicError, match="failed safely"):
+        publish_public_suite(
+            manifest_path=manifest_path,
+            root=root,
+            destination=destination,
+            external_anchor_path=anchor,
+            confirm_publication=True,
+        )
+
+    assert failed
+    assert not destination.exists()
+    assert not anchor.exists()
+    assert not list(publish_parent.glob(".bundle-staging-*"))
+    assert not list(publish_parent.glob(".phase6-anchor-*"))
+
+
 def test_no_replace_fails_closed_on_unsupported_platform(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -791,7 +989,9 @@ def test_confirmation_flags_have_zero_side_effects(tmp_path: Path) -> None:
 
 
 def _historical_fixture(root: Path) -> tuple[str, str, str, str]:
-    plan = build_workflow_plan(Path("experiments/examples/workflow-ab.yaml"))
+    source_spec = Path(HISTORICAL_REVIEWED_SPEC)
+    plan = build_workflow_plan(source_spec)
+    _write(root.parent / HISTORICAL_REVIEWED_SPEC, source_spec.read_bytes())
     plan_bytes = workflow_plan_bytes(plan)
     plan_path = "plan.json"
     campaign_path = "campaign.jsonl"
@@ -885,12 +1085,13 @@ def test_historical_verification_uses_saved_bytes_and_create_only_output(
     monkeypatch.setattr("agentlab.phase6_public._clean_git_head", lambda _path: COMMIT)
     monkeypatch.setattr(
         "agentlab.phase6_public._source_reviewed_commit",
-        lambda _repository, _root, _plan: COMMIT,
+        lambda _repository, _path, _bytes, _plan: COMMIT,
     )
 
     result = verify_phase6_historical(
         repository=tmp_path,
         historical_root=root,
+        reviewed_spec_path=HISTORICAL_REVIEWED_SPEC,
         plan_path=plan,
         campaign_path=campaign,
         report_json_path=report_json,
@@ -910,6 +1111,7 @@ def test_historical_verification_uses_saved_bytes_and_create_only_output(
         verify_phase6_historical(
             repository=tmp_path,
             historical_root=root,
+            reviewed_spec_path=HISTORICAL_REVIEWED_SPEC,
             plan_path=plan,
             campaign_path=campaign,
             report_json_path=report_json,
@@ -918,6 +1120,94 @@ def test_historical_verification_uses_saved_bytes_and_create_only_output(
             language=Language.PYTHON,
             confirm_local_execution=True,
         )
+
+
+def test_historical_source_commit_uses_explicit_repository_spec_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "saved-campaign-002"
+    root.mkdir()
+    plan_path, _campaign, _report_json, _report_markdown = _historical_fixture(root)
+    plan = __import__(
+        "agentlab.workflow",
+        fromlist=["WorkflowPlan"],
+    ).WorkflowPlan.model_validate_json((root / plan_path).read_bytes())
+    spec_bytes = (tmp_path / HISTORICAL_REVIEWED_SPEC).read_bytes()
+    calls: list[tuple[str, ...]] = []
+
+    def saved_git(_repository: Path, *arguments: str) -> bytes:
+        calls.append(arguments)
+        if arguments[:4] == ("log", "-1", "--format=%H", "--"):
+            return f"{COMMIT}\n".encode("ascii")
+        if arguments[:1] == ("show",):
+            return spec_bytes
+        raise AssertionError(f"unexpected Git argv: {arguments!r}")
+
+    monkeypatch.setattr("agentlab.phase6_public._git", saved_git)
+    source_commit = _source_reviewed_commit(
+        tmp_path,
+        HISTORICAL_REVIEWED_SPEC,
+        spec_bytes,
+        plan,
+    )
+
+    assert source_commit == COMMIT
+    assert calls == [
+        ("log", "-1", "--format=%H", "--", HISTORICAL_REVIEWED_SPEC),
+        ("show", f"{COMMIT}:{HISTORICAL_REVIEWED_SPEC}"),
+    ]
+    assert not (root / f"{plan.experiment_id}.yaml").exists()
+
+
+def test_historical_reviewed_spec_replacement_is_detected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "historical"
+    root.mkdir()
+    plan, campaign, report_json, report_markdown = _historical_fixture(root)
+    output_parent = tmp_path / "records"
+    output_parent.mkdir()
+    output = output_parent / "verification.json"
+    spec_path = tmp_path / HISTORICAL_REVIEWED_SPEC
+
+    def replace_reviewed_spec(_repository: Path) -> str:
+        replacement = spec_path.with_name("replacement-workflow-ab.yaml")
+        replacement.write_bytes(spec_path.read_bytes())
+        replacement.replace(spec_path)
+        return COMMIT
+
+    monkeypatch.setattr(
+        "agentlab.phase6_public._clean_git_head",
+        replace_reviewed_spec,
+    )
+    monkeypatch.setattr(
+        "agentlab.phase6_public._source_reviewed_commit",
+        lambda _repository, _path, _bytes, _plan: COMMIT,
+    )
+    with pytest.raises(Phase6PublicError, match=r"reviewed Spec.*changed"):
+        verify_phase6_historical(
+            repository=tmp_path,
+            historical_root=root,
+            reviewed_spec_path=HISTORICAL_REVIEWED_SPEC,
+            plan_path=plan,
+            campaign_path=campaign,
+            report_json_path=report_json,
+            report_markdown_path=report_markdown,
+            output_path=output,
+            language=Language.PYTHON,
+            confirm_local_execution=True,
+        )
+
+    assert not output.exists()
+
+
+def test_historical_cli_requires_explicit_reviewed_spec_option() -> None:
+    result = CliRunner().invoke(app, ["verify-phase6-historical", "--help"])
+
+    assert result.exit_code == 0
+    assert "--reviewed-spec" in result.output
 
 
 def test_historical_rejects_absolute_path_symlink_and_missing_confirmation(
@@ -933,6 +1223,7 @@ def test_historical_rejects_absolute_path_symlink_and_missing_confirmation(
         verify_phase6_historical(
             repository=tmp_path,
             historical_root=root,
+            reviewed_spec_path=HISTORICAL_REVIEWED_SPEC,
             plan_path=plan,
             campaign_path=campaign,
             report_json_path=report_json,
@@ -946,6 +1237,7 @@ def test_historical_rejects_absolute_path_symlink_and_missing_confirmation(
         verify_phase6_historical(
             repository=tmp_path,
             historical_root=root,
+            reviewed_spec_path=HISTORICAL_REVIEWED_SPEC,
             plan_path=str((root / plan).resolve()),
             campaign_path=campaign,
             report_json_path=report_json,
@@ -969,7 +1261,7 @@ def test_historical_rejects_json_markdown_and_hardlink_tampering(
     monkeypatch.setattr("agentlab.phase6_public._clean_git_head", lambda _path: COMMIT)
     monkeypatch.setattr(
         "agentlab.phase6_public._source_reviewed_commit",
-        lambda _repository, _root, _plan: COMMIT,
+        lambda _repository, _path, _bytes, _plan: COMMIT,
     )
 
     original_markdown = (root / report_markdown).read_bytes()
@@ -978,6 +1270,7 @@ def test_historical_rejects_json_markdown_and_hardlink_tampering(
         verify_phase6_historical(
             repository=tmp_path,
             historical_root=root,
+            reviewed_spec_path=HISTORICAL_REVIEWED_SPEC,
             plan_path=plan,
             campaign_path=campaign,
             report_json_path=report_json,
@@ -1002,6 +1295,7 @@ def test_historical_rejects_json_markdown_and_hardlink_tampering(
         verify_phase6_historical(
             repository=tmp_path,
             historical_root=root,
+            reviewed_spec_path=HISTORICAL_REVIEWED_SPEC,
             plan_path=plan,
             campaign_path=campaign,
             report_json_path=report_json,
@@ -1019,6 +1313,7 @@ def test_historical_rejects_json_markdown_and_hardlink_tampering(
         verify_phase6_historical(
             repository=tmp_path,
             historical_root=root,
+            reviewed_spec_path=HISTORICAL_REVIEWED_SPEC,
             plan_path=plan,
             campaign_path=campaign,
             report_json_path=report_json,
@@ -1049,12 +1344,13 @@ def test_historical_root_replacement_is_detected_before_output(
     monkeypatch.setattr("agentlab.phase6_public._clean_git_head", replace_root)
     monkeypatch.setattr(
         "agentlab.phase6_public._source_reviewed_commit",
-        lambda _repository, _root, _plan: COMMIT,
+        lambda _repository, _path, _bytes, _plan: COMMIT,
     )
     with pytest.raises(Phase6PublicError, match="directory changed type"):
         verify_phase6_historical(
             repository=tmp_path,
             historical_root=root,
+            reviewed_spec_path=HISTORICAL_REVIEWED_SPEC,
             plan_path=plan,
             campaign_path=campaign,
             report_json_path=report_json,
@@ -1070,6 +1366,7 @@ def test_historical_root_replacement_is_detected_before_output(
         verify_phase6_historical(
             repository=tmp_path,
             historical_root=linked,
+            reviewed_spec_path=HISTORICAL_REVIEWED_SPEC,
             plan_path=plan,
             campaign_path=campaign,
             report_json_path=report_json,

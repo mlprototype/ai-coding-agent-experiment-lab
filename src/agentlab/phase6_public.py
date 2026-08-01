@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Literal, cast
@@ -25,7 +25,9 @@ from typing import Literal, cast
 from pydantic import TypeAdapter, ValidationError
 
 from agentlab.models import (
+    CommandStatus,
     ContractModel,
+    GateKind,
     Provider,
     UsageMetricSource,
 )
@@ -311,32 +313,34 @@ def _stable_regular_file(
             os.close(descriptor)
 
 
-def _revalidate_historical_inputs(
+def _revalidate_stable_inputs(
     root: Path,
     contents_by_relative: Mapping[str, bytes],
     directory_identities: dict[Path, tuple[int, int, int]],
     file_identities: dict[Path, tuple[int, int, int, int, int, int, int]],
+    *,
+    label: str,
 ) -> None:
     for path, expected in directory_identities.items():
         try:
             metadata = path.lstat()
         except OSError as error:
-            raise Phase6PublicError("historical directory disappeared") from error
+            raise Phase6PublicError(f"{label} directory disappeared") from error
         actual = (metadata.st_dev, metadata.st_ino, metadata.st_mode)
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            raise Phase6PublicError("historical directory changed type")
+            raise Phase6PublicError(f"{label} directory changed type")
         if actual != expected:
-            raise Phase6PublicError("historical directory identity changed")
+            raise Phase6PublicError(f"{label} directory identity changed")
     for relative, expected_content in contents_by_relative.items():
         current = _stable_regular_file(
             root,
             relative,
-            f"historical input {relative}",
+            f"{label} input {relative}",
             directory_identities=directory_identities,
             file_identities=file_identities,
         )
         if current != expected_content:
-            raise Phase6PublicError("historical input bytes changed after validation")
+            raise Phase6PublicError(f"{label} input bytes changed after validation")
 
 
 def _create_only_file(path: Path, content: bytes, label: str) -> None:
@@ -355,10 +359,13 @@ def _create_only_file(path: Path, content: bytes, label: str) -> None:
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = -1
+        staging_identity = _published_identity(staging, False)
         _rename_no_replace(staging, target)
-        published_identity = _published_identity(target, False)
+        published_identity = staging_identity
+        if _published_identity(target, False) != staging_identity:
+            raise Phase6PublicError(f"published {label} identity changed after rename")
         _fsync_directory(parent)
-    except OSError as error:
+    except (OSError, Phase6PublicError) as error:
         if published_identity is not None:
             _rollback_owned_path(
                 target,
@@ -405,23 +412,24 @@ def _clean_git_head(repository: Path) -> str:
 
 def _source_reviewed_commit(
     repository: Path,
-    historical_root: Path,
+    reviewed_spec_path: str,
+    reviewed_spec_bytes: bytes,
     plan: WorkflowPlan,
 ) -> str:
-    spec_path = historical_root / f"{plan.experiment_id}.yaml"
-    try:
-        relative = spec_path.relative_to(repository).as_posix()
-    except ValueError as error:
-        raise Phase6PublicError("historical Spec must remain below repository root") from error
+    relative = _safe_relative(reviewed_spec_path, "reviewed historical Spec path")
+    if _sha256(reviewed_spec_bytes) != plan.experiment_spec_sha256:
+        raise Phase6PublicError("reviewed historical Spec does not match Plan")
     commit = (
         _git(repository, "log", "-1", "--format=%H", "--", relative)
         .decode("ascii")
         .strip()
     )
-    if len(commit) != 40:
+    if len(commit) != 40 or any(
+        character not in "0123456789abcdef" for character in commit
+    ):
         raise Phase6PublicError("could not derive the reviewed historical commit")
     saved_spec = _git(repository, "show", f"{commit}:{relative}")
-    if _sha256(saved_spec) != plan.experiment_spec_sha256:
+    if saved_spec != reviewed_spec_bytes:
         raise Phase6PublicError("reviewed historical Spec does not match Plan")
     return commit
 
@@ -430,6 +438,7 @@ def verify_phase6_historical(
     *,
     repository: Path,
     historical_root: Path,
+    reviewed_spec_path: str,
     plan_path: str,
     campaign_path: str,
     report_json_path: str,
@@ -444,6 +453,22 @@ def verify_phase6_historical(
         raise Phase6PublicError("historical verification requires explicit confirmation")
     repository = _real_directory(repository, "repository root")
     root = _real_directory(historical_root, "historical Artifact root")
+    reviewed_spec_path = _safe_relative(
+        reviewed_spec_path,
+        "reviewed historical Spec path",
+    )
+    spec_directory_identities: dict[Path, tuple[int, int, int]] = {}
+    spec_file_identities: dict[
+        Path,
+        tuple[int, int, int, int, int, int, int],
+    ] = {}
+    reviewed_spec_bytes = _stable_regular_file(
+        repository,
+        reviewed_spec_path,
+        "reviewed historical Spec",
+        directory_identities=spec_directory_identities,
+        file_identities=spec_file_identities,
+    )
     relative_paths = {
         "plan": _safe_relative(plan_path, "historical Plan path"),
         "campaign": _safe_relative(campaign_path, "historical Campaign path"),
@@ -481,6 +506,8 @@ def verify_phase6_historical(
         raise Phase6PublicError("invalid historical Workflow Plan 1.1") from error
     if contents["plan"] != workflow_plan_bytes(plan):
         raise Phase6PublicError("historical Workflow Plan must be canonical JSON")
+    if _sha256(reviewed_spec_bytes) != plan.experiment_spec_sha256:
+        raise Phase6PublicError("reviewed historical Spec does not match Plan")
     try:
         saved_report = WorkflowReport.model_validate_json(contents["report_json"])
     except ValidationError as error:
@@ -495,6 +522,9 @@ def verify_phase6_historical(
     # explicitly reserved by the Plan; no directory discovery is performed.
     with tempfile.TemporaryDirectory(prefix="agentlab-phase6-historical-") as temp:
         mirror = Path(temp)
+        mirror_spec = mirror / reviewed_spec_path
+        mirror_spec.parent.mkdir(parents=True, exist_ok=True)
+        mirror_spec.write_bytes(reviewed_spec_bytes)
         for role, relative in relative_paths.items():
             target = mirror / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -520,7 +550,7 @@ def verify_phase6_historical(
                     target.write_bytes(data)
         try:
             regenerated = aggregate_workflow_campaign(
-                mirror / f"{plan.experiment_id}.yaml",
+                mirror_spec,
                 mirror / relative_paths["plan"],
                 mirror / relative_paths["campaign"],
             ).model_copy(update={"created_at": saved_report.created_at})
@@ -530,20 +560,25 @@ def verify_phase6_historical(
         raise Phase6PublicError("historical Report does not match offline aggregation")
 
     verification_commit = _clean_git_head(repository)
-    source_commit = _source_reviewed_commit(repository, root, plan)
-    try:
-        reviewed_spec_path = (
-            root / f"{plan.experiment_id}.yaml"
-        ).relative_to(repository).as_posix()
-    except ValueError as error:
-        raise Phase6PublicError(
-            "historical root must remain below the repository root"
-        ) from error
-    _revalidate_historical_inputs(
+    source_commit = _source_reviewed_commit(
+        repository,
+        reviewed_spec_path,
+        reviewed_spec_bytes,
+        plan,
+    )
+    _revalidate_stable_inputs(
         root,
         all_contents,
         directory_identities,
         file_identities,
+        label="historical",
+    )
+    _revalidate_stable_inputs(
+        repository,
+        {reviewed_spec_path: reviewed_spec_bytes},
+        spec_directory_identities,
+        spec_file_identities,
+        label="reviewed Spec",
     )
     verified_at = (now or (lambda: datetime.now(UTC)))()
     record = HistoricalVerificationRecord(
@@ -593,11 +628,19 @@ def verify_phase6_historical(
         verified_at=_timestamp_contract_input(verified_at),
     )
     record_bytes = canonical_json_bytes(record)
-    _revalidate_historical_inputs(
+    _revalidate_stable_inputs(
         root,
         all_contents,
         directory_identities,
         file_identities,
+        label="historical",
+    )
+    _revalidate_stable_inputs(
+        repository,
+        {reviewed_spec_path: reviewed_spec_bytes},
+        spec_directory_identities,
+        spec_file_identities,
+        label="reviewed Spec",
     )
     _create_only_file(output_path, record_bytes, "Historical Verification Record")
     return HistoricalVerification(record=record, record_bytes=record_bytes, output_path=output_path)
@@ -698,17 +741,21 @@ def _eligible_run_records(
             usage_source = "provider_reported"
         elif usage.source is UsageMetricSource.ESTIMATED:
             usage_source = "estimated"
+        gate_counts = _gate_counts_from_commands(artifact)
         if metrics is None:
-            gate_counts = (0, 0, 0, 0, 0)
             metric_values: tuple[int | None, ...] = (None,) * 6
         else:
-            gate_counts = (
+            metrics_gate_counts = (
                 metrics.acceptance_tests_passed,
                 metrics.acceptance_tests_total,
                 metrics.regression_failures,
                 metrics.lint_errors,
                 metrics.typecheck_errors,
             )
+            if metrics_gate_counts != gate_counts:
+                raise Phase6PublicError(
+                    f"Run Metrics Gate counts differ from Command Evidence: {run.run_id}"
+                )
             metric_values = (
                 metrics.agent_duration_ms,
                 metrics.evaluation_duration_ms,
@@ -788,6 +835,36 @@ def _eligible_run_records(
         )
         records.append((index, record))
     return records
+
+
+def _gate_counts_from_commands(
+    artifact: LiveRunArtifactV1_2,
+) -> tuple[int, int, int, int, int]:
+    """Derive public Gate counts even when post-Gate Metrics are unavailable."""
+    acceptance = [
+        command
+        for command in artifact.gate_commands
+        if command.gate is GateKind.ACCEPTANCE
+    ]
+    return (
+        sum(command.status is CommandStatus.PASSED for command in acceptance),
+        len(acceptance),
+        sum(
+            command.status is CommandStatus.FAILED
+            for command in artifact.gate_commands
+            if command.gate is GateKind.REGRESSION
+        ),
+        sum(
+            command.status is CommandStatus.FAILED
+            for command in artifact.gate_commands
+            if command.gate is GateKind.LINT
+        ),
+        sum(
+            command.status is CommandStatus.FAILED
+            for command in artifact.gate_commands
+            if command.gate is GateKind.TYPECHECK
+        ),
+    )
 
 
 def _language_report(
@@ -1030,7 +1107,17 @@ def _scan_public_bytes(files: Mapping[str, bytes], anchor: bytes) -> None:
 
 
 def _validate_rendered_files(rendered: RenderedPublicSuite) -> None:
-    checksum_entries = {entry.path: entry for entry in rendered.checksums.entries}
+    checksum_bytes = rendered.files.get("checksums.json")
+    if checksum_bytes is None:
+        raise Phase6PublicError("rendered output lacks checksums.json")
+    actual_checksums = _strict_canonical_model(
+        checksum_bytes,
+        PublicChecksums,
+        "Public Checksums",
+    )
+    if actual_checksums != rendered.checksums:
+        raise Phase6PublicError("staged checksums.json differs from rendered contract")
+    checksum_entries = {entry.path: entry for entry in actual_checksums.entries}
     expected_checksum_paths = set(rendered.files) - {"checksums.json"}
     if set(checksum_entries) != expected_checksum_paths:
         raise Phase6PublicError("staged checksum path set changed")
@@ -1041,7 +1128,6 @@ def _validate_rendered_files(rendered: RenderedPublicSuite) -> None:
         entry = checksum_entries[path]
         if entry.size_bytes != len(content) or entry.sha256 != _sha256(content):
             raise Phase6PublicError(f"staged checksum or size differs: {path}")
-    checksum_bytes = rendered.files["checksums.json"]
     if (
         rendered.external_anchor.checksum_manifest_sha256
         != _sha256(checksum_bytes)
@@ -1278,6 +1364,112 @@ def _rename_no_replace(source: Path, destination: Path) -> None:
     )
 
 
+def _staging_bundle_bytes(
+    staging: Path,
+    planned_paths: set[str],
+) -> dict[str, bytes]:
+    """Read the complete staged tree with an exact path and identity contract."""
+    staging = _real_directory(staging, "staging root")
+    expected_directories = {"."}
+    for relative in planned_paths:
+        relative = _safe_relative(relative, "planned staged output path")
+        parent = PurePosixPath(relative).parent
+        while parent.as_posix() != ".":
+            expected_directories.add(parent.as_posix())
+            parent = parent.parent
+
+    directory_identities: dict[Path, tuple[int, int, int]] = {}
+    file_identities: dict[
+        Path,
+        tuple[int, int, int, int, int, int, int],
+    ] = {}
+    root_metadata = staging.lstat()
+    directory_identities[staging] = (
+        root_metadata.st_dev,
+        root_metadata.st_ino,
+        root_metadata.st_mode,
+    )
+    actual_directories = {"."}
+    actual_files: set[str] = set()
+    pending = [(staging, PurePosixPath("."))]
+    while pending:
+        directory, prefix = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as error:
+            raise Phase6PublicError("could not enumerate staged outputs safely") from error
+        for entry in entries:
+            relative_path = (
+                PurePosixPath(entry.name)
+                if prefix.as_posix() == "."
+                else prefix / entry.name
+            )
+            relative = _safe_relative(relative_path.as_posix(), "staged output path")
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise Phase6PublicError("could not inspect staged output") from error
+            path = staging / relative
+            if stat.S_ISLNK(metadata.st_mode):
+                raise Phase6PublicError("staged output must not contain symlinks")
+            if stat.S_ISDIR(metadata.st_mode):
+                actual_directories.add(relative)
+                directory_identities[path] = (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_mode,
+                )
+                pending.append((path, relative_path))
+                continue
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise Phase6PublicError(
+                    "staged output must contain only single-link regular files"
+                )
+            actual_files.add(relative)
+            file_identities[path] = (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_nlink,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            )
+    if actual_files != planned_paths or actual_directories != expected_directories:
+        raise Phase6PublicError("staged output path set differs from the plan")
+
+    contents = {
+        relative: _stable_regular_file(
+            staging,
+            relative,
+            f"staged output {relative}",
+            directory_identities=directory_identities,
+            file_identities=file_identities,
+        )
+        for relative in sorted(planned_paths)
+    }
+    _revalidate_stable_inputs(
+        staging,
+        contents,
+        directory_identities,
+        file_identities,
+        label="staged output",
+    )
+    return contents
+
+
+def _validate_staging_bundle(
+    staging: Path,
+    rendered: RenderedPublicSuite,
+) -> tuple[int, int, int]:
+    actual_files = _staging_bundle_bytes(staging, set(rendered.files))
+    actual_rendered = replace(rendered, files=actual_files)
+    _validate_rendered_files(actual_rendered)
+    if actual_files != rendered.files:
+        raise Phase6PublicError("staged output bytes differ from rendered bytes")
+    return _published_identity(staging, True)
+
+
 def _write_staging_bundle(staging: Path, rendered: RenderedPublicSuite) -> None:
     _validate_rendered_files(rendered)
     created_directories = {staging}
@@ -1308,8 +1500,6 @@ def _write_staging_bundle(staging: Path, rendered: RenderedPublicSuite) -> None:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        if target.read_bytes() != content:
-            raise Phase6PublicError(f"staged output bytes changed: {relative}")
         _strict_reload_generated_json(relative, content)
     for directory in sorted(
         created_directories,
@@ -1319,7 +1509,7 @@ def _write_staging_bundle(staging: Path, rendered: RenderedPublicSuite) -> None:
         _fsync_directory(directory)
     # Required second staging-root sync occurs after the last file and all
     # strict reload/checksum validation work.
-    _validate_rendered_files(rendered)
+    _validate_staging_bundle(staging, rendered)
     _fsync_directory(staging)
 
 
@@ -1334,11 +1524,39 @@ def _write_anchor_staging(parent: Path, content: bytes) -> Path:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-    if path.read_bytes() != content:
-        raise Phase6PublicError("staged external anchor bytes changed")
-    _strict_canonical_model(content, ExternalChecksumAnchor, "External anchor")
+    _validate_anchor_staging(path, content)
     _fsync_directory(parent)
     return path
+
+
+def _validate_anchor_staging(
+    path: Path,
+    expected_content: bytes,
+) -> tuple[int, int, int]:
+    parent = _real_directory(path.parent, "anchor staging parent")
+    directory_identities: dict[Path, tuple[int, int, int]] = {}
+    file_identities: dict[
+        Path,
+        tuple[int, int, int, int, int, int, int],
+    ] = {}
+    content = _stable_regular_file(
+        parent,
+        path.name,
+        "staged external anchor",
+        directory_identities=directory_identities,
+        file_identities=file_identities,
+    )
+    if content != expected_content:
+        raise Phase6PublicError("staged external anchor bytes changed")
+    _strict_canonical_model(content, ExternalChecksumAnchor, "External anchor")
+    _revalidate_stable_inputs(
+        parent,
+        {path.name: content},
+        directory_identities,
+        file_identities,
+        label="staged external anchor",
+    )
+    return _published_identity(path, False)
 
 
 def _published_identity(path: Path, directory: bool) -> tuple[int, int, int]:
@@ -1358,7 +1576,12 @@ def _rollback_owned_path(
 ) -> None:
     if not os.path.lexists(path):
         return
-    current = _published_identity(path, directory)
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or (
+        directory and not stat.S_ISDIR(metadata.st_mode)
+    ) or (not directory and not stat.S_ISREG(metadata.st_mode)):
+        raise Phase6PublicError("refusing to remove a changed publication path")
+    current = metadata.st_dev, metadata.st_ino, metadata.st_mode
     if current != identity:
         raise Phase6PublicError("refusing to remove a replaced publication path")
     if directory:
@@ -1437,11 +1660,24 @@ def publish_public_suite(
         if os.path.lexists(destination) or os.path.lexists(external_anchor_path):
             raise Phase6PublicError("publication destination appeared after lock")
         _require_loaded_inputs_unchanged(loaded)
+        staging_identity = _validate_staging_bundle(staging, rendered)
+        if anchor_staging is None:  # pragma: no cover - defensive invariant
+            raise Phase6PublicError("external anchor staging is unavailable")
+        anchor_staging_identity = _validate_anchor_staging(
+            anchor_staging,
+            rendered.external_anchor_bytes,
+        )
+        _fsync_directory(staging)
+        _fsync_directory(anchor_parent)
 
         _rename_no_replace(staging, destination)
-        published_bundle = _published_identity(destination, True)
+        published_bundle = staging_identity
+        if _published_identity(destination, True) != staging_identity:
+            raise Phase6PublicError("published bundle identity changed after rename")
         _rename_no_replace(anchor_staging, external_anchor_path)
-        published_anchor = _published_identity(external_anchor_path, False)
+        published_anchor = anchor_staging_identity
+        if _published_identity(external_anchor_path, False) != anchor_staging_identity:
+            raise Phase6PublicError("published anchor identity changed after rename")
         anchor_staging = None
         _fsync_directory(destination_parent)
         if anchor_parent != destination_parent:

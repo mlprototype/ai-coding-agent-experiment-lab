@@ -286,7 +286,9 @@ Prompt本文、raw Provider output、agent message、reasoning、thread ID、絶
 `run_metrics_available`はduration／diff統計の完全な有無と一致させる。Gate未実行時は
 Acceptance／Regression／lint／typecheck値をすべて0とし、`acceptance_passed`は
 `acceptance_total`を超えてはならない。overall status、failure kind、Gate状態、Metrics、
-Gate非実行理由は双方向に整合させる。
+Gate非実行理由は双方向に整合させる。Gate実行済みの場合、Gate集計値はMetricsの有無に
+かかわらず保存済みCommand Evidenceから再導出する。Metricsが存在する場合は、そのGate集計と
+完全一致させる。
 
 Public Language Report 1.1は1.0のvalidatorとcanonical loader互換性を維持したまま
 `zero_call_runs`と
@@ -313,9 +315,11 @@ Slice 6Dは`agentlab.phase6_public`へruntimeを分離し、Public schemaを変�
 追加する。
 
 - `verify-phase6-historical`: 明示されたPlan 1.1、Campaign 1.1、保存Report JSON／Markdownを
-  固定rootからstable readし、同じbytesの一時mirrorでoffline再集計する。CampaignやGateは
-  再実行せず、toolchain versionは`unknown`のままHistorical Verification Record 1.0を
-  create-onlyで生成する。
+  固定rootからstable readする。さらに`--reviewed-spec`でrepository root基準のcanonical相対
+  pathを必須入力とし、Specをstable readした同じbytesについてPlanのSpec SHA-256、`git log`、
+  `git show`を照合する。filenameやexperiment IDからSpec pathを推測しない。同じbytesの一時
+  mirrorでoffline再集計し、CampaignやGateは再実行せず、toolchain versionは`unknown`のまま
+  Historical Verification Record 1.0をcreate-onlyで生成する。
 - `publish-phase6-public-suite`: `load_public_suite_inputs`と
   `validate_public_suite_inputs`を通過した、Manifest列挙入力だけから決定的bundleを生成する。
   directory探索や未列挙fileの自動採用は行わない。
@@ -336,9 +340,11 @@ Verification Record生成も行わない。Antigravity coverageは
 
 JSONはcanonical serializer、Markdownはstrict-load済みJSON modelからの固定rendererで作る。
 全出力はUTF-8／LF／末尾newline 1個で、時刻は`data_cutoff_at`だけを使う。stagingでは全fileを
-fsyncし、JSON strict reload、Markdown byte再生成、allowlist leak scan、size／SHA-256再計算、
-`checksums.json`、External Checksum Anchorの順に検証する。排他的lock取得後にも入力不変と
-destination／anchor非存在を確認し、macOSの`renamex_np(RENAME_EXCL)`またはLinuxの
+fsyncする。全file生成後とpublish lock取得後にstagingの実treeを安全に再読込し、予定path／
+directory集合、通常file、single link、identity、実bytes、JSON strict reload、Markdown byte
+再生成、allowlist leak scan、size／SHA-256、`checksums.json`を再検証する。rename前にbundleと
+anchorのidentityを保存し、rename成功直後からrollback対象とする。destination／anchor非存在を
+確認し、macOSの`renamex_np(RENAME_EXCL)`またはLinuxの
 `renameat2(RENAME_NOREPLACE)`だけでpublishする。unsupported platformはfail closedとする。
 
 Slice 6Dの実装受入は一時directoryのsynthetic Artifactだけである。実Historical Verification
