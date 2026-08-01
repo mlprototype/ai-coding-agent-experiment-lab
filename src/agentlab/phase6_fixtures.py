@@ -7,6 +7,8 @@ Fixture Gate executed through the existing process-group runner.
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -59,7 +61,7 @@ _MAX_OUTPUT_BYTES = 64 * 1024
 _MAX_DIFF_BYTES = 256 * 1024
 _TREE_DOMAIN = b"agentlab-phase6-tree-v1\0"
 _VERSION_DOMAIN = "agentlab-phase6-version-output-v1"
-_TSC_PACKAGE_DOMAIN = "agentlab-phase6-typescript-package-v1"
+_TSC_PACKAGE_DOMAIN = "agentlab-phase6-typescript-package-v2"
 _GATE_CONTRACT_DOMAIN = "agentlab-phase6-gate-contract-v1"
 
 
@@ -143,6 +145,23 @@ class _FileIdentity:
 class _VersionObservation:
     exact_version: str
     output_sha256: str
+
+
+@dataclass(frozen=True)
+class _ComponentBinding:
+    role: ToolchainComponentRole
+    resolved_path: Path
+    identity: _FileIdentity
+
+
+@dataclass(frozen=True)
+class _ToolchainBindingSnapshot:
+    language: Language
+    toolchain_fingerprint: str
+    components: tuple[_ComponentBinding, ...]
+    typescript_package_root: Path | None = None
+    typescript_package: SecureTreeSnapshot | None = None
+    typescript_compiler_js: Path | None = None
 
 
 def _sha256(content: bytes) -> str:
@@ -496,6 +515,38 @@ def _find_typescript_package(
     raise FixtureAcceptanceError("TypeScript package root could not be determined")
 
 
+def _typescript_package_fingerprint(
+    *,
+    package_root: Path,
+    package_version: str,
+    package_json_bytes: bytes,
+    package_snapshot: SecureTreeSnapshot,
+    compiler_js_bytes: bytes,
+    launcher_sha256: str,
+    node_component: ToolchainComponent,
+    compiler_version_output_sha256: str,
+) -> str:
+    compiler_js = package_root / "lib" / "tsc.js"
+    return _canonical_hash(
+        {
+            "compiler_js_path": "lib/tsc.js",
+            "compiler_js_sha256": _sha256(compiler_js_bytes),
+            "compiler_version_argv": [
+                node_component.resolved_executable_path,
+                str(compiler_js),
+                "--version",
+            ],
+            "compiler_version_output_sha256": compiler_version_output_sha256,
+            "domain": _TSC_PACKAGE_DOMAIN,
+            "node_component": node_component.model_dump(mode="json"),
+            "package_json_sha256": _sha256(package_json_bytes),
+            "package_tree_sha256": package_snapshot.sha256,
+            "package_version": package_version,
+            "tsc_launcher_sha256": launcher_sha256,
+        }
+    )
+
+
 def _audit_typescript_component(
     candidate: Path | None,
     node_component: ToolchainComponent,
@@ -519,11 +570,20 @@ def _audit_typescript_component(
         compiler_js_bytes = package_snapshot.files["lib/tsc.js"]
     except KeyError as error:
         raise FixtureAcceptanceError("TypeScript compiler JS is unavailable") from error
-    observation = _run_version_command(
+    launcher_observation = _run_version_command(
         [str(resolved), "--version"],
         path_entries=path_entries,
     )
-    if observation.exact_version != f"Version {package_version}":
+    compiler_js = package_root / "lib" / "tsc.js"
+    compiler_observation = _run_version_command(
+        [node_component.resolved_executable_path, str(compiler_js), "--version"],
+        path_entries=path_entries,
+    )
+    if (
+        launcher_observation.exact_version != f"Version {package_version}"
+        or compiler_observation.exact_version != launcher_observation.exact_version
+        or compiler_observation.output_sha256 != launcher_observation.output_sha256
+    ):
         raise FixtureAcceptanceError("TypeScript package and tsc versions differ")
     after_resolved, after = _snapshot_executable(
         resolved,
@@ -538,25 +598,23 @@ def _audit_typescript_component(
         raise FixtureAcceptanceError("TypeScript compiler JS changed during audit")
     if after_package_snapshot.sha256 != package_snapshot.sha256:
         raise FixtureAcceptanceError("TypeScript package tree changed during audit")
-    package_fingerprint = _canonical_hash(
-        {
-            "compiler_js_path": "lib/tsc.js",
-            "compiler_js_sha256": _sha256(compiler_js_bytes),
-            "domain": _TSC_PACKAGE_DOMAIN,
-            "node_component": node_component.model_dump(mode="json"),
-            "package_json_sha256": _sha256(package_json_bytes),
-            "package_tree_sha256": package_snapshot.sha256,
-            "package_version": package_version,
-            "tsc_launcher_sha256": before.sha256,
-        }
+    package_fingerprint = _typescript_package_fingerprint(
+        package_root=package_root,
+        package_version=package_version,
+        package_json_bytes=package_json_bytes,
+        package_snapshot=package_snapshot,
+        compiler_js_bytes=compiler_js_bytes,
+        launcher_sha256=before.sha256,
+        node_component=node_component,
+        compiler_version_output_sha256=compiler_observation.output_sha256,
     )
     return ToolchainComponent(
         role=ToolchainComponentRole.TYPESCRIPT_COMPILER,
         resolved_executable_path=str(resolved),
         executable_sha256=before.sha256,
         version_argv=[str(resolved), "--version"],
-        exact_version=observation.exact_version,
-        version_output_sha256=observation.output_sha256,
+        exact_version=launcher_observation.exact_version,
+        version_output_sha256=launcher_observation.output_sha256,
         package_version=package_version,
         package_fingerprint=package_fingerprint,
     )
@@ -664,9 +722,88 @@ def discover_toolchain_candidates() -> ToolchainCandidates:
     )
 
 
+def _capture_toolchain_binding(
+    language: Language,
+    toolchain: ToolchainIdentity,
+) -> _ToolchainBindingSnapshot:
+    components: list[_ComponentBinding] = []
+    by_role = {component.role: component for component in toolchain.components}
+    for component in toolchain.components:
+        recorded_path = Path(component.resolved_executable_path)
+        resolved, identity = _snapshot_executable(recorded_path)
+        if resolved != recorded_path or identity.sha256 != component.executable_sha256:
+            raise FixtureAcceptanceError(
+                f"recorded {component.role.value} executable identity changed"
+            )
+        components.append(
+            _ComponentBinding(
+                role=component.role,
+                resolved_path=resolved,
+                identity=identity,
+            )
+        )
+
+    package_root: Path | None = None
+    package_snapshot: SecureTreeSnapshot | None = None
+    compiler_js: Path | None = None
+    if language is Language.TYPESCRIPT:
+        node = by_role[ToolchainComponentRole.NODE_RUNTIME]
+        compiler = by_role[ToolchainComponentRole.TYPESCRIPT_COMPILER]
+        package_root, package_raw, package_json_bytes, package_snapshot = (
+            _find_typescript_package(Path(compiler.resolved_executable_path))
+        )
+        package_version = package_raw.get("version")
+        if not isinstance(package_version, str):
+            raise FixtureAcceptanceError("TypeScript package version is invalid")
+        try:
+            compiler_js_bytes = package_snapshot.files["lib/tsc.js"]
+        except KeyError as error:
+            raise FixtureAcceptanceError(
+                "TypeScript compiler JS is unavailable"
+            ) from error
+        expected_fingerprint = _typescript_package_fingerprint(
+            package_root=package_root,
+            package_version=package_version,
+            package_json_bytes=package_json_bytes,
+            package_snapshot=package_snapshot,
+            compiler_js_bytes=compiler_js_bytes,
+            launcher_sha256=compiler.executable_sha256,
+            node_component=node,
+            compiler_version_output_sha256=compiler.version_output_sha256,
+        )
+        if (
+            compiler.package_version != package_version
+            or compiler.exact_version != f"Version {package_version}"
+            or compiler.package_fingerprint != expected_fingerprint
+        ):
+            raise FixtureAcceptanceError(
+                "TypeScript package no longer matches its recorded fingerprint"
+            )
+        compiler_js = package_root / "lib" / "tsc.js"
+
+    return _ToolchainBindingSnapshot(
+        language=language,
+        toolchain_fingerprint=toolchain.fingerprint,
+        components=tuple(components),
+        typescript_package_root=package_root,
+        typescript_package=package_snapshot,
+        typescript_compiler_js=compiler_js,
+    )
+
+
+def _verify_toolchain_binding(
+    expected: _ToolchainBindingSnapshot,
+    toolchain: ToolchainIdentity,
+) -> None:
+    current = _capture_toolchain_binding(expected.language, toolchain)
+    if current != expected:
+        raise FixtureAcceptanceError("toolchain changed during Fixture Acceptance")
+
+
 def _commands_for(
     language: Language,
     toolchain: ToolchainIdentity,
+    binding: _ToolchainBindingSnapshot,
 ) -> tuple[tuple[GateKind, list[str]], ...]:
     by_role = {component.role: component for component in toolchain.components}
     if language is Language.PYTHON:
@@ -677,14 +814,20 @@ def _commands_for(
         )
     if language is Language.TYPESCRIPT:
         node = by_role[ToolchainComponentRole.NODE_RUNTIME].resolved_executable_path
-        tsc = by_role[ToolchainComponentRole.TYPESCRIPT_COMPILER].resolved_executable_path
+        compiler_js = binding.typescript_compiler_js
+        if compiler_js is None:
+            raise FixtureAcceptanceError("TypeScript compiler binding is unavailable")
         return tuple(
-            (gate, [node, "gate_helper.mjs", gate.value, tsc])
+            (
+                gate,
+                [node, "gate_helper.mjs", gate.value, node, str(compiler_js)],
+            )
             for gate in GateKind
         )
     java = by_role[ToolchainComponentRole.JAVA_RUNTIME].resolved_executable_path
+    javac = by_role[ToolchainComponentRole.JAVA_COMPILER].resolved_executable_path
     return tuple(
-        (gate, [java, "GateHelper.java", gate.value])
+        (gate, [java, "GateHelper.java", gate.value, javac])
         for gate in GateKind
     )
 
@@ -763,6 +906,7 @@ def _run_gate_commands(
     environment_root: Path,
     temporary_root: Path,
     toolchain: ToolchainIdentity,
+    toolchain_binding: _ToolchainBindingSnapshot | None = None,
 ) -> tuple[CommandEvidence, ...]:
     settings = RunnerSettings(
         fixture_path="phase6-fixture",
@@ -775,6 +919,8 @@ def _run_gate_commands(
     evidence: list[CommandEvidence] = []
     environment = _minimal_environment(toolchain.gate_path_entries)
     for index, (gate, argv) in enumerate(commands):
+        if toolchain_binding is not None:
+            _verify_toolchain_binding(toolchain_binding, toolchain)
         result = runner.run(
             gate=gate,
             command_index=index,
@@ -784,6 +930,8 @@ def _run_gate_commands(
             temporary_root=temporary_root,
             parent_environment=environment,
         )
+        if toolchain_binding is not None:
+            _verify_toolchain_binding(toolchain_binding, toolchain)
         command = result.evidence
         if (
             result.harness_failure is not None
@@ -1024,6 +1172,52 @@ def _blocked_outcome(
     )
 
 
+def _rename_directory_no_replace(source: Path, destination: Path) -> None:
+    """Atomically publish a directory while refusing every existing destination."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    try:
+        if sys.platform == "darwin":
+            rename = libc.renamex_np
+            rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+            rename.restype = ctypes.c_int
+            result = rename(source_bytes, destination_bytes, 0x00000004)
+        elif sys.platform.startswith("linux"):
+            rename = libc.renameat2
+            rename.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            rename.restype = ctypes.c_int
+            result = rename(
+                -100,
+                source_bytes,
+                -100,
+                destination_bytes,
+                0x00000001,
+            )
+        else:
+            raise FixtureAcceptanceError(
+                "atomic no-replace publication is unsupported on this platform"
+            )
+    except AttributeError as error:
+        raise FixtureAcceptanceError(
+            "atomic no-replace publication is unavailable"
+        ) from error
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FixtureAcceptanceError("Fixture Acceptance output already exists")
+    raise FixtureAcceptanceError(
+        f"atomic no-replace publication failed: {os.strerror(error_number)}"
+    )
+
+
 def _write_acceptance_outputs(
     definition: FixtureDefinition,
     manifest: FixtureManifest,
@@ -1047,9 +1241,7 @@ def _write_acceptance_outputs(
             raise FixtureAcceptanceError("canonical Fixture Manifest reload failed")
         if load_fixture_acceptance(acceptance_path) != acceptance:
             raise FixtureAcceptanceError("canonical Fixture Acceptance reload failed")
-        if os.path.lexists(definition.output_root):
-            raise FixtureAcceptanceError("Fixture Acceptance output already exists")
-        os.rename(staging, definition.output_root)
+        _rename_directory_no_replace(staging, definition.output_root)
     except FileExistsError as error:
         raise FixtureAcceptanceError("Fixture Acceptance output already exists") from error
     except Exception:
@@ -1099,7 +1291,15 @@ def accept_fixture(
                 definition.output_root,
             ),
         )
-        commands = _commands_for(definition.language, toolchain)
+        toolchain_binding = _capture_toolchain_binding(
+            definition.language,
+            toolchain,
+        )
+        commands = _commands_for(
+            definition.language,
+            toolchain,
+            toolchain_binding,
+        )
         gate_contract_sha256 = _gate_contract_hash(
             definition.language,
             toolchain,
@@ -1127,6 +1327,7 @@ def accept_fixture(
                 environment_root=baseline_workspace.environment_root,
                 temporary_root=baseline_workspace.temporary_root,
                 toolchain=toolchain,
+                toolchain_binding=toolchain_binding,
             )
             _assert_gate_expectations(baseline_commands, baseline=True)
             baseline_after = secure_tree_snapshot(baseline_workspace.workspace)
@@ -1155,6 +1356,7 @@ def accept_fixture(
                 environment_root=reference_workspace.environment_root,
                 temporary_root=reference_workspace.temporary_root,
                 toolchain=toolchain,
+                toolchain_binding=toolchain_binding,
             )
             _assert_gate_expectations(reference_commands, baseline=False)
             reference_after = secure_tree_snapshot(reference_workspace.workspace)
@@ -1167,6 +1369,7 @@ def accept_fixture(
         source_after = secure_tree_snapshot(definition.fixture_root)
         if source_after != source_before:
             raise FixtureAcceptanceError("source Fixture changed during Acceptance")
+        _verify_toolchain_binding(toolchain_binding, toolchain)
         if (repository_root / ".git").exists():
             current_commit = verify_repository_provenance(repository_root)
             if current_commit != commit_sha:

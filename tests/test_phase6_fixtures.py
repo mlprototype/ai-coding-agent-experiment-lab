@@ -80,7 +80,6 @@ def _typescript_candidates(
     package_version: str = "5.7.3",
     command_version: str | None = None,
 ) -> ToolchainCandidates:
-    node = _version_executable(root / "node-bin" / "node", "v22.12.0")
     package = root / "typescript"
     (package / "lib").mkdir(parents=True)
     (package / "package.json").write_text(
@@ -88,6 +87,13 @@ def _typescript_candidates(
         encoding="utf-8",
     )
     (package / "lib" / "tsc.js").write_text("// compiler\n", encoding="utf-8")
+    node = _write_executable(
+        root / "node-bin" / "node",
+        "import sys\n"
+        f"print({'Version ' + package_version!r} "
+        "if len(sys.argv) > 1 and sys.argv[1].endswith('tsc.js') "
+        "else 'v22.12.0')",
+    )
     tsc = _version_executable(
         package / "bin" / "tsc",
         command_version or f"Version {package_version}",
@@ -139,6 +145,30 @@ def test_typescript_capability_audit_binds_node_package_and_compiler_tree(
     assert compiler.exact_version == "Version 5.7.3"
 
 
+def test_typescript_version_audit_explicitly_uses_recorded_node_and_compiler_js(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidates = _typescript_candidates(tmp_path)
+    observed_argv: list[tuple[str, ...]] = []
+    original = fixtures._run_version_command
+
+    def record_argv(argv: list[str], **kwargs: Any) -> Any:
+        observed_argv.append(tuple(argv))
+        return original(argv, **kwargs)
+
+    monkeypatch.setattr(fixtures, "_run_version_command", record_argv)
+    audit_toolchain(Language.TYPESCRIPT, candidates)
+
+    assert candidates.node is not None
+    assert candidates.tsc is not None
+    assert (
+        str(candidates.node.resolve()),
+        str((tmp_path / "typescript" / "lib" / "tsc.js").resolve()),
+        "--version",
+    ) in observed_argv
+
+
 def test_java_capability_audit_requires_and_records_one_jdk(tmp_path: Path) -> None:
     identity = audit_toolchain(Language.JAVA, _java_candidates(tmp_path))
 
@@ -148,6 +178,44 @@ def test_java_capability_audit_requires_and_records_one_jdk(tmp_path: Path) -> N
     ]
     assert identity.components[0].exact_version == "javac 21.0.6"
     assert identity.components[1].exact_version == 'openjdk version "21.0.6"'
+
+
+def test_gate_contract_uses_audited_compilers_explicitly(tmp_path: Path) -> None:
+    typescript = audit_toolchain(
+        Language.TYPESCRIPT,
+        _typescript_candidates(tmp_path / "typescript-toolchain"),
+    )
+    typescript_binding = fixtures._capture_toolchain_binding(
+        Language.TYPESCRIPT,
+        typescript,
+    )
+    typescript_commands = fixtures._commands_for(
+        Language.TYPESCRIPT,
+        typescript,
+        typescript_binding,
+    )
+    node = next(
+        component.resolved_executable_path
+        for component in typescript.components
+        if component.role is ToolchainComponentRole.NODE_RUNTIME
+    )
+    assert typescript_binding.typescript_compiler_js is not None
+    for _gate, argv in typescript_commands:
+        assert argv[0] == node
+        assert argv[3:] == [node, str(typescript_binding.typescript_compiler_js)]
+
+    java = audit_toolchain(
+        Language.JAVA,
+        _java_candidates(tmp_path / "java-toolchain"),
+    )
+    java_binding = fixtures._capture_toolchain_binding(Language.JAVA, java)
+    java_commands = fixtures._commands_for(Language.JAVA, java, java_binding)
+    javac = next(
+        component.resolved_executable_path
+        for component in java.components
+        if component.role is ToolchainComponentRole.JAVA_COMPILER
+    )
+    assert all(argv[-1] == javac for _gate, argv in java_commands)
 
 
 def test_workspace_executable_is_rejected_even_when_explicitly_selected(
@@ -300,13 +368,106 @@ def test_typescript_package_mutation_during_audit_is_rejected(
         nonlocal calls
         result = original(*args, **kwargs)
         calls += 1
-        if calls == 2:
+        if calls == 3:
             (package / changed_file).write_text("changed", encoding="utf-8")
         return result
 
     monkeypatch.setattr(fixtures, "_run_version_command", mutate_after_tsc)
     with pytest.raises(FixtureAcceptanceError, match="changed during audit"):
         audit_toolchain(Language.TYPESCRIPT, candidates)
+
+
+@pytest.mark.parametrize("language", [Language.PYTHON, Language.JAVA])
+def test_gate_rejects_audited_executable_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    language: Language,
+) -> None:
+    if language is Language.PYTHON:
+        candidates = _python_candidates(tmp_path)
+    else:
+        candidates = _java_candidates(tmp_path)
+    toolchain = audit_toolchain(language, candidates)
+    binding = fixtures._capture_toolchain_binding(language, toolchain)
+    target_role = (
+        ToolchainComponentRole.PYTHON_RUNTIME
+        if language is Language.PYTHON
+        else ToolchainComponentRole.JAVA_COMPILER
+    )
+    target = next(
+        component.resolved_path
+        for component in binding.components
+        if component.role is target_role
+    )
+
+    class MutatingRunner:
+        def __init__(self, _settings: Any) -> None:
+            pass
+
+        def run(self, **_kwargs: Any) -> CommandRunResult:
+            target.write_text("replacement", encoding="utf-8")
+            target.chmod(0o755)
+            return CommandRunResult(
+                evidence=_command(GateKind.ACCEPTANCE, CommandStatus.PASSED),
+                harness_failure=None,
+            )
+
+    monkeypatch.setattr(fixtures, "LocalCommandRunner", MutatingRunner)
+    temporary = tmp_path / "gate"
+    workspace = temporary / "workspace"
+    environment = temporary / "environment"
+    workspace.mkdir(parents=True)
+    environment.mkdir()
+
+    with pytest.raises(FixtureAcceptanceError, match="executable identity changed"):
+        fixtures._run_gate_commands(
+            [(GateKind.ACCEPTANCE, ["/fake/gate"])],
+            workspace=workspace,
+            environment_root=environment,
+            temporary_root=temporary,
+            toolchain=toolchain,
+            toolchain_binding=binding,
+        )
+
+
+def test_gate_rejects_typescript_package_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    toolchain = audit_toolchain(
+        Language.TYPESCRIPT,
+        _typescript_candidates(tmp_path),
+    )
+    binding = fixtures._capture_toolchain_binding(Language.TYPESCRIPT, toolchain)
+    assert binding.typescript_compiler_js is not None
+
+    class MutatingRunner:
+        def __init__(self, _settings: Any) -> None:
+            pass
+
+        def run(self, **_kwargs: Any) -> CommandRunResult:
+            binding.typescript_compiler_js.write_text("changed", encoding="utf-8")
+            return CommandRunResult(
+                evidence=_command(GateKind.ACCEPTANCE, CommandStatus.PASSED),
+                harness_failure=None,
+            )
+
+    monkeypatch.setattr(fixtures, "LocalCommandRunner", MutatingRunner)
+    temporary = tmp_path / "gate"
+    workspace = temporary / "workspace"
+    environment = temporary / "environment"
+    workspace.mkdir(parents=True)
+    environment.mkdir()
+
+    with pytest.raises(FixtureAcceptanceError, match="TypeScript package"):
+        fixtures._run_gate_commands(
+            [(GateKind.ACCEPTANCE, ["/fake/gate"])],
+            workspace=workspace,
+            environment_root=environment,
+            temporary_root=temporary,
+            toolchain=toolchain,
+            toolchain_binding=binding,
+        )
 
 
 def test_java_and_javac_must_share_jdk_root(tmp_path: Path) -> None:
@@ -330,6 +491,7 @@ def _test_toolchain(tmp_path: Path) -> ToolchainIdentity:
     executable = tmp_path / "outside" / "python"
     executable.parent.mkdir(parents=True)
     executable.write_bytes(b"fake")
+    executable.chmod(0o755)
     component = ToolchainComponent(
         role=ToolchainComponentRole.PYTHON_RUNTIME,
         resolved_executable_path=str(executable.absolute()),
@@ -463,6 +625,28 @@ def _install_acceptance_fakes(
         return _normal_gate_results(baseline=calls == 1)
 
     monkeypatch.setattr(fixtures, "_run_gate_commands", run_gates)
+
+
+def test_all_language_acceptance_gates_share_hyphen_separator_boundary_case() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    helpers = (
+        repository
+        / "experiments/phase6/fixtures/python/baseline/gate_helper.py",
+        repository
+        / "experiments/phase6/fixtures/typescript/baseline/gate_helper.mjs",
+        repository
+        / "experiments/phase6/fixtures/java/baseline/GateHelper.java",
+    )
+    for helper in helpers:
+        content = helper.read_text(encoding="utf-8")
+        assert '"a- _b"' in content
+        assert '"a--b"' in content
+    java_reference = (
+        repository
+        / "experiments/phase6/fixtures/java/reference/TagNormalizer.java"
+    ).read_text(encoding="utf-8")
+    assert "if (pendingSeparator)" in java_reference
+    assert "value.charAt(value.length() - 1) != '-'" not in java_reference
 
 
 def test_fixture_acceptance_generates_strict_canonical_records_only_after_success(
@@ -823,6 +1007,41 @@ def test_existing_output_is_never_replaced(
     )
     assert outcome.status == "blocked"
     assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_atomic_publish_preserves_empty_directory_created_in_race_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, definition = _definition(tmp_path)
+    _install_acceptance_fakes(monkeypatch, _test_toolchain(tmp_path))
+    original = fixtures._rename_directory_no_replace
+    competing_identity: tuple[int, int] | None = None
+
+    def create_competing_directory(source: Path, destination: Path) -> None:
+        nonlocal competing_identity
+        destination.mkdir()
+        metadata = destination.lstat()
+        competing_identity = (metadata.st_dev, metadata.st_ino)
+        original(source, destination)
+
+    monkeypatch.setattr(
+        fixtures,
+        "_rename_directory_no_replace",
+        create_competing_directory,
+    )
+    outcome = accept_fixture(
+        definition,
+        repository_root=repository,
+        commit_sha=FULL_COMMIT,
+        candidates=ToolchainCandidates(),
+    )
+
+    assert outcome.status == "blocked"
+    assert competing_identity is not None
+    current = definition.output_root.lstat()
+    assert (current.st_dev, current.st_ino) == competing_identity
+    assert list(definition.output_root.iterdir()) == []
 
 
 def _suite_result(language: Language, status: str) -> FixtureAcceptanceOutcome:

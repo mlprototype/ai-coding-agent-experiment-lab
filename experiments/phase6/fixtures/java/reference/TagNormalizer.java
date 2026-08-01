@@ -24,7 +24,7 @@ public final class TagNormalizer {
             if (character == '-' && value.length() == 0) {
                 continue;
             }
-            if (pendingSeparator && value.charAt(value.length() - 1) != '-') {
+            if (pendingSeparator) {
                 value.append('-');
             }
             pendingSeparator = false;

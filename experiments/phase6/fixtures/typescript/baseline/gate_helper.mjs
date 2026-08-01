@@ -6,7 +6,8 @@ import { createRequire } from "node:module";
 import { join } from "node:path";
 
 const gate = process.argv[2];
-const tsc = process.argv[3];
+const compilerNode = process.argv[3];
+const compilerJs = process.argv[4];
 const output = join(process.env.TMPDIR, `phase6-ts-${process.pid}`);
 mkdirSync(output, { recursive: true });
 
@@ -25,7 +26,7 @@ function compile(noEmit = false) {
     args.push("--outDir", output);
   }
   args.push("tag_normalizer.ts");
-  return spawnSync(tsc, args, {
+  return spawnSync(compilerNode, [compilerJs, ...args], {
     encoding: "utf8",
     env: process.env,
     shell: false,
@@ -54,12 +55,14 @@ function acceptance() {
     "___",
     "ALPHA BETA",
     "x   y",
+    "a- _b",
   ]);
   return JSON.stringify(actual) === JSON.stringify([
     "hello-world",
     "alpha-beta",
     "trim",
     "x-y",
+    "a--b",
   ]);
 }
 

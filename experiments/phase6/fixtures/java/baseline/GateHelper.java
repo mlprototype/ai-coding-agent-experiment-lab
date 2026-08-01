@@ -6,37 +6,29 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
-import javax.tools.JavaCompiler;
-import javax.tools.ToolProvider;
 
 /** Dependency-free deterministic Gates for the Java Fixture. */
 public final class GateHelper {
     private GateHelper() {}
 
-    private static Path compile() throws IOException {
-        JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
-        if (compiler == null) {
-            return null;
-        }
+    private static Path compile(String javac) throws IOException, InterruptedException {
         Path output = Path.of(
             System.getenv("TMPDIR"),
             "phase6-java-" + ProcessHandle.current().pid()
         );
         Files.createDirectories(output);
-        int result = compiler.run(
-            null,
-            null,
-            null,
+        Process compiler = new ProcessBuilder(
+            javac,
             "-d",
             output.toString(),
             "TagNormalizer.java"
-        );
-        return result == 0 ? output : null;
+        ).inheritIO().start();
+        return compiler.waitFor() == 0 ? output : null;
     }
 
     @SuppressWarnings("unchecked")
-    private static List<String> normalize(List<String> input) throws Exception {
-        Path output = compile();
+    private static List<String> normalize(List<String> input, String javac) throws Exception {
+        Path output = compile(javac);
         if (output == null) {
             return null;
         }
@@ -47,7 +39,7 @@ public final class GateHelper {
         }
     }
 
-    private static boolean acceptance() throws Exception {
+    private static boolean acceptance(String javac) throws Exception {
         List<String> actual = normalize(List.of(
             "  Hello World  ",
             "hello__world",
@@ -55,14 +47,16 @@ public final class GateHelper {
             " --Trim-- ",
             "___",
             "ALPHA BETA",
-            "x   y"
-        ));
-        return List.of("hello-world", "alpha-beta", "trim", "x-y").equals(actual);
+            "x   y",
+            "a- _b"
+        ), javac);
+        return List.of("hello-world", "alpha-beta", "trim", "x-y", "a--b")
+            .equals(actual);
     }
 
-    private static boolean regression() throws Exception {
-        return List.of().equals(normalize(List.of()))
-            && List.of("plain-tag").equals(normalize(List.of("plain-tag")));
+    private static boolean regression(String javac) throws Exception {
+        return List.of().equals(normalize(List.of(), javac))
+            && List.of("plain-tag").equals(normalize(List.of("plain-tag"), javac));
     }
 
     private static boolean lint() throws IOException {
@@ -72,19 +66,20 @@ public final class GateHelper {
             && content.lines().allMatch(line -> line.equals(line.stripTrailing()));
     }
 
-    private static boolean typecheck() throws IOException {
-        return compile() != null;
+    private static boolean typecheck(String javac) throws IOException, InterruptedException {
+        return compile(javac) != null;
     }
 
     public static void main(String[] arguments) throws Exception {
-        if (arguments.length != 1) {
+        if (arguments.length != 2) {
             System.exit(2);
         }
+        String javac = arguments[1];
         boolean passed = switch (arguments[0]) {
-            case "acceptance" -> acceptance();
-            case "regression" -> regression();
+            case "acceptance" -> acceptance(javac);
+            case "regression" -> regression(javac);
             case "lint" -> lint();
-            case "typecheck" -> typecheck();
+            case "typecheck" -> typecheck(javac);
             default -> false;
         };
         System.exit(passed ? 0 : 1);

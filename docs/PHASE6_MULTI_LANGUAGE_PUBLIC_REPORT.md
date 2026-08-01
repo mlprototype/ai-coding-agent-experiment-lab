@@ -50,6 +50,9 @@ Acceptanceだけが通常終了の品質FAIL、Regression／lint／typecheckがP
 要求する。reference solutionはbaseline、Prompt、Provider Workspace、生成Artifactに含めない。
 全process group、Workspaceの回収とsource不変を確認し、全条件成功時だけManifest 1.0と
 Acceptance Record 1.0を`.artifacts/phase6/fixture-acceptance`配下へcreate-onlyで生成する。
+staging directoryからのpublishはmacOSの`renamex_np(RENAME_EXCL)`またはLinuxの
+`renameat2(RENAME_NOREPLACE)`を使い、競合して作られた空directoryを含む既存destinationを
+atomicに置換せず失敗する。
 
 実Acceptanceのprovenanceはclean worktreeのfull HEADへ固定し、Fixture／Policy／referenceが
 そのcommitのtracked fileであることを開始前に検証する。`acceptance_agentlab_commit`と
@@ -128,12 +131,22 @@ timeout、64 KiB stream別出力上限、strict UTF-8、process group回収を�
 実行権限、link count、実行前後のdevice／inode／mode／size／mtime／ctime／bytes hashを照合する。
 Javaの`java`／`javac`は同じJDK rootを必須とする。
 
+Gate contractは記録したtoolchainを実行argvへ直接束縛する。Java Gateは監査済み`java`で
+Gate helperを起動し、監査済み`javac`絶対pathをhelperへ渡して対象実装のcompileに使用する。
+TypeScript Gateは監査済みNodeでhelperを起動し、同じNodeとpackage内の`lib/tsc.js`を明示して
+compilerを起動する。`tsc` launcherのshebangやWorkspace PATHには依存しない。各Gateの直前・
+直後に全componentのrealpath、device／inode／mode／link count／size／mtime／ctime／SHA-256を
+再確認する。TypeScriptではさらにpackage tree、`package.json`、`lib/tsc.js`とpackage
+fingerprintを再計算し、差し替えがあればAcceptanceを拒否する。
+
 version出力hashはstdout／stderrのCRLFとCRをLFへ正規化し、`domain`、exit code、正規化後の
 stdout、stderrを持つcanonical JSON bytesのSHA-256とする。完全一致versionは非空のstdout、
 stderrの順で各末尾LFを1個だけ除き、両方がある場合はLFで結合するため、stderrへversionを出す
-Javaも保持できる。TypeScript compilerの`package_fingerprint`は専用hash domainのcanonical
-JSONに、package version、`package.json` hash、package tree hash、`lib/tsc.js` hash、tsc
-launcher hash、使用するNode component全体を含める。
+Javaも保持できる。TypeScript compilerの`package_fingerprint`はhash domain
+`agentlab-phase6-typescript-package-v2`のcanonical JSONに、package version、`package.json`
+hash、package tree hash、`lib/tsc.js` hash、tsc launcher hash、使用するNode component全体、
+Node＋compiler JSのversion argvとversion出力hashを含める。auditではlauncherによるversionと
+Node＋compiler JSによるversionの完全一致およびstream別出力hash一致を要求する。
 
 Slice 6Bで使うhash対象は次のとおり固定する。
 

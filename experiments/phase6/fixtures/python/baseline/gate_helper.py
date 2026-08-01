@@ -19,9 +19,10 @@ def _acceptance() -> bool:
             "___",
             "ALPHA BETA",
             "x   y",
+            "a- _b",
         ]
     )
-    return actual == ["hello-world", "alpha-beta", "trim", "x-y"]
+    return actual == ["hello-world", "alpha-beta", "trim", "x-y", "a--b"]
 
 
 def _regression() -> bool:
