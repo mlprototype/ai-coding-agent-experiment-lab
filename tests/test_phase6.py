@@ -11,7 +11,15 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from agentlab.campaign import CampaignRunStatus, CampaignStopReason
+from agentlab.campaign import (
+    AdapterCleanupState,
+    CampaignFinishedEvent,
+    CampaignOutcome,
+    CampaignRunEvent,
+    CampaignRunStatus,
+    CampaignStartedEvent,
+    CampaignStopReason,
+)
 from agentlab.models import (
     CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS,
     CODEX_REQUIRED_EXEC_FLAGS,
@@ -115,6 +123,12 @@ from agentlab.workflow import (
     WorkflowPlan,
     build_workflow_plan,
     workflow_plan_bytes,
+)
+from agentlab.workflow_report import (
+    Estimability,
+    WorkflowReportError,
+    aggregate_workflow_campaign,
+    create_workflow_report,
 )
 
 HASH_A = "a" * 64
@@ -958,6 +972,96 @@ def _cross_artifact_case(
     return source, spec, plan, campaign, artifacts, recordings
 
 
+def _write_phase6_report_case(
+    tmp_path: Path,
+    *,
+    incomplete_pair: bool = False,
+) -> tuple[Path, Path, Path, WorkflowPlanV1_2]:
+    _, _, plan, campaign, artifacts, recordings = _cross_artifact_case(tmp_path)
+    manifest, policy, acceptance = _fixture_contracts()
+    spec_path = tmp_path / "workflow.yaml"
+    plan_path = tmp_path / "plan.json"
+    campaign_path = tmp_path / "campaign.jsonl"
+    (tmp_path / "fixture.manifest.json").write_bytes(canonical_json_bytes(manifest))
+    (tmp_path / "fixture.acceptance.json").write_bytes(
+        canonical_json_bytes(acceptance)
+    )
+    (tmp_path / "diff-policy.json").write_bytes(canonical_json_bytes(policy))
+    plan_path.write_bytes(canonical_json_bytes(plan))
+
+    if incomplete_pair:
+        first_started, first_terminal = campaign.events[1:3]
+        second_run = plan.runs[1]
+        not_run = Phase6CampaignRunEvent(
+            schema_version="1.2",
+            sequence=3,
+            event_type="run_state",
+            run_id=second_run.run_id,
+            task_id=second_run.task_id,
+            workflow=second_run.workflow,
+            repetition_index=second_run.repetition_index,
+            status=CampaignRunStatus.NOT_RUN,
+            outcome=Phase6CampaignOutcome.STOP_CONDITION,
+            stop_reason=CampaignStopReason.MAX_TOTAL_DURATION,
+            provider_call_count=0,
+            gate_executed=False,
+            counted_failure=False,
+            fail_fast_applies=False,
+            max_failures_applies=False,
+            failure_kind=None,
+            occurred_at=T1,
+        )
+        finished = Phase6CampaignFinishedEvent(
+            schema_version="1.2",
+            sequence=4,
+            event_type="campaign_finished",
+            experiment_id=plan.experiment_id,
+            stop_reason=CampaignStopReason.MAX_TOTAL_DURATION,
+            attempted_run_count=1,
+            provider_call_count=1,
+            provider_call_count_unknown_runs=0,
+            counted_failure_count=0,
+            retry_count=0,
+            occurred_at=T1,
+        )
+        campaign = LoadedPhase6Campaign(
+            (campaign.started, first_started, first_terminal, not_run, finished)
+        )
+        artifacts = artifacts[:1]
+        recordings = recordings[:1]
+    campaign_path.write_bytes(_campaign_jsonl(campaign.events))
+
+    for artifact, recording in zip(artifacts, recordings, strict=True):
+        recording_bytes = b"".join(
+            _canonical_jsonl_line(event)
+            for event in (recording.started, recording.terminal)
+        )
+        recording_path = tmp_path / Path(
+            next(
+                run.recording_path
+                for run in plan.runs
+                if run.run_id == artifact.run_id
+            )
+        )
+        evidence_path = tmp_path / Path(
+            next(
+                run.evidence_path
+                for run in plan.runs
+                if run.run_id == artifact.run_id
+            )
+        )
+        recording_path.parent.mkdir(parents=True, exist_ok=True)
+        evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        recording_path.write_bytes(recording_bytes)
+        bound_artifact = artifact.model_copy(
+            update={
+                "recording_sha256": hashlib.sha256(recording_bytes).hexdigest()
+            }
+        )
+        evidence_path.write_bytes(canonical_json_bytes(bound_artifact))
+    return spec_path, plan_path, campaign_path, plan
+
+
 def test_compatible_loaders_keep_spec_2_0_and_plan_1_1(
     tmp_path: Path,
 ) -> None:
@@ -982,6 +1086,186 @@ def test_compatible_loaders_keep_spec_2_0_and_plan_1_1(
         load_workflow_plan_contract(noncanonical_path),
         WorkflowPlan,
     )
+
+
+def test_workflow_report_accepts_strict_plan_1_2_complete_pair(
+    tmp_path: Path,
+) -> None:
+    spec_path, plan_path, campaign_path, plan = _write_phase6_report_case(
+        tmp_path
+    )
+
+    report = aggregate_workflow_campaign(spec_path, plan_path, campaign_path)
+
+    assert report.pairing.status is Estimability.ESTIMABLE
+    assert report.pairing.complete_pair_count == 1
+    assert [item.quality_gate_passed_runs for item in report.workflows] == [1, 1]
+    assert [item.not_run_runs for item in report.workflows] == [0, 0]
+    artifact_root = tmp_path / Path(plan.runs[0].evidence_path).parent.parent
+    output_path = artifact_root / "synthetic-report.json"
+    markdown_path = artifact_root / "synthetic-report.md"
+    created = create_workflow_report(
+        spec_path,
+        plan_path,
+        campaign_path,
+        output_path,
+        markdown_path,
+    )
+    assert created.pairing == report.pairing
+    assert output_path.is_file()
+    assert markdown_path.is_file()
+
+
+def test_workflow_report_preserves_plan_1_1_not_run_aggregation(
+    tmp_path: Path,
+) -> None:
+    plan = build_workflow_plan(Path("experiments/examples/workflow-ab.yaml"))
+    plan_bytes = workflow_plan_bytes(plan)
+    plan_path = tmp_path / "plan.json"
+    campaign_path = tmp_path / "campaign.jsonl"
+    plan_path.write_bytes(plan_bytes)
+    occurred_at = datetime.fromisoformat(T0.replace("Z", "+00:00"))
+    events: list[Any] = [
+        CampaignStartedEvent(
+            schema_version="1.1",
+            sequence=0,
+            event_type="campaign_started",
+            experiment_id=plan.experiment_id,
+            plan_sha256=hashlib.sha256(plan_bytes).hexdigest(),
+            planned_run_count=plan.planned_run_count,
+            planned_provider_call_count=plan.planned_provider_call_count,
+            occurred_at=occurred_at,
+        )
+    ]
+    for sequence, run in enumerate(plan.runs, start=1):
+        events.append(
+            CampaignRunEvent(
+                schema_version="1.1",
+                sequence=sequence,
+                event_type="run_state",
+                run_id=run.run_id,
+                task_id=run.task_id,
+                workflow=run.workflow,
+                repetition_index=run.repetition_index,
+                status=CampaignRunStatus.NOT_RUN,
+                outcome=CampaignOutcome.STOP_CONDITION,
+                stop_reason=CampaignStopReason.FAIL_FAST,
+                provider_call_count=0,
+                retry_count=0,
+                live_failure_kind=None,
+                adapter_cleanup_state=AdapterCleanupState.NOT_APPLICABLE,
+                occurred_at=occurred_at,
+            )
+        )
+    events.append(
+        CampaignFinishedEvent(
+            schema_version="1.1",
+            sequence=len(events),
+            event_type="campaign_finished",
+            experiment_id=plan.experiment_id,
+            stop_reason=CampaignStopReason.FAIL_FAST,
+            attempted_run_count=0,
+            provider_call_count=0,
+            provider_call_count_unknown_runs=0,
+            retry_count=0,
+            occurred_at=occurred_at,
+        )
+    )
+    campaign_path.write_bytes(
+        b"".join(
+            (
+                json.dumps(
+                    event.model_dump(mode="json"),
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8")
+            for event in events
+        )
+    )
+
+    report = aggregate_workflow_campaign(
+        tmp_path / "workflow.yaml",
+        plan_path,
+        campaign_path,
+    )
+
+    assert report.pairing.status is Estimability.NOT_ESTIMABLE
+    assert report.pairing.complete_pair_count == 0
+    assert all(item.attempted_runs == 0 for item in report.workflows)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing_required", "invalid Workflow Plan"),
+        ("unsupported_version", "unsupported Workflow Plan schema_version"),
+        ("extra_field", "invalid Workflow Plan"),
+        ("noncanonical", "canonical JSON"),
+    ],
+)
+def test_workflow_report_rejects_invalid_or_unsupported_plan_1_2(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    spec_path, plan_path, campaign_path, _ = _write_phase6_report_case(tmp_path)
+    raw = json.loads(plan_path.read_text(encoding="utf-8"))
+    if mutation == "missing_required":
+        del raw["toolchain_fingerprint"]
+    elif mutation == "unsupported_version":
+        raw["schema_version"] = "1.3"
+    elif mutation == "extra_field":
+        raw["unexpected_report_field"] = True
+    if mutation == "noncanonical":
+        plan_path.write_text(json.dumps(raw), encoding="utf-8")
+    else:
+        plan_path.write_bytes(canonical_json_bytes(raw))
+
+    with pytest.raises(WorkflowReportError, match=message):
+        aggregate_workflow_campaign(spec_path, plan_path, campaign_path)
+
+
+def test_workflow_report_rejects_plan_1_2_binding_drift(tmp_path: Path) -> None:
+    spec_path, plan_path, campaign_path, _ = _write_phase6_report_case(tmp_path)
+    raw = json.loads(plan_path.read_text(encoding="utf-8"))
+    raw["toolchain_fingerprint"] = HASH_C
+    plan_path.write_bytes(canonical_json_bytes(raw))
+
+    with pytest.raises(WorkflowReportError, match="bindings are inconsistent"):
+        aggregate_workflow_campaign(spec_path, plan_path, campaign_path)
+
+
+def test_workflow_report_marks_incomplete_plan_1_2_pair_not_estimable(
+    tmp_path: Path,
+) -> None:
+    spec_path, plan_path, campaign_path, _ = _write_phase6_report_case(
+        tmp_path,
+        incomplete_pair=True,
+    )
+
+    report = aggregate_workflow_campaign(spec_path, plan_path, campaign_path)
+
+    assert report.pairing.status is Estimability.NOT_ESTIMABLE
+    assert report.pairing.complete_pair_count == 0
+    assert [item.not_run_runs for item in report.workflows] == [0, 1]
+
+
+def test_workflow_report_rejects_plan_1_2_artifact_mismatch(tmp_path: Path) -> None:
+    spec_path, plan_path, campaign_path, plan = _write_phase6_report_case(tmp_path)
+    evidence_path = tmp_path / Path(plan.runs[0].evidence_path)
+    raw = json.loads(evidence_path.read_text(encoding="utf-8"))
+    raw["plan_sha256"] = HASH_C
+    evidence_path.write_bytes(canonical_json_bytes(raw))
+
+    with pytest.raises(
+        WorkflowReportError,
+        match="Plan, Campaign, Evidence, and Recording identities differ",
+    ):
+        aggregate_workflow_campaign(spec_path, plan_path, campaign_path)
 
 
 def test_plan_1_2_binds_acceptance_policy_toolchain_and_commit(
