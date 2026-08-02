@@ -1111,3 +1111,160 @@ def test_language_results_are_independent_and_minimum_is_explicit(
     assert [result.status for result in outcome.results] == list(statuses)
     assert outcome.engineering_minimum_met is minimum
     assert outcome.full_target_met is full
+
+
+def test_language_scoped_acceptance_invokes_only_java(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    output_root = repository / ".artifacts" / "phase6" / "fixture-acceptance" / "new-head"
+    invoked: list[Language] = []
+    monkeypatch.setattr(fixtures, "verify_repository_provenance", lambda *_args: FULL_COMMIT)
+    monkeypatch.setattr(fixtures, "verify_fixture_sources_committed", lambda *_args: None)
+    monkeypatch.setattr(fixtures, "discover_toolchain_candidates", ToolchainCandidates)
+
+    def accept(definition: FixtureDefinition, **_kwargs: Any) -> FixtureAcceptanceOutcome:
+        invoked.append(definition.language)
+        assert definition.output_root == output_root / "java"
+        return _suite_result(definition.language, "accepted")
+
+    monkeypatch.setattr(fixtures, "accept_fixture", accept)
+    outcome = fixtures.accept_phase6_fixtures(
+        repository,
+        output_root,
+        language=Language.JAVA,
+        confirm_local_execution=True,
+    )
+
+    assert invoked == [Language.JAVA]
+    assert [result.language for result in outcome.results] == [Language.JAVA]
+
+
+def test_language_scoped_cli_returns_success_for_one_accepted_language(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "agentlab.cli.accept_phase6_fixtures",
+        lambda *_args, **_kwargs: fixtures.FixtureAcceptanceSuiteOutcome(
+            commit_sha=FULL_COMMIT,
+            results=(_suite_result(Language.JAVA, "accepted"),),
+        ),
+    )
+
+    result = CLI_RUNNER.invoke(
+        app,
+        [
+            "accept-phase6-fixtures",
+            "--language",
+            "java",
+            "--confirm-local-execution",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "java: accepted" in result.output
+
+
+def test_language_scoped_cli_rejects_duplicate_before_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal called
+        called = True
+        raise AssertionError("domain must not be invoked")
+
+    monkeypatch.setattr(fixtures, "accept_phase6_fixtures", forbidden)
+    result = CLI_RUNNER.invoke(
+        app,
+        [
+            "accept-phase6-fixtures",
+            "--language",
+            "java",
+            "--language",
+            "java",
+            "--confirm-local-execution",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "at most once" in result.output
+    assert called is False
+
+
+def test_language_scoped_cli_rejects_unknown_language_at_parse_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal called
+        called = True
+        raise AssertionError("domain must not be invoked")
+
+    monkeypatch.setattr(fixtures, "accept_phase6_fixtures", forbidden)
+    result = CLI_RUNNER.invoke(
+        app,
+        [
+            "accept-phase6-fixtures",
+            "--language",
+            "rust",
+            "--confirm-local-execution",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert called is False
+
+
+def test_acceptance_output_rejects_lexical_traversal_before_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    called = False
+
+    def forbidden() -> ToolchainCandidates:
+        nonlocal called
+        called = True
+        raise AssertionError("discovery must not run")
+
+    monkeypatch.setattr(fixtures, "discover_toolchain_candidates", forbidden)
+    with pytest.raises(FixtureAcceptanceError, match="must not contain"):
+        fixtures.accept_phase6_fixtures(
+            repository,
+            Path(".artifacts/phase6/fixture-acceptance/../collision"),
+            language=Language.JAVA,
+            confirm_local_execution=True,
+        )
+    assert called is False
+
+
+def test_acceptance_output_symlink_parent_is_rejected_without_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    artifact_root = repository / ".artifacts" / "phase6" / "fixture-acceptance"
+    artifact_root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (artifact_root / "linked").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(fixtures, "verify_repository_provenance", lambda *_args: FULL_COMMIT)
+    monkeypatch.setattr(fixtures, "verify_fixture_sources_committed", lambda *_args: None)
+    monkeypatch.setattr(fixtures, "discover_toolchain_candidates", ToolchainCandidates)
+
+    outcome = fixtures.accept_phase6_fixtures(
+        repository,
+        artifact_root / "linked",
+        language=Language.JAVA,
+        confirm_local_execution=True,
+    )
+
+    assert outcome.results[0].status == "blocked"
+    assert list(outside.iterdir()) == []

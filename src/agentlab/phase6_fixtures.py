@@ -837,7 +837,16 @@ def _gate_contract_hash(
     toolchain: ToolchainIdentity,
     commands: Sequence[tuple[GateKind, list[str]]],
 ) -> str:
-    return _canonical_hash(
+    return _sha256(_gate_contract_bytes(language, toolchain, commands))
+
+
+def _gate_contract_bytes(
+    language: Language,
+    toolchain: ToolchainIdentity,
+    commands: Sequence[tuple[GateKind, list[str]]],
+) -> bytes:
+    """Return the canonical bytes whose digest is the Gate contract identity."""
+    return canonical_json_bytes(
         {
             "commands": [
                 {"argv": argv, "gate": gate.value, "order": index}
@@ -1458,14 +1467,17 @@ def accept_phase6_fixtures(
     output_root: Path,
     *,
     confirm_local_execution: bool,
+    language: Language | None = None,
     candidates: ToolchainCandidates | None = None,
 ) -> FixtureAcceptanceSuiteOutcome:
-    """Accept all languages independently after an explicit local-execution opt-in."""
+    """Accept all languages, or one explicitly selected language, independently."""
     if not confirm_local_execution:
         raise FixtureAcceptanceError(
             "--confirm-local-execution is required before toolchain or Gate subprocesses"
         )
     repository = repository_root.resolve(strict=True)
+    if ".." in output_root.parts:
+        raise FixtureAcceptanceError("Fixture Acceptance output must not contain '..'")
     requested_output = Path(os.path.abspath(
         output_root
         if output_root.is_absolute()
@@ -1478,6 +1490,12 @@ def accept_phase6_fixtures(
             ".artifacts/phase6/fixture-acceptance"
         )
     definitions = fixture_definitions(repository, requested_output)
+    if language is not None:
+        definitions = tuple(
+            definition for definition in definitions if definition.language is language
+        )
+        if len(definitions) != 1:
+            raise FixtureAcceptanceError("unsupported Phase 6 language")
     commit_sha = verify_repository_provenance(repository)
     selected = discover_toolchain_candidates() if candidates is None else candidates
     results: list[FixtureAcceptanceOutcome] = []

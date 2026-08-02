@@ -453,6 +453,11 @@ def prepare_phase6_campaign(
     if language not in {Language.PYTHON, Language.JAVA, Language.TYPESCRIPT}:
         raise Phase6CampaignError("unsupported Phase 6 language")
     repository = repository_root.resolve(strict=True)
+    acceptance_root = _repository_input_directory(
+        repository,
+        acceptance_root,
+        "Fixture Acceptance root",
+    )
     commit = verify_repository_provenance(repository)
     definition = next(
         item
@@ -603,6 +608,33 @@ def prepare_phase6_campaign(
         plan_sha256=_sha256(plan_bytes),
         plan=plan,
     )
+
+
+def _repository_input_directory(repository: Path, configured: Path, label: str) -> Path:
+    """Resolve one existing repository directory without following symlink components."""
+    if ".." in configured.parts:
+        raise Phase6CampaignError(f"{label} must not contain '..'")
+    candidate = configured if configured.is_absolute() else repository / configured
+    lexical = Path(os.path.abspath(candidate))
+    try:
+        relative = lexical.relative_to(repository)
+    except ValueError as error:
+        raise Phase6CampaignError(f"{label} must remain below repository") from error
+    current = repository
+    for component in relative.parts:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except OSError as error:
+            raise Phase6CampaignError(f"{label} is unavailable") from error
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise Phase6CampaignError(f"{label} contains a link or non-directory")
+    try:
+        resolved = lexical.resolve(strict=True)
+        resolved.relative_to(repository)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise Phase6CampaignError(f"{label} must remain below repository") from error
+    return resolved
 
 
 def load_plan_bound_inputs(

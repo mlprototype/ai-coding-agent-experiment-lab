@@ -579,6 +579,56 @@ def test_phase6_cli_confirmation_stops_before_runtime(monkeypatch: pytest.Monkey
     assert "subprocesses executed: 0" in result.stdout
 
 
+def test_explicit_acceptance_root_is_resolved_without_default_fallback(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    selected = repository / "custom" / "acceptance" / "new-head"
+    selected.mkdir(parents=True)
+
+    assert campaign._repository_input_directory(
+        repository,
+        Path("custom/acceptance/new-head"),
+        "Fixture Acceptance root",
+    ) == selected
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [Path("custom/../acceptance"), Path("../outside")],
+)
+def test_explicit_acceptance_root_rejects_traversal(
+    tmp_path: Path,
+    configured: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    with pytest.raises(Phase6CampaignError, match="must not contain"):
+        campaign._repository_input_directory(
+            repository,
+            configured,
+            "Fixture Acceptance root",
+        )
+
+
+def test_explicit_acceptance_root_rejects_symlink_parent(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (repository / "linked").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(Phase6CampaignError, match="link"):
+        campaign._repository_input_directory(
+            repository,
+            Path("linked/acceptance"),
+            "Fixture Acceptance root",
+        )
+
+
 def test_plan_fixture_hash_uses_phase6_manifest_domain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -603,6 +653,9 @@ def test_plan_fixture_hash_uses_phase6_manifest_domain(
         policy_bytes=inputs.policy_bytes,
     )
     assert plan.fixture_sha256 == inputs.manifest.fixture_sha256
+    assert plan.fixture_acceptance_sha256 == hashlib.sha256(
+        inputs.acceptance_bytes
+    ).hexdigest()
 
 
 def test_run_cli_requires_live_confirmation_before_runtime() -> None:

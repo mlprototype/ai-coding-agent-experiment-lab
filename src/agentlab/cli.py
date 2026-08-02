@@ -13,6 +13,10 @@ from agentlab.gates import RunGatesError, run_gates
 from agentlab.live import LiveCodexError, run_live_codex
 from agentlab.models import EvidenceOverallStatus, LiveOverallStatus
 from agentlab.phase6 import Language, Phase6ContractError
+from agentlab.phase6_approval import (
+    SupplementalApprovalError,
+    prepare_supplemental_live_campaign_approval,
+)
 from agentlab.phase6_campaign import (
     Phase6CampaignError,
     prepare_phase6_campaign,
@@ -44,6 +48,71 @@ app = typer.Typer(
     help="Reproducible AI coding-agent experiment foundation.",
     no_args_is_help=True,
 )
+
+
+@app.command("prepare-phase6-supplemental-approval")
+def prepare_phase6_supplemental_approval_command(
+    spec_path: Annotated[Path, typer.Argument()],
+    approval_id: Annotated[str, typer.Option("--approval-id")],
+    plan_path: Annotated[Path, typer.Option("--plan")],
+    campaign_path: Annotated[Path, typer.Option("--campaign")],
+    accepted_manifest_path: Annotated[
+        Path,
+        typer.Option("--accepted-manifest"),
+    ],
+    prior_provider_call_minimum: Annotated[
+        int,
+        typer.Option("--prior-provider-call-min"),
+    ],
+    prior_provider_call_maximum: Annotated[
+        int,
+        typer.Option("--prior-provider-call-max"),
+    ],
+    output_path: Annotated[Path, typer.Option("--output")],
+    repository_root: Annotated[Path, typer.Option("--repository-root")] = Path("."),
+    confirm_local_execution: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-local-execution",
+            help=(
+                "Create one pending, create-only offline packet. This is not Live "
+                "approval, performs no Provider call, and requires separate human approval."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Prepare a pending Java Live control-plane packet without executing Live work."""
+    if not confirm_local_execution:
+        typer.echo(
+            "prepare-phase6-supplemental-approval stopped: "
+            "--confirm-local-execution is required",
+            err=True,
+        )
+        typer.echo("files created: 0")
+        typer.echo("Provider calls, Prompt transmissions, Gates, and Campaigns: 0")
+        raise typer.Exit(code=2)
+    try:
+        publication = prepare_supplemental_live_campaign_approval(
+            repository_root=repository_root,
+            approval_id=approval_id,
+            spec_path=spec_path,
+            plan_path=plan_path,
+            campaign_path=campaign_path,
+            accepted_manifest_path=accepted_manifest_path,
+            prior_provider_call_minimum=prior_provider_call_minimum,
+            prior_provider_call_maximum=prior_provider_call_maximum,
+            output_path=output_path,
+            confirm_local_execution=True,
+        )
+    except SupplementalApprovalError as error:
+        typer.echo(f"prepare-phase6-supplemental-approval stopped: {error}", err=True)
+        typer.echo("Provider calls, Prompt transmissions, Gates, and Campaigns: 0")
+        raise typer.Exit(code=2) from error
+    typer.echo(f"pending Supplemental Approval: {publication.output_path}")
+    typer.echo(f"bytes: {publication.byte_count}")
+    typer.echo(f"SHA-256: {publication.sha256}")
+    typer.echo("Live approval granted: no; separate human approval is required")
+    typer.echo("Provider calls, Prompt transmissions, Gates, and Campaigns: 0")
 
 
 @app.command("verify-phase6-historical")
@@ -225,6 +294,17 @@ def run_phase6_campaign_command(
 
 @app.command("accept-phase6-fixtures")
 def accept_phase6_fixtures_command(
+    language: Annotated[
+        list[Language] | None,
+        typer.Option(
+            "--language",
+            metavar="LANGUAGE",
+            help=(
+                "Accept exactly one selected language. Omit for the existing "
+                "python, typescript, java sequence; duplicate selection is rejected."
+            ),
+        ),
+    ] = None,
     repository_root: Annotated[
         Path,
         typer.Option(
@@ -239,7 +319,11 @@ def accept_phase6_fixtures_command(
         Path,
         typer.Option(
             "--output-root",
-            help="Create-only .artifacts root for canonical Acceptance records.",
+            help=(
+                "Create-only root below .artifacts/phase6/fixture-acceptance; "
+                "language subdirectories are preserved. Default: "
+                ".artifacts/phase6/fixture-acceptance."
+            ),
         ),
     ] = Path(".artifacts/phase6/fixture-acceptance"),
     confirm_local_execution: Annotated[
@@ -262,11 +346,20 @@ def accept_phase6_fixtures_command(
         typer.echo("local subprocesses executed: 0")
         typer.echo("Provider calls, Prompt transmissions, network, and quota: 0")
         raise typer.Exit(code=2)
+    if language is not None and len(language) != 1:
+        typer.echo(
+            "accept-phase6-fixtures stopped: --language must be supplied at most once",
+            err=True,
+        )
+        typer.echo("local subprocesses executed: 0")
+        typer.echo("Provider calls, Prompt transmissions, network, and quota: 0")
+        raise typer.Exit(code=2)
     try:
         outcome = accept_phase6_fixtures(
             repository_root,
             output_root,
             confirm_local_execution=confirm_local_execution,
+            language=language[0] if language else None,
         )
     except FixtureAcceptanceError as error:
         typer.echo(f"accept-phase6-fixtures stopped: {error}", err=True)
@@ -285,7 +378,12 @@ def accept_phase6_fixtures_command(
     typer.echo(f"engineering minimum met: {outcome.engineering_minimum_met}")
     typer.echo(f"full target met: {outcome.full_target_met}")
     typer.echo("Provider calls, Prompt transmissions, network, and quota: 0")
-    if not outcome.engineering_minimum_met:
+    succeeded = (
+        all(result.status == "accepted" for result in outcome.results)
+        if language
+        else outcome.engineering_minimum_met
+    )
+    if not succeeded:
         raise typer.Exit(code=1)
 
 
