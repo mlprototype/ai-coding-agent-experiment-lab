@@ -50,10 +50,12 @@ from agentlab.phase6 import (
     ArtifactReference,
     LanguageStatus,
     LiveRunArtifactV1_2,
+    LiveRunArtifactV1_3,
     LoadedPhase6Campaign,
     Phase6CampaignOutcome,
     Phase6CampaignRunEvent,
     Phase6ContractError,
+    Phase6LiveRunArtifact,
     Phase6Recording,
     PrimarySuiteSource,
     SourceClass,
@@ -91,7 +93,7 @@ from agentlab.workflow import (
     workflow_prompt_fingerprint,
 )
 
-ReportArtifact = LiveRunArtifact | LiveRunArtifactV1_2
+ReportArtifact = LiveRunArtifact | Phase6LiveRunArtifact
 
 
 @dataclass(frozen=True)
@@ -681,7 +683,7 @@ def _load_phase6_report_inputs(
             "Campaign must retain one terminal state for every planned run"
         )
 
-    artifacts: list[LiveRunArtifactV1_2] = []
+    artifacts: list[Phase6LiveRunArtifact] = []
     recordings: list[Phase6Recording] = []
     evidence_references: list[ArtifactReference] = []
     recording_references: list[ArtifactReference] = []
@@ -702,12 +704,16 @@ def _load_phase6_report_inputs(
             continue
         artifact = load_live_run_artifact_contract(evidence_path)
         recording = load_recording_contract(recording_path)
-        if not isinstance(artifact, LiveRunArtifactV1_2) or not isinstance(
+        if not isinstance(
+            artifact,
+            (LiveRunArtifactV1_2, LiveRunArtifactV1_3),
+        ) or not isinstance(
             recording,
             Phase6Recording,
         ):
             raise WorkflowReportError(
-                f"Workflow Plan 1.2 requires Artifact schema 1.2 for {run.run_id}"
+                "Workflow Plan 1.2 requires Phase 6 Artifact schema 1.2 or "
+                f"1.3 for {run.run_id}"
             )
         evidence_sha256 = hashlib.sha256(canonical_json_bytes(artifact)).hexdigest()
         recording_sha256 = hashlib.sha256(

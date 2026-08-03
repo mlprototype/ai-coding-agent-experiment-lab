@@ -1455,10 +1455,36 @@ class Phase6RecordingTerminalEvent(ContractModel):
         return self
 
 
+class Phase6RecordingStartedEventV1_3(Phase6RecordingStartedEvent):
+    """Recording 1.3 starts the Codex Evidence 1.6 binding."""
+
+    schema_version: Literal["1.3"]  # type: ignore[assignment]
+
+
+class Phase6RecordingTerminalEventV1_3(Phase6RecordingTerminalEvent):
+    schema_version: Literal["1.3"]  # type: ignore[assignment]
+
+    @field_validator("codex", mode="before")
+    @classmethod
+    def nested_codex_schema_is_1_5(cls, value: object) -> object:
+        schema_version: object
+        if isinstance(value, CodexExecutionEvidence):
+            schema_version = value.schema_version
+        elif isinstance(value, dict):
+            schema_version = value.get("schema_version")
+        else:
+            schema_version = None
+        if schema_version != "1.6":
+            raise ValueError(
+                "Recording 1.3 requires unchanged CodexExecutionEvidence 1.6"
+            )
+        return value
+
+
 @dataclass(frozen=True)
 class Phase6Recording:
-    started: Phase6RecordingStartedEvent
-    terminal: Phase6RecordingTerminalEvent
+    started: Phase6RecordingStartedEvent | Phase6RecordingStartedEventV1_3
+    terminal: Phase6RecordingTerminalEvent | Phase6RecordingTerminalEventV1_3
 
 
 RecordingContract = ReplayRecording | Phase6Recording
@@ -1770,7 +1796,31 @@ class LiveRunArtifactV1_2(ContractModel):
         return self
 
 
-LiveRunArtifactContract = LiveRunArtifact | LiveRunArtifactV1_2
+class LiveRunArtifactV1_3(LiveRunArtifactV1_2):
+    """Phase 6 Live artifact bound to Codex Execution Evidence 1.6."""
+
+    schema_version: Literal["1.3"]  # type: ignore[assignment]
+
+    @field_validator("codex", mode="before")
+    @classmethod
+    def nested_codex_schema_is_1_5(cls, value: object) -> object:
+        schema_version: object
+        if isinstance(value, CodexExecutionEvidence):
+            schema_version = value.schema_version
+        elif isinstance(value, dict):
+            schema_version = value.get("schema_version")
+        else:
+            schema_version = None
+        if schema_version != "1.6":
+            raise ValueError(
+                "LiveRunArtifact 1.3 requires unchanged "
+                "CodexExecutionEvidence 1.6"
+            )
+        return value
+
+
+Phase6LiveRunArtifact = LiveRunArtifactV1_2 | LiveRunArtifactV1_3
+LiveRunArtifactContract = LiveRunArtifact | Phase6LiveRunArtifact
 
 
 class HistoricalVerificationRecord(ContractModel):
@@ -2948,17 +2998,29 @@ def _load_phase6_recording_bytes(
     if raw_events is None:
         raw_events = _load_jsonl_objects_bytes(content, "Recording")
     version = raw_events[0].get("schema_version")
-    if (
-        version != "1.2"
-        or len(raw_events) != 2
-        or any(event.get("schema_version") != "1.2" for event in raw_events)
+    if version not in {"1.2", "1.3"} or len(raw_events) != 2 or any(
+        event.get("schema_version") != version for event in raw_events
     ):
         raise Phase6ContractError("Recording must use one supported schema version")
+    started_model: (
+        type[Phase6RecordingStartedEvent]
+        | type[Phase6RecordingStartedEventV1_3]
+    )
+    terminal_model: (
+        type[Phase6RecordingTerminalEvent]
+        | type[Phase6RecordingTerminalEventV1_3]
+    )
+    if version == "1.2":
+        started_model = Phase6RecordingStartedEvent
+        terminal_model = Phase6RecordingTerminalEvent
+    else:
+        started_model = Phase6RecordingStartedEventV1_3
+        terminal_model = Phase6RecordingTerminalEventV1_3
     try:
-        started = Phase6RecordingStartedEvent.model_validate(raw_events[0])
-        terminal = Phase6RecordingTerminalEvent.model_validate(raw_events[1])
+        started = started_model.model_validate(raw_events[0])
+        terminal = terminal_model.model_validate(raw_events[1])
     except ValidationError as error:
-        raise Phase6ContractError(f"invalid Recording 1.2: {error}") from error
+        raise Phase6ContractError(f"invalid Recording {version}: {error}") from error
     if (
         started.run_id != terminal.run_id
         or started.experiment_id != terminal.experiment_id
@@ -2973,12 +3035,14 @@ def _load_phase6_recording_bytes(
         is not terminal.codex.requested_reasoning_effort
         or started.cli_version != terminal.codex.cli_version
     ):
-        raise Phase6ContractError("Recording 1.2 event identities differ")
+        raise Phase6ContractError(f"Recording {version} event identities differ")
     canonical = b"".join(
         _canonical_jsonl_line(event) for event in (started, terminal)
     )
     if content != canonical:
-        raise Phase6ContractError("Recording 1.2 must use canonical JSONL serialization")
+        raise Phase6ContractError(
+            f"Recording {version} must use canonical JSONL serialization"
+        )
     return Phase6Recording(started, terminal)
 
 
@@ -2993,7 +3057,21 @@ def load_live_run_artifact_contract(path: Path) -> LiveRunArtifactContract:
             raise Phase6ContractError(
                 f"invalid LiveRunArtifact: {error}"
             ) from error
-    return _load_live_run_artifact_1_2_bytes(snapshot.content, raw)
+    return _load_phase6_live_run_artifact_bytes(snapshot.content, raw)
+
+
+def _load_phase6_live_run_artifact_bytes(
+    content: bytes,
+    raw: dict[str, Any] | None = None,
+) -> Phase6LiveRunArtifact:
+    if raw is None:
+        raw = _strict_json_bytes(content, "LiveRunArtifact")
+    version = raw.get("schema_version")
+    if version == "1.2":
+        return _load_live_run_artifact_1_2_bytes(content, raw)
+    if version == "1.3":
+        return _load_live_run_artifact_1_3_bytes(content, raw)
+    raise Phase6ContractError("unsupported LiveRunArtifact schema_version")
 
 
 def _load_live_run_artifact_1_2_bytes(
@@ -3011,6 +3089,25 @@ def _load_live_run_artifact_1_2_bytes(
     if content != canonical_json_bytes(artifact):
         raise Phase6ContractError(
             "LiveRunArtifact 1.2 must use canonical JSON serialization"
+        )
+    return artifact
+
+
+def _load_live_run_artifact_1_3_bytes(
+    content: bytes,
+    raw: dict[str, Any] | None = None,
+) -> LiveRunArtifactV1_3:
+    if raw is None:
+        raw = _strict_json_bytes(content, "LiveRunArtifact")
+    if raw.get("schema_version") != "1.3":
+        raise Phase6ContractError("unsupported LiveRunArtifact schema_version")
+    try:
+        artifact = LiveRunArtifactV1_3.model_validate(raw)
+    except ValidationError as error:
+        raise Phase6ContractError(f"invalid LiveRunArtifact: {error}") from error
+    if content != canonical_json_bytes(artifact):
+        raise Phase6ContractError(
+            "LiveRunArtifact 1.3 must use canonical JSON serialization"
         )
     return artifact
 
@@ -3299,7 +3396,7 @@ def validate_data_cutoff(
     fixture_acceptances: list[FixtureAcceptanceRecord],
     campaigns: list[CampaignContract],
     historical_verifications: list[HistoricalVerificationRecord],
-    live_artifacts: Sequence[LiveRunArtifactV1_2] = (),
+    live_artifacts: Sequence[Phase6LiveRunArtifact] = (),
     recordings: Sequence[Phase6Recording] = (),
 ) -> datetime:
     """Require data_cutoff_at to equal the maximum persisted terminal time."""
@@ -3377,7 +3474,7 @@ def validate_public_suite_inputs(
     acceptances: list[FixtureAcceptanceRecord] = []
     campaigns: list[CampaignContract] = []
     historical_records: list[HistoricalVerificationRecord] = []
-    live_artifacts: list[LiveRunArtifactV1_2] = []
+    live_artifacts: list[Phase6LiveRunArtifact] = []
     live_recordings: list[Phase6Recording] = []
 
     for source in loaded.manifest.primary_sources:
@@ -3477,9 +3574,9 @@ def validate_public_suite_inputs(
                 "Live inputs must not exist before every Plan-bound input is present"
             )
 
-        evidence: list[LiveRunArtifactV1_2] = []
+        evidence: list[Phase6LiveRunArtifact] = []
         for reference in source.evidence:
-            artifact = _load_live_run_artifact_1_2_bytes(
+            artifact = _load_phase6_live_run_artifact_bytes(
                 loaded.bytes_by_path[reference.path]
             )
             evidence.append(artifact)
@@ -3619,7 +3716,7 @@ def _validate_primary_live_bindings(
     spec: WorkflowSpecContract | None,
     plan: WorkflowPlanContract | None,
     campaign: CampaignContract | None,
-    evidence: list[LiveRunArtifactV1_2],
+    evidence: list[Phase6LiveRunArtifact],
     recordings: list[Phase6Recording],
 ) -> None:
     if campaign is None:

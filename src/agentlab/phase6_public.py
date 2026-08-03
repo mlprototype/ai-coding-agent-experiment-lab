@@ -38,8 +38,8 @@ from agentlab.phase6 import (
     FixtureManifest,
     HistoricalVerificationRecord,
     Language,
-    LiveRunArtifactV1_2,
     LoadedPhase6Campaign,
+    Phase6LiveRunArtifact,
     PrimarySuiteSource,
     ProviderCoverage,
     PublicChecksums,
@@ -52,8 +52,8 @@ from agentlab.phase6 import (
     ValidatedPublicSuiteInputs,
     WorkflowPlanV1_2,
     _load_canonical_model_bytes,
-    _load_live_run_artifact_1_2_bytes,
     _load_phase6_campaign_bytes,
+    _load_phase6_live_run_artifact_bytes,
     _load_phase6_recording_bytes,
     _load_workflow_plan_1_2_bytes,
     _provider_call_count_from_codex,
@@ -661,7 +661,7 @@ class _PrimaryContext:
     plan: WorkflowPlanV1_2 | None
     campaign: LoadedPhase6Campaign | None
     fixture_manifest: FixtureManifest | None
-    evidence: Mapping[str, tuple[ArtifactReference, LiveRunArtifactV1_2]]
+    evidence: Mapping[str, tuple[ArtifactReference, Phase6LiveRunArtifact]]
     recordings: Mapping[str, ArtifactReference]
 
 
@@ -689,9 +689,9 @@ def _primary_context(
         if source.fixture_manifest is not None
         else None
     )
-    evidence: dict[str, tuple[ArtifactReference, LiveRunArtifactV1_2]] = {}
+    evidence: dict[str, tuple[ArtifactReference, Phase6LiveRunArtifact]] = {}
     for reference in source.evidence:
-        artifact = _load_live_run_artifact_1_2_bytes(
+        artifact = _load_phase6_live_run_artifact_bytes(
             loaded.bytes_by_path[reference.path]
         )
         if artifact.run_id in evidence:
@@ -847,7 +847,7 @@ def _eligible_run_records(
 
 
 def _gate_counts_from_commands(
-    artifact: LiveRunArtifactV1_2,
+    artifact: Phase6LiveRunArtifact,
 ) -> tuple[int, int, int, int, int]:
     """Derive public Gate counts even when post-Gate Metrics are unavailable."""
     acceptance = [

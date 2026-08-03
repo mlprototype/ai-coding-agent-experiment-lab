@@ -58,7 +58,7 @@ from agentlab.phase6 import (
     FixtureManifest,
     GateNotExecutedReason,
     Language,
-    LiveRunArtifactV1_2,
+    LiveRunArtifactV1_3,
     LoadedWorkflowSpecContract,
     Phase6CampaignFinishedEvent,
     Phase6CampaignOutcome,
@@ -66,8 +66,8 @@ from agentlab.phase6 import (
     Phase6CampaignStartedEvent,
     Phase6FailureKind,
     Phase6OverallStatus,
-    Phase6RecordingStartedEvent,
-    Phase6RecordingTerminalEvent,
+    Phase6RecordingStartedEventV1_3,
+    Phase6RecordingTerminalEventV1_3,
     WorkflowExperimentSpecV2_1,
     WorkflowPlanV1_2,
     _canonical_jsonl_line,
@@ -1052,8 +1052,8 @@ def _write_run_outputs(
     spec = inputs.loaded_spec.spec
     assert isinstance(spec, WorkflowExperimentSpecV2_1)
     prompt = inputs.fixed.prompts[run.workflow]
-    recording_started = Phase6RecordingStartedEvent(
-        schema_version="1.2",
+    recording_started = Phase6RecordingStartedEventV1_3(
+        schema_version="1.3",
         sequence=0,
         event_type="run_started",
         run_id=run.run_id,
@@ -1077,8 +1077,8 @@ def _write_run_outputs(
         requested_reasoning_effort=spec.reasoning_effort,
         cli_version=cast(str, codex.cli_version),
     )
-    terminal = Phase6RecordingTerminalEvent(
-        schema_version="1.2",
+    terminal = Phase6RecordingTerminalEventV1_3(
+        schema_version="1.3",
         sequence=1,
         event_type=(
             "run_completed"
@@ -1099,8 +1099,8 @@ def _write_run_outputs(
         workspace_lifecycle=lifecycle,
     )
     recording_bytes = _canonical_jsonl_line(recording_started) + _canonical_jsonl_line(terminal)
-    artifact = LiveRunArtifactV1_2(
-        schema_version="1.2",
+    artifact = LiveRunArtifactV1_3(
+        schema_version="1.3",
         run_id=run.run_id,
         experiment_id=plan_id(inputs),
         task_id=run.task_id,

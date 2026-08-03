@@ -24,14 +24,21 @@ from agentlab.models import (
     CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS,
     CODEX_REQUIRED_EXEC_FLAGS,
     CodexApprovalBasis,
+    CodexArgvIdentity,
+    CodexChildEnvironmentContract,
     CodexCleanupState,
     CodexCliProfile,
+    CodexExecutableIdentity,
+    CodexExecutableIdentityStatus,
     CodexExecutionEvidence,
     CodexExecutionStage,
     CodexFailureStage,
     CodexInvocationState,
     CodexProviderFailureHint,
     CodexRunnerState,
+    CodexStderrDiagnostic,
+    CodexStderrFailureCategory,
+    CodexStderrRuleId,
     CodexStdinWriteState,
     CodexTerminalEvent,
     CommandEvidence,
@@ -63,6 +70,7 @@ from agentlab.phase6 import (
     Language,
     LanguageStatus,
     LiveRunArtifactV1_2,
+    LiveRunArtifactV1_3,
     LoadedPhase6Campaign,
     Phase6CampaignFinishedEvent,
     Phase6CampaignOutcome,
@@ -74,7 +82,9 @@ from agentlab.phase6 import (
     Phase6PathError,
     Phase6Recording,
     Phase6RecordingStartedEvent,
+    Phase6RecordingStartedEventV1_3,
     Phase6RecordingTerminalEvent,
+    Phase6RecordingTerminalEventV1_3,
     PrimarySuiteSource,
     ProtectedPathPolicy,
     ProviderCoverage,
@@ -513,6 +523,48 @@ def _successful_codex(
     )
 
 
+def _successful_codex_1_6(
+    *,
+    model: str,
+    reasoning_effort: Any,
+    prompt_bytes: int,
+) -> CodexExecutionEvidence:
+    payload = _successful_codex(
+        model=model,
+        reasoning_effort=reasoning_effort,
+        prompt_bytes=prompt_bytes,
+    ).model_dump(mode="python")
+    payload.update(
+        {
+            "schema_version": "1.6",
+            "stderr_diagnostic": CodexStderrDiagnostic(
+                stderr_bytes=0,
+                stderr_sha256=hashlib.sha256(b"").hexdigest(),
+                stderr_truncated=False,
+                stderr_nonempty=False,
+                failure_category=CodexStderrFailureCategory.NOT_APPLICABLE,
+                rule_id=CodexStderrRuleId.NOT_APPLICABLE,
+            ),
+            "executable_identity": CodexExecutableIdentity(
+                status=CodexExecutableIdentityStatus.VERIFIED,
+                sha256=HASH_A,
+            ),
+            "argv_identity": CodexArgvIdentity(
+                profile_id=CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2,
+                sha256=HASH_B,
+                prompt_in_argv=False,
+            ),
+            "child_environment": CodexChildEnvironmentContract(
+                codex_home_included=True,
+                credential_environment_excluded=True,
+                path_from_allowlist=True,
+                cwd_verified_ephemeral_workspace=True,
+            ),
+        }
+    )
+    return CodexExecutionEvidence.model_validate(payload)
+
+
 def _provider_unavailable_codex(
     *,
     model: str,
@@ -688,7 +740,8 @@ def _successful_live_pair(
     plan: WorkflowPlanV1_2,
     plan_sha256: str,
     run: Any,
-) -> tuple[LiveRunArtifactV1_2, Phase6Recording, str]:
+    diagnostics_1_6: bool = False,
+) -> tuple[LiveRunArtifactV1_2 | LiveRunArtifactV1_3, Phase6Recording, str]:
     prompt_sha256 = (
         plan.one_shot_prompt_sha256
         if run.workflow is Workflow.ONE_SHOT
@@ -699,7 +752,8 @@ def _successful_live_pair(
         if run.workflow is Workflow.ONE_SHOT
         else plan.staged_prompt_bytes
     )
-    codex = _successful_codex(
+    codex_factory = _successful_codex_1_6 if diagnostics_1_6 else _successful_codex
+    codex = codex_factory(
         model=plan.model,
         reasoning_effort=plan.reasoning_effort,
         prompt_bytes=prompt_bytes,
@@ -716,8 +770,13 @@ def _successful_live_pair(
         line_counts_complete=True,
         collection_error=None,
     )
-    started = Phase6RecordingStartedEvent(
-        schema_version="1.2",
+    started_model = (
+        Phase6RecordingStartedEventV1_3
+        if diagnostics_1_6
+        else Phase6RecordingStartedEvent
+    )
+    started = started_model(
+        schema_version="1.3" if diagnostics_1_6 else "1.2",  # type: ignore[arg-type]
         sequence=0,
         event_type="run_started",
         run_id=run.run_id,
@@ -741,8 +800,13 @@ def _successful_live_pair(
         requested_reasoning_effort=plan.reasoning_effort,
         cli_version=codex.cli_version,
     )
-    terminal = Phase6RecordingTerminalEvent(
-        schema_version="1.2",
+    terminal_model = (
+        Phase6RecordingTerminalEventV1_3
+        if diagnostics_1_6
+        else Phase6RecordingTerminalEvent
+    )
+    terminal = terminal_model(
+        schema_version="1.3" if diagnostics_1_6 else "1.2",  # type: ignore[arg-type]
         sequence=1,
         event_type="run_completed",
         run_id=run.run_id,
@@ -762,8 +826,9 @@ def _successful_live_pair(
     recording_sha256 = hashlib.sha256(
         f"recording:{run.run_id}".encode()
     ).hexdigest()
-    artifact = LiveRunArtifactV1_2(
-        schema_version="1.2",
+    artifact_model = LiveRunArtifactV1_3 if diagnostics_1_6 else LiveRunArtifactV1_2
+    artifact = artifact_model(
+        schema_version="1.3" if diagnostics_1_6 else "1.2",  # type: ignore[arg-type]
         run_id=run.run_id,
         experiment_id=plan.experiment_id,
         task_id=run.task_id,
@@ -803,12 +868,14 @@ def _successful_live_pair(
 
 def _cross_artifact_case(
     tmp_path: Path,
+    *,
+    diagnostics_1_6: bool = False,
 ) -> tuple[
     PrimarySuiteSource,
     WorkflowExperimentSpecV2_1,
     WorkflowPlanV1_2,
     LoadedPhase6Campaign,
-    list[LiveRunArtifactV1_2],
+    list[LiveRunArtifactV1_2 | LiveRunArtifactV1_3],
     list[Phase6Recording],
 ]:
     fixture_manifest, policy, acceptance = _fixture_contracts()
@@ -840,7 +907,7 @@ def _cross_artifact_case(
             occurred_at=T0,
         )
     ]
-    artifacts: list[LiveRunArtifactV1_2] = []
+    artifacts: list[LiveRunArtifactV1_2 | LiveRunArtifactV1_3] = []
     recordings: list[Phase6Recording] = []
     recording_hashes: list[str] = []
     for index, run in enumerate(plan.runs):
@@ -892,6 +959,7 @@ def _cross_artifact_case(
             plan=plan,
             plan_sha256=plan_sha256,
             run=run,
+            diagnostics_1_6=diagnostics_1_6,
         )
         artifacts.append(artifact)
         recordings.append(recording)
@@ -976,8 +1044,12 @@ def _write_phase6_report_case(
     tmp_path: Path,
     *,
     incomplete_pair: bool = False,
+    diagnostics_1_6: bool = False,
 ) -> tuple[Path, Path, Path, WorkflowPlanV1_2]:
-    _, _, plan, campaign, artifacts, recordings = _cross_artifact_case(tmp_path)
+    _, _, plan, campaign, artifacts, recordings = _cross_artifact_case(
+        tmp_path,
+        diagnostics_1_6=diagnostics_1_6,
+    )
     manifest, policy, acceptance = _fixture_contracts()
     spec_path = tmp_path / "workflow.yaml"
     plan_path = tmp_path / "plan.json"
@@ -1114,6 +1186,21 @@ def test_workflow_report_accepts_strict_plan_1_2_complete_pair(
     assert created.pairing == report.pairing
     assert output_path.is_file()
     assert markdown_path.is_file()
+
+
+def test_workflow_report_accepts_phase6_diagnostic_schema_complete_pair(
+    tmp_path: Path,
+) -> None:
+    spec_path, plan_path, campaign_path, _plan = _write_phase6_report_case(
+        tmp_path,
+        diagnostics_1_6=True,
+    )
+
+    report = aggregate_workflow_campaign(spec_path, plan_path, campaign_path)
+
+    assert report.pairing.status is Estimability.ESTIMABLE
+    assert report.pairing.complete_pair_count == 1
+    assert [item.completed_runs for item in report.workflows] == [1, 1]
 
 
 def test_workflow_report_preserves_plan_1_1_not_run_aggregation(
@@ -1467,6 +1554,52 @@ def test_cross_validator_rejects_artifact_provenance_mismatch(
     )
     changed = list(artifacts)
     changed[0] = changed[0].model_copy(update={field: value})
+
+    with pytest.raises(Phase6ContractError, match="identities differ"):
+        _validate_primary_live_bindings(
+            source=source,
+            spec=spec,
+            plan=plan,
+            campaign=campaign,
+            evidence=changed,
+            recordings=recordings,
+        )
+
+
+def test_cross_validator_accepts_phase6_diagnostic_schema(tmp_path: Path) -> None:
+    source, spec, plan, campaign, artifacts, recordings = _cross_artifact_case(
+        tmp_path,
+        diagnostics_1_6=True,
+    )
+
+    _validate_primary_live_bindings(
+        source=source,
+        spec=spec,
+        plan=plan,
+        campaign=campaign,
+        evidence=artifacts,
+        recordings=recordings,
+    )
+
+
+def test_cross_validator_rejects_diagnostic_binding_drift(tmp_path: Path) -> None:
+    source, spec, plan, campaign, artifacts, recordings = _cross_artifact_case(
+        tmp_path,
+        diagnostics_1_6=True,
+    )
+    changed = list(artifacts)
+    codex = changed[0].codex
+    assert codex.stderr_diagnostic is not None
+    changed_diagnostic = codex.stderr_diagnostic.model_copy(
+        update={"stderr_sha256": HASH_C}
+    )
+    changed[0] = changed[0].model_copy(
+        update={
+            "codex": codex.model_copy(
+                update={"stderr_diagnostic": changed_diagnostic}
+            )
+        }
+    )
 
     with pytest.raises(Phase6ContractError, match="identities differ"):
         _validate_primary_live_bindings(

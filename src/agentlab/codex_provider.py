@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
 import selectors
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -23,8 +25,12 @@ from agentlab.models import (
     CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS,
     CODEX_REQUIRED_EXEC_FLAGS,
     CodexApprovalBasis,
+    CodexArgvIdentity,
+    CodexChildEnvironmentContract,
     CodexCleanupState,
     CodexCliProfile,
+    CodexExecutableIdentity,
+    CodexExecutableIdentityStatus,
     CodexExecutionEvidence,
     CodexExecutionStage,
     CodexFailureStage,
@@ -32,6 +38,9 @@ from agentlab.models import (
     CodexItemType,
     CodexProviderFailureHint,
     CodexRunnerState,
+    CodexStderrDiagnostic,
+    CodexStderrFailureCategory,
+    CodexStderrRuleId,
     CodexStdinWriteState,
     CodexTerminalEvent,
     CommandStatus,
@@ -74,8 +83,9 @@ _PROVIDER_ENV_ALLOWLIST = (
     "PATHEXT",
 )
 REQUIRED_CODEX_EXEC_FLAGS = CODEX_REQUIRED_EXEC_FLAGS
-CODEX_EVIDENCE_SCHEMA_VERSION: Literal["1.5"] = "1.5"
+CODEX_EVIDENCE_SCHEMA_VERSION: Literal["1.6"] = "1.6"
 _MAX_FAILURE_MESSAGE_BYTES = 4096
+_EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _SAFE_ITEM_TYPES = frozenset(
     item_type.value
     for item_type in CodexItemType
@@ -160,6 +170,198 @@ _FAILURE_HINT_PATTERNS: tuple[
         ),
     ),
 )
+
+_PATH_ALIAS_WARNING = re.compile(
+    r"^warning: proceeding, even though we could not create path aliases: "
+    r"operation not permitted \(os error 1\)$"
+)
+_STDERR_CLASSIFIER_RULES: tuple[
+    tuple[
+        CodexStderrFailureCategory,
+        CodexStderrRuleId,
+        tuple[re.Pattern[str], ...],
+    ],
+    ...,
+] = (
+    (
+        CodexStderrFailureCategory.AUTHENTICATION,
+        CodexStderrRuleId.AUTHENTICATION_REQUIRED,
+        tuple(
+            re.compile(pattern)
+            for pattern in (
+                r"\bauthentication (?:failed|required)\b",
+                r"\bunauthori[sz]ed\b",
+                r"\bnot (?:logged|signed) in\b",
+                r"\b(?:login|sign[- ]in) required\b",
+                r"\binvalid (?:api )?key\b",
+            )
+        ),
+    ),
+    (
+        CodexStderrFailureCategory.QUOTA_OR_RATE_LIMIT,
+        CodexStderrRuleId.QUOTA_OR_RATE_LIMIT,
+        tuple(
+            re.compile(pattern)
+            for pattern in (
+                r"\brate limit(?:ed|ing)?\b",
+                r"\bquota (?:exceeded|exhausted)\b",
+                r"\btoo many requests\b",
+                r"\bresource exhausted\b",
+                r"\busage limit\b",
+            )
+        ),
+    ),
+    (
+        CodexStderrFailureCategory.MODEL_ACCESS,
+        CodexStderrRuleId.MODEL_ACCESS,
+        tuple(
+            re.compile(pattern)
+            for pattern in (
+                r"\bmodel\b.{0,80}\b(?:not found|not available|unsupported)\b",
+                r"\bmodel\b.{0,80}\baccess denied\b",
+                r"\b(?:no|without|denied) access\b.{0,80}\bmodel\b",
+            )
+        ),
+    ),
+    (
+        CodexStderrFailureCategory.STRICT_CONFIG_OR_OPTION,
+        CodexStderrRuleId.STRICT_CONFIG_OR_OPTION,
+        tuple(
+            re.compile(pattern)
+            for pattern in (
+                r"\bunknown (?:configuration|config) (?:field|key)\b",
+                r"\bunknown option\b",
+                r"\bunrecognized option\b",
+                r"\bunexpected argument\b",
+                r"\binvalid value\b.{0,80}\b(?:option|argument|config)\b",
+                r"\bstrict config(?:uration)?\b.{0,80}\b(?:failed|error|invalid)\b",
+            )
+        ),
+    ),
+    (
+        CodexStderrFailureCategory.PERMISSION,
+        CodexStderrRuleId.PERMISSION_DENIED,
+        tuple(
+            re.compile(pattern)
+            for pattern in (
+                r"\bpermission denied\b",
+                r"\boperation not permitted\b",
+                r"\baccess denied\b",
+            )
+        ),
+    ),
+    (
+        CodexStderrFailureCategory.PROVIDER_SERVICE,
+        CodexStderrRuleId.PROVIDER_SERVICE,
+        tuple(
+            re.compile(pattern)
+            for pattern in (
+                r"\bservice unavailable\b",
+                r"\binternal server error\b",
+                r"\bbad gateway\b",
+                r"\bgateway timeout\b",
+                r"\btemporarily unavailable\b",
+                r"\boverloaded\b",
+            )
+        ),
+    ),
+)
+
+
+def _classify_stderr(
+    content: bytes,
+) -> tuple[CodexStderrFailureCategory, CodexStderrRuleId]:
+    try:
+        decoded = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return (
+            CodexStderrFailureCategory.UNKNOWN,
+            CodexStderrRuleId.UNCLASSIFIED,
+        )
+    relevant_lines = [
+        line
+        for line in decoded.casefold().splitlines()
+        if not _PATH_ALIAS_WARNING.fullmatch(line.strip())
+    ]
+    normalized = "\n".join(relevant_lines)
+    for category, rule_id, patterns in _STDERR_CLASSIFIER_RULES:
+        if any(pattern.search(normalized) for pattern in patterns):
+            return category, rule_id
+    return CodexStderrFailureCategory.UNKNOWN, CodexStderrRuleId.UNCLASSIFIED
+
+
+@dataclass
+class _StderrAccumulator:
+    max_classification_bytes: int
+    byte_count: int = 0
+    truncated: bool = False
+    _content: bytearray = field(default_factory=bytearray, repr=False)
+    _hasher: Any = field(default_factory=hashlib.sha256, repr=False)
+
+    def feed(self, chunk: bytes) -> None:
+        self.byte_count += len(chunk)
+        self._hasher.update(chunk)
+        remaining = max(self.max_classification_bytes - len(self._content), 0)
+        if remaining:
+            self._content.extend(chunk[:remaining])
+        if self.byte_count > self.max_classification_bytes:
+            self.truncated = True
+
+    def diagnostic(self, *, exit_code: int | None) -> CodexStderrDiagnostic:
+        nonzero = exit_code is not None and exit_code != 0
+        if not nonzero:
+            category = CodexStderrFailureCategory.NOT_APPLICABLE
+            rule_id = CodexStderrRuleId.NOT_APPLICABLE
+        elif self.truncated:
+            category = CodexStderrFailureCategory.UNKNOWN
+            rule_id = CodexStderrRuleId.UNCLASSIFIED
+        else:
+            category, rule_id = _classify_stderr(bytes(self._content))
+        return CodexStderrDiagnostic(
+            stderr_bytes=self.byte_count,
+            stderr_sha256=self._hasher.hexdigest(),
+            stderr_truncated=self.truncated,
+            stderr_nonempty=self.byte_count > 0,
+            failure_category=category,
+            rule_id=rule_id,
+        )
+
+
+def _empty_stderr_diagnostic() -> CodexStderrDiagnostic:
+    return CodexStderrDiagnostic(
+        stderr_bytes=0,
+        stderr_sha256=_EMPTY_SHA256,
+        stderr_truncated=False,
+        stderr_nonempty=False,
+        failure_category=CodexStderrFailureCategory.NOT_APPLICABLE,
+        rule_id=CodexStderrRuleId.NOT_APPLICABLE,
+    )
+
+
+def _unavailable_executable_identity() -> CodexExecutableIdentity:
+    return CodexExecutableIdentity(
+        status=CodexExecutableIdentityStatus.UNAVAILABLE,
+        sha256=None,
+    )
+
+
+def _stderr_diagnostic_for_exit(
+    diagnostic: CodexStderrDiagnostic,
+    exit_code: int | None,
+) -> CodexStderrDiagnostic:
+    if (
+        exit_code is not None
+        and exit_code != 0
+        and diagnostic.failure_category
+        is CodexStderrFailureCategory.NOT_APPLICABLE
+    ):
+        return diagnostic.model_copy(
+            update={
+                "failure_category": CodexStderrFailureCategory.UNKNOWN,
+                "rule_id": CodexStderrRuleId.UNCLASSIFIED,
+            }
+        )
+    return diagnostic
 
 
 def _classify_failure_message(message: str) -> CodexProviderFailureHint:
@@ -290,6 +492,7 @@ class CodexPreflight:
     cli_profile: Literal[CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2]
     checked_at: datetime
     verified_flags: tuple[str, ...]
+    executable_identity: CodexExecutableIdentity
 
 
 @dataclass(frozen=True)
@@ -329,6 +532,11 @@ class CodexLifecycleTracker:
     return_code: int | None = None
     stderr_bytes: int = 0
     stderr_truncated: bool = False
+    stderr_diagnostic: CodexStderrDiagnostic = field(
+        default_factory=_empty_stderr_diagnostic
+    )
+    argv_identity: CodexArgvIdentity | None = None
+    child_environment: CodexChildEnvironmentContract | None = None
     stdout_limit_exceeded: bool = False
     stdin_write_state: CodexStdinWriteState = CodexStdinWriteState.NOT_STARTED
     stdin_bytes_written: int | None = 0
@@ -973,7 +1181,37 @@ def preflight_codex(
         cli_profile=CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2,
         checked_at=checked_at,
         verified_flags=verified_flags,
+        executable_identity=_executable_identity(executable),
     )
+
+
+def _executable_identity(executable: str) -> CodexExecutableIdentity:
+    descriptor: int | None = None
+    try:
+        resolved = Path(executable).resolve(strict=True)
+        descriptor = os.open(
+            resolved,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("Codex executable is not regular")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, _READ_CHUNK_BYTES):
+            digest.update(chunk)
+        return CodexExecutableIdentity(
+            status=CodexExecutableIdentityStatus.VERIFIED,
+            sha256=digest.hexdigest(),
+        )
+    except (OSError, RuntimeError):
+        return CodexExecutableIdentity(
+            status=CodexExecutableIdentityStatus.UNAVAILABLE,
+            sha256=None,
+        )
+    finally:
+        if descriptor is not None:
+            with suppress(OSError):
+                os.close(descriptor)
 
 
 def build_codex_argv(
@@ -1006,6 +1244,32 @@ def build_codex_argv(
         'web_search="disabled"',
         "-",
     ]
+
+
+def build_codex_argv_identity(argv: list[str]) -> CodexArgvIdentity:
+    """Hash a canonical argv representation without its absolute executable path."""
+    if len(argv) < 2 or argv[-1] != "-":
+        raise ValueError("Codex argv identity requires the fixed stdin profile")
+    canonical = json.dumps(
+        ["<codex-executable>", *argv[1:]],
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return CodexArgvIdentity(
+        profile_id=CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2,
+        sha256=hashlib.sha256(canonical).hexdigest(),
+        prompt_in_argv=False,
+    )
+
+
+def _child_environment_contract() -> CodexChildEnvironmentContract:
+    return CodexChildEnvironmentContract(
+        codex_home_included=True,
+        credential_environment_excluded=True,
+        path_from_allowlist=True,
+        cwd_verified_ephemeral_workspace=True,
+    )
 
 
 def build_codex_environment(
@@ -1105,6 +1369,10 @@ def _preflight_failure_evidence(
         stderr_bytes=0,
         stdout_limit_exceeded=False,
         stderr_truncated=False,
+        stderr_diagnostic=_empty_stderr_diagnostic(),
+        executable_identity=_unavailable_executable_identity(),
+        argv_identity=None,
+        child_environment=None,
         termination=error.termination,
     )
 
@@ -1175,6 +1443,10 @@ def post_preflight_failure_evidence(
         stderr_bytes=0,
         stdout_limit_exceeded=False,
         stderr_truncated=False,
+        stderr_diagnostic=_empty_stderr_diagnostic(),
+        executable_identity=preflight.executable_identity,
+        argv_identity=None,
+        child_environment=None,
         termination=termination_without_signal(),
     )
 
@@ -1262,6 +1534,13 @@ def lifecycle_failure_evidence(
         stderr_bytes=lifecycle.stderr_bytes,
         stdout_limit_exceeded=lifecycle.stdout_limit_exceeded,
         stderr_truncated=lifecycle.stderr_truncated,
+        stderr_diagnostic=_stderr_diagnostic_for_exit(
+            lifecycle.stderr_diagnostic,
+            lifecycle.return_code,
+        ),
+        executable_identity=preflight.executable_identity,
+        argv_identity=lifecycle.argv_identity,
+        child_environment=lifecycle.child_environment,
         termination=lifecycle.termination,
     )
 
@@ -1354,6 +1633,7 @@ class CodexProcessRunner:
                 model=live.model,
                 reasoning_effort=live.reasoning_effort,
             )
+            self.lifecycle.argv_identity = build_codex_argv_identity(argv)
         except Exception:
             return self._result_from_evidence(
                 lambda: post_preflight_failure_evidence(
@@ -1370,6 +1650,7 @@ class CodexProcessRunner:
                 environment_root,
                 parent_environment=parent_environment,
             )
+            self.lifecycle.child_environment = _child_environment_contract()
         except Exception:
             return self._result_from_evidence(
                 lambda: post_preflight_failure_evidence(
@@ -1515,6 +1796,7 @@ class CodexProcessRunner:
         prompt_offset = 0
         stderr_bytes = 0
         stderr_truncated = False
+        stderr_accumulator = _StderrAccumulator(max_provider_output_bytes)
         failure_kind: LiveFailureKind | None = None
         timed_out = False
         termination = termination_without_signal()
@@ -1596,9 +1878,9 @@ class CodexProcessRunner:
                         protocol_error = error
                         failure_kind = error.failure_kind
                 else:
-                    stderr_bytes += len(chunk)
-                    if stderr_bytes > max_provider_output_bytes:
-                        stderr_truncated = True
+                    stderr_accumulator.feed(chunk)
+                    stderr_bytes = stderr_accumulator.byte_count
+                    stderr_truncated = stderr_accumulator.truncated
                     self.lifecycle.stderr_bytes = stderr_bytes
                     self.lifecycle.stderr_truncated = stderr_truncated
 
@@ -1700,6 +1982,9 @@ class CodexProcessRunner:
         self.lifecycle.return_code = return_code
         self.lifecycle.stderr_bytes = stderr_bytes
         self.lifecycle.stderr_truncated = stderr_truncated
+        self.lifecycle.stderr_diagnostic = stderr_accumulator.diagnostic(
+            exit_code=return_code
+        )
         summary = parser.summary()
         if protocol_error is None:
             try:
@@ -1890,6 +2175,13 @@ class CodexProcessRunner:
             stderr_bytes=stderr_bytes,
             stdout_limit_exceeded=stdout_limit_exceeded,
             stderr_truncated=stderr_truncated,
+            stderr_diagnostic=_stderr_diagnostic_for_exit(
+                self.lifecycle.stderr_diagnostic,
+                exit_code,
+            ),
+            executable_identity=preflight.executable_identity,
+            argv_identity=self.lifecycle.argv_identity,
+            child_environment=self.lifecycle.child_environment,
             termination=termination,
         )
 
@@ -1949,5 +2241,9 @@ def unsupported_platform_evidence(
         stderr_bytes=0,
         stdout_limit_exceeded=False,
         stderr_truncated=False,
+        stderr_diagnostic=_empty_stderr_diagnostic(),
+        executable_identity=preflight.executable_identity,
+        argv_identity=None,
+        child_environment=None,
         termination=termination_without_signal(),
     )

@@ -220,10 +220,17 @@ def _ready_suite(tmp_path: Path) -> tuple[Path, Path]:
     return root, manifest_path
 
 
-def _evaluated_suite(tmp_path: Path) -> tuple[Path, Path]:
+def _evaluated_suite(
+    tmp_path: Path,
+    *,
+    diagnostics_1_6: bool = False,
+) -> tuple[Path, Path]:
     root = tmp_path / "evaluated-inputs"
     root.mkdir(parents=True)
-    source, _spec, plan, campaign, artifacts, recordings = _cross_artifact_case(root)
+    source, _spec, plan, campaign, artifacts, recordings = _cross_artifact_case(
+        root,
+        diagnostics_1_6=diagnostics_1_6,
+    )
     fixture, policy, acceptance = _fixture_contracts()
     core = {
         "fixture.manifest.json": canonical_json_bytes(fixture),
@@ -431,6 +438,17 @@ def test_evaluated_suite_emits_plan_indexed_allowlisted_run_records(
     assert "prompt" not in record
     assert "raw_provider_output" not in record
     assert "unified_diff" not in record
+    report = json.loads(rendered.files["languages/python/report.json"])
+    assert report["status"] == "evaluated"
+    assert report["complete_pair_count"] == 1
+
+
+def test_public_suite_accepts_phase6_diagnostic_schema(tmp_path: Path) -> None:
+    root, manifest_path = _evaluated_suite(tmp_path, diagnostics_1_6=True)
+
+    rendered = render_public_suite(_validated(root, manifest_path))
+
+    assert "runs/python/000.json" in rendered.files
     report = json.loads(rendered.files["languages/python/report.json"])
     assert report["status"] == "evaluated"
     assert report["complete_pair_count"] == 1

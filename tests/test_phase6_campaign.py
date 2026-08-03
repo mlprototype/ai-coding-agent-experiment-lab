@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -8,15 +9,24 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from test_phase6 import _successful_codex
+from test_codex_provider import _run_nonzero_stderr
+from test_phase6 import _successful_codex as _legacy_successful_codex
 from typer.testing import CliRunner
 
 import agentlab.phase6_campaign as campaign
 from agentlab.cli import app
 from agentlab.live import PromptInput
 from agentlab.models import (
+    CodexArgvIdentity,
+    CodexChildEnvironmentContract,
+    CodexCliProfile,
+    CodexExecutableIdentity,
+    CodexExecutableIdentityStatus,
     CodexExecutionEvidence,
     CodexFailureStage,
+    CodexStderrDiagnostic,
+    CodexStderrFailureCategory,
+    CodexStderrRuleId,
     CodexTerminalEvent,
     CommandEvidence,
     CommandStatus,
@@ -37,6 +47,7 @@ from agentlab.phase6 import (
     GateAcceptanceSummary,
     Language,
     LoadedWorkflowSpecContract,
+    Phase6ContractError,
     ProtectedPathPolicy,
     ToolchainComponent,
     ToolchainComponentRole,
@@ -63,6 +74,48 @@ from agentlab.workspace import snapshot_directory
 
 HASH = "a" * 64
 COMMIT = "1" * 40
+
+
+def _successful_codex(
+    *,
+    model: str,
+    reasoning_effort: Any,
+    prompt_bytes: int,
+) -> CodexExecutionEvidence:
+    payload = _legacy_successful_codex(
+        model=model,
+        reasoning_effort=reasoning_effort,
+        prompt_bytes=prompt_bytes,
+    ).model_dump(mode="python")
+    payload.update(
+        {
+            "schema_version": "1.6",
+            "stderr_diagnostic": CodexStderrDiagnostic(
+                stderr_bytes=0,
+                stderr_sha256=hashlib.sha256(b"").hexdigest(),
+                stderr_truncated=False,
+                stderr_nonempty=False,
+                failure_category=CodexStderrFailureCategory.NOT_APPLICABLE,
+                rule_id=CodexStderrRuleId.NOT_APPLICABLE,
+            ),
+            "executable_identity": CodexExecutableIdentity(
+                status=CodexExecutableIdentityStatus.VERIFIED,
+                sha256=HASH,
+            ),
+            "argv_identity": CodexArgvIdentity(
+                profile_id=CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2,
+                sha256=HASH,
+                prompt_in_argv=False,
+            ),
+            "child_environment": CodexChildEnvironmentContract(
+                codex_home_included=True,
+                credential_environment_excluded=True,
+                path_from_allowlist=True,
+                cwd_verified_ephemeral_workspace=True,
+            ),
+        }
+    )
+    return CodexExecutionEvidence.model_validate(payload)
 
 
 def _toolchain() -> ToolchainIdentity:
@@ -385,10 +438,26 @@ def _failed_provider_evidence(
             "terminal_event": CodexTerminalEvent.NONE,
             "turn_completed_count": 0,
             "exit_code": 1,
+            "stderr_diagnostic": CodexStderrDiagnostic(
+                stderr_bytes=0,
+                stderr_sha256=hashlib.sha256(b"").hexdigest(),
+                stderr_truncated=False,
+                stderr_nonempty=False,
+                failure_category=CodexStderrFailureCategory.UNKNOWN,
+                rule_id=CodexStderrRuleId.UNCLASSIFIED,
+            ),
         }
     )
     if failure is LiveFailureKind.PROVIDER_TIMEOUT:
         success["exit_code"] = -15
+        success["stderr_diagnostic"] = CodexStderrDiagnostic(
+            stderr_bytes=0,
+            stderr_sha256=hashlib.sha256(b"").hexdigest(),
+            stderr_truncated=False,
+            stderr_nonempty=False,
+            failure_category=CodexStderrFailureCategory.UNKNOWN,
+            rule_id=CodexStderrRuleId.UNCLASSIFIED,
+        )
         success["termination"] = TerminationEvidence(
             reason=TerminationReason.TIMEOUT,
             sigterm_sent=True,
@@ -435,7 +504,15 @@ def test_fake_campaign_accepts_allowed_diff_and_strict_reloads(
     assert load_campaign_contract(campaign_path).finished.provider_call_count == 2  # type: ignore[union-attr]
     for run in inputs.plan.runs:
         artifact = load_live_run_artifact_contract(inputs.spec_path.parent / run.evidence_path)
+        assert artifact.schema_version == "1.3"  # type: ignore[union-attr]
+        assert artifact.codex.schema_version == "1.6"  # type: ignore[union-attr]
         assert artifact.overall_status.value == "passed"  # type: ignore[union-attr]
+        recording = load_recording_contract(
+            inputs.spec_path.parent / run.recording_path
+        )
+        assert recording.started.schema_version == "1.3"  # type: ignore[union-attr]
+        assert recording.terminal.schema_version == "1.3"  # type: ignore[union-attr]
+        assert recording.terminal.codex.schema_version == "1.6"  # type: ignore[union-attr]
 
 
 def test_output_contract_violation_runs_zero_gates(
@@ -1161,3 +1238,122 @@ def test_diff_policy_rejects_create_delete_hardlink_and_special_file(
     )
     assert outcome.provider_call_count == 2
     assert gate_calls == 0
+
+
+def test_fake_provider_secrets_never_reach_phase6_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = _inputs(tmp_path)
+    _patch_inputs(monkeypatch, inputs)
+    stderr = (
+        b"authentication required token=fake-token-123 "
+        b"api_key=fake-api-key-456 user=synthetic-user "
+        b"path=/Users/synthetic-user/private"
+    )
+    raw_prompts = tuple(prompt.content for prompt in inputs.fixed.prompts.values())
+    call_count = 0
+
+    def provider(**kwargs: Any) -> CodexExecutionEvidence:
+        nonlocal call_count
+        call_count += 1
+        provider_root = tmp_path / f"fake-provider-{call_count}"
+        provider_root.mkdir()
+        evidence = _run_nonzero_stderr(
+            provider_root,
+            stderr,
+        )
+        return evidence.model_copy(
+            update={
+                "requested_model": inputs.plan.model,
+                "requested_reasoning_effort": inputs.plan.reasoning_effort,
+                "stdin_bytes_written": len(kwargs["prompt"]),
+                "stdin_bytes_total": len(kwargs["prompt"]),
+            }
+        )
+
+    campaign_path = inputs.artifact_root / "campaign.jsonl"
+    campaign.run_phase6_campaign(
+        tmp_path,
+        inputs.spec_path,
+        inputs.plan_path,
+        campaign_path,
+        confirm_live_codex=True,
+        confirm_provider_calls=2,
+        provider_executor=provider,
+    )
+
+    persisted = bytearray(campaign_path.read_bytes())
+    for run in inputs.plan.runs:
+        for relative in (run.recording_path, run.evidence_path):
+            path = inputs.spec_path.parent / relative
+            if path.exists():
+                persisted.extend(path.read_bytes())
+    for forbidden in (
+        stderr,
+        b"fake-token-123",
+        b"fake-api-key-456",
+        b"synthetic-user",
+        b"/Users/synthetic-user/private",
+        *raw_prompts,
+    ):
+        assert forbidden not in persisted
+
+    first_run = inputs.plan.runs[0]
+    evidence_path = inputs.spec_path.parent / first_run.evidence_path
+    recording_path = inputs.spec_path.parent / first_run.recording_path
+    artifact = load_live_run_artifact_contract(evidence_path)
+    recording = load_recording_contract(recording_path)
+    assert artifact.schema_version == "1.3"  # type: ignore[union-attr]
+    assert artifact.codex.schema_version == "1.6"  # type: ignore[union-attr]
+    assert recording.started.schema_version == "1.3"  # type: ignore[union-attr]
+    assert recording.terminal.codex == artifact.codex  # type: ignore[union-attr]
+
+    original = json.loads(evidence_path.read_text(encoding="utf-8"))
+    mutated_path = tmp_path / "mutated-evidence.json"
+    mutations = []
+    unknown = json.loads(json.dumps(original))
+    unknown["unexpected"] = True
+    mutations.append(canonical_json_bytes(unknown))
+    missing = json.loads(json.dumps(original))
+    del missing["codex"]["stderr_diagnostic"]
+    mutations.append(canonical_json_bytes(missing))
+    strict_bool = json.loads(json.dumps(original))
+    strict_bool["codex"]["stderr_diagnostic"]["stderr_bytes"] = True
+    mutations.append(canonical_json_bytes(strict_bool))
+    unsupported = json.loads(json.dumps(original))
+    unsupported["schema_version"] = "1.4"
+    mutations.append(canonical_json_bytes(unsupported))
+    mutations.append(json.dumps(original, indent=2).encode("utf-8"))
+    for content in mutations:
+        mutated_path.write_bytes(content)
+        with pytest.raises(Phase6ContractError):
+            load_live_run_artifact_contract(mutated_path)
+
+    recording_events = [
+        json.loads(line)
+        for line in recording_path.read_text(encoding="utf-8").splitlines()
+    ]
+    mutated_recording_path = tmp_path / "mutated-recording.jsonl"
+    recording_mutations = []
+    unknown_recording = json.loads(json.dumps(recording_events))
+    unknown_recording[0]["unexpected"] = True
+    recording_mutations.append(unknown_recording)
+    missing_diagnostic = json.loads(json.dumps(recording_events))
+    del missing_diagnostic[1]["codex"]["stderr_diagnostic"]
+    recording_mutations.append(missing_diagnostic)
+    mixed_version = json.loads(json.dumps(recording_events))
+    mixed_version[1]["schema_version"] = "1.2"
+    recording_mutations.append(mixed_version)
+    for events in recording_mutations:
+        mutated_recording_path.write_bytes(
+            b"".join(canonical_json_bytes(event) + b"\n" for event in events)
+        )
+        with pytest.raises(Phase6ContractError):
+            load_recording_contract(mutated_recording_path)
+    mutated_recording_path.write_text(
+        "\n".join(json.dumps(event, indent=2) for event in recording_events) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(Phase6ContractError):
+        load_recording_contract(mutated_recording_path)

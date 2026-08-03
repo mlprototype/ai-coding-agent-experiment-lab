@@ -32,8 +32,12 @@ from agentlab.live import (
 )
 from agentlab.models import (
     CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS,
+    CodexArgvIdentity,
+    CodexChildEnvironmentContract,
     CodexCleanupState,
     CodexCliProfile,
+    CodexExecutableIdentity,
+    CodexExecutableIdentityStatus,
     CodexExecutionStage,
     CodexFailureStage,
     CodexInvocationState,
@@ -76,11 +80,31 @@ _CODEX_15_FIELDS = (
     "stdin_bytes_total",
     "provider_failure_hint",
 )
+_CODEX_16_FIELDS = (
+    "stderr_diagnostic",
+    "executable_identity",
+    "argv_identity",
+    "child_environment",
+)
 
 
 def _remove_codex_15_fields(codex_payload: dict[str, Any]) -> None:
-    for field in _CODEX_15_FIELDS:
-        codex_payload.pop(field)
+    for field in (*_CODEX_15_FIELDS, *_CODEX_16_FIELDS):
+        codex_payload.pop(field, None)
+
+
+def _add_codex_16_invocation_fields(codex_payload: dict[str, Any]) -> None:
+    codex_payload["argv_identity"] = CodexArgvIdentity(
+        profile_id=CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2,
+        sha256="b" * 64,
+        prompt_in_argv=False,
+    ).model_dump(mode="json")
+    codex_payload["child_environment"] = CodexChildEnvironmentContract(
+        codex_home_included=True,
+        credential_environment_excluded=True,
+        path_from_allowlist=True,
+        cwd_verified_ephemeral_workspace=True,
+    ).model_dump(mode="json")
 
 
 def _fake_codex(
@@ -375,7 +399,7 @@ def test_live_success_runs_provider_and_gates_in_same_workspace_and_replays(
     assert artifact == outcome.artifact
     assert artifact.overall_status is LiveOverallStatus.PASSED
     assert artifact.failure_kind is LiveFailureKind.NONE
-    assert artifact.codex.schema_version == "1.5"
+    assert artifact.codex.schema_version == "1.6"
     assert artifact.codex.stdin_write_state is CodexStdinWriteState.COMPLETE
     assert artifact.codex.stdin_bytes_written == artifact.prompt_bytes
     assert artifact.codex.stdin_bytes_total == artifact.prompt_bytes
@@ -506,7 +530,7 @@ def test_live_pre_turn_warning_is_nonfatal_and_runs_gates(tmp_path: Path) -> Non
 
     assert artifact.overall_status is LiveOverallStatus.PASSED
     assert artifact.failure_kind is LiveFailureKind.NONE
-    assert artifact.codex.schema_version == "1.5"
+    assert artifact.codex.schema_version == "1.6"
     assert artifact.codex.item_type_counts == {
         CodexItemType.AGENT_MESSAGE: 1,
         CodexItemType.ERROR: 1,
@@ -584,7 +608,7 @@ def test_provider_failure_skips_gates_and_writes_failed_recording(tmp_path: Path
     )
     assert outcome.artifact.gate_commands == []
     assert outcome.artifact.metrics is None
-    assert outcome.artifact.codex.schema_version == "1.5"
+    assert outcome.artifact.codex.schema_version == "1.6"
     assert outcome.artifact.codex.error_event_count == 1
     assert outcome.artifact.codex.turn_failed_count == 1
     assert isinstance(recording.failed, LiveRunFailedEvent)
@@ -636,7 +660,7 @@ def test_live_protocol_error_publishes_strict_paired_failure_without_diagnostic(
 
     assert artifact.overall_status is LiveOverallStatus.PROVIDER_ERROR
     assert artifact.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
-    assert artifact.codex.schema_version == "1.5"
+    assert artifact.codex.schema_version == "1.6"
     assert artifact.codex.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
     assert artifact.codex.process_started is True
     assert artifact.codex.cleanup_state is CodexCleanupState.CLEARED
@@ -1096,7 +1120,7 @@ def test_runner_boundary_faults_preserve_pre_spawn_lifecycle(
         expected_execution_stage=CodexExecutionStage.PREFLIGHT_COMPLETED,
         expected_failure_kind=LiveFailureKind.EVIDENCE_ERROR,
     )
-    assert outcome.artifact.codex.schema_version == "1.5"
+    assert outcome.artifact.codex.schema_version == "1.6"
     assert outcome.artifact.codex.runner_state is expected_runner_state
     assert (
         outcome.artifact.codex.invocation_state
@@ -1207,7 +1231,7 @@ def test_pre_provider_faults_persist_safe_stage_without_running_gates(
     assert b"synthetic failure text must not be persisted" not in persisted
     assert len(temporary_roots) == 1
     assert not temporary_roots[0].exists()
-    assert outcome.artifact.codex.schema_version == "1.5"
+    assert outcome.artifact.codex.schema_version == "1.6"
     assert outcome.artifact.codex.runner_state is CodexRunnerState.STARTED
     if expected_execution_stage is CodexExecutionStage.PREFLIGHT_COMPLETED:
         assert (
@@ -1326,7 +1350,7 @@ def test_post_spawn_handoff_faults_preserve_process_lifecycle(
         expected_process_started=True,
     )
     codex = outcome.artifact.codex
-    assert codex.schema_version == "1.5"
+    assert codex.schema_version == "1.6"
     assert codex.runner_state is CodexRunnerState.STARTED
     assert codex.invocation_state is CodexInvocationState.PROCESS_STARTED
     assert codex.cleanup_state is CodexCleanupState.CLEARED
@@ -1769,6 +1793,10 @@ def test_reachable_lifecycle_states_build_strict_evidence_or_truthful_diagnostic
         cli_profile=CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2,
         checked_at=datetime.now(UTC),
         verified_flags=tuple(REQUIRED_CODEX_EXEC_FLAGS),
+        executable_identity=CodexExecutableIdentity(
+            status=CodexExecutableIdentityStatus.VERIFIED,
+            sha256="a" * 64,
+        ),
     )
     live = LiveSettings.model_validate(_base_spec()["live"])
     lifecycle = codex_provider_module.CodexLifecycleTracker(
@@ -1777,6 +1805,18 @@ def test_reachable_lifecycle_states_build_strict_evidence_or_truthful_diagnostic
         cleanup_state=cleanup_state,
         failure_stage=failure_stage,
     )
+    if invocation_state is not CodexInvocationState.NOT_ATTEMPTED:
+        lifecycle.argv_identity = CodexArgvIdentity(
+            profile_id=CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2,
+            sha256="b" * 64,
+            prompt_in_argv=False,
+        )
+        lifecycle.child_environment = CodexChildEnvironmentContract(
+            codex_home_included=True,
+            credential_environment_excluded=True,
+            path_from_allowlist=True,
+            cwd_verified_ephemeral_workspace=True,
+        )
     if cleanup_state is CodexCleanupState.FAILED:
         lifecycle.termination = TerminationEvidence(
             reason=TerminationReason.EMERGENCY_CLEANUP,
@@ -1792,7 +1832,7 @@ def test_reachable_lifecycle_states_build_strict_evidence_or_truthful_diagnostic
             live=live,
             lifecycle=lifecycle,
         )
-        assert evidence.schema_version == "1.5"
+        assert evidence.schema_version == "1.6"
         assert evidence.runner_state is runner_state
         assert evidence.invocation_state is invocation_state
         assert evidence.cleanup_state is cleanup_state
@@ -2248,7 +2288,7 @@ def test_post_spawn_faults_persist_safe_stage_and_reap_process(
         is CodexExecutionStage.PROVIDER_INVOCATION_ATTEMPTED
     )
     assert artifact.codex.process_started is True
-    assert artifact.codex.schema_version == "1.5"
+    assert artifact.codex.schema_version == "1.6"
     assert artifact.codex.runner_state is CodexRunnerState.STARTED
     assert (
         artifact.codex.invocation_state is CodexInvocationState.PROCESS_STARTED
@@ -3349,7 +3389,7 @@ def test_codex_evidence_13_does_not_adopt_14_error_count_semantics(
     )
     environment, _inspection = _fake_codex(tmp_path, live_code=live_code)
     payload = _run(spec_path, output, environment).artifact.model_dump(mode="json")
-    assert payload["codex"]["schema_version"] == "1.5"
+    assert payload["codex"]["schema_version"] == "1.6"
     payload["codex"]["schema_version"] = "1.3"
     _remove_codex_15_fields(payload["codex"])
 
@@ -3400,6 +3440,7 @@ def test_codex_evidence_rejects_failure_stage_execution_contradiction(
     payload["codex"]["invocation_state"] = "process_started"
     payload["codex"]["cleanup_state"] = "cleared"
     payload["codex"]["process_started"] = True
+    _add_codex_16_invocation_fields(payload["codex"])
 
     with pytest.raises(ValidationError, match="execution_stage"):
         LiveRunArtifact.model_validate(payload)
@@ -3484,6 +3525,7 @@ def test_artifact_and_recording_reject_invocation_without_created_workspace(
     artifact_payload["codex"]["runner_state"] = "started"
     artifact_payload["codex"]["invocation_state"] = "spawn_attempted"
     artifact_payload["codex"]["cleanup_state"] = "not_applicable"
+    _add_codex_16_invocation_fields(artifact_payload["codex"])
 
     with pytest.raises(ValidationError, match="requires a created Workspace"):
         LiveRunArtifact.model_validate(artifact_payload)
@@ -3502,6 +3544,7 @@ def test_artifact_and_recording_reject_invocation_without_created_workspace(
     terminal["codex"]["runner_state"] = "started"
     terminal["codex"]["invocation_state"] = "spawn_attempted"
     terminal["codex"]["cleanup_state"] = "not_applicable"
+    _add_codex_16_invocation_fields(terminal["codex"])
     outcome.recording_path.write_text(
         "\n".join(json.dumps(event) for event in events) + "\n",
         encoding="utf-8",
