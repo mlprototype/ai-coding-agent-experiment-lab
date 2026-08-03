@@ -15,7 +15,7 @@ import agentlab.cli as cli
 import agentlab.phase6_approval as approval
 import agentlab.phase6_campaign as campaign
 from agentlab.cli import app
-from agentlab.models import Provider
+from agentlab.models import Provider, ReasoningEffort, Workflow
 from agentlab.phase6 import (
     ArtifactReference,
     Language,
@@ -144,9 +144,12 @@ def _approval_case(
             "reference_solution_sha256": reference_snapshot.sha256,
         }
     )
+    runs_by_workflow = {run.workflow: run for run in inputs.plan.runs}
     runs = [
-        run.model_copy(update={"fixture_revision": "tag-normalizer-java-v1"})
-        for run in inputs.plan.runs
+        runs_by_workflow[workflow].model_copy(
+            update={"fixture_revision": "tag-normalizer-java-v1"}
+        )
+        for workflow in (Workflow.STAGED, Workflow.ONE_SHOT)
     ]
     plan = inputs.plan.model_copy(
         update={
@@ -253,6 +256,7 @@ def test_valid_java_packet_is_pending_canonical_and_strictly_reloadable(
     assert loaded.provider_accounting.projected_minimum_calls == 4
     assert loaded.provider_accounting.projected_maximum_calls == 5
     assert loaded.campaign.workflow_order == [run.workflow for run in inputs.plan.runs]
+    assert loaded.campaign.workflow_order == [Workflow.STAGED, Workflow.ONE_SHOT]
     assert loaded.campaign.per_run_provider_calls == [1, 1]
     assert loaded.exact_argv == [
         ".venv/bin/agentlab",
@@ -341,6 +345,10 @@ def test_generator_rolls_back_owned_partial_publication(
             lambda raw: raw["campaign"].update(exact_provider_calls=3),
             "invalid",
         ),
+        (
+            lambda raw: raw["campaign"].update(planned_runs=True),
+            "invalid",
+        ),
         (lambda raw: raw["exact_argv"].append("--force"), "invalid"),
     ],
 )
@@ -370,7 +378,7 @@ def test_strict_schema_and_cross_field_mutations_are_rejected(
         {"reviewed_repository_head": "f" * 40},
         {"campaign": {"model": "different-model"}},
         {"campaign": {"reasoning_effort": "medium"}},
-        {"campaign": {"workflow_order": ["staged", "one_shot"]}},
+        {"campaign": {"workflow_order": ["one_shot", "staged"]}},
     ],
 )
 def test_rederived_head_provider_and_workflow_bindings_reject_drift(
@@ -552,6 +560,87 @@ def test_java_language_and_accounting_range_are_enforced_during_generation(
             prior_provider_call_maximum=3,
             output_path=repository / "packet-2.json",
             confirm_local_execution=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("condition", "match"),
+    [
+        ("experiment_id", "experiment ID"),
+        ("provider", "Provider"),
+        ("model", "model"),
+        ("reasoning_effort", "reasoning effort"),
+        ("planned_runs", "planned run count"),
+        ("exact_calls", "exact Provider-call count"),
+        ("workflow_order", "workflow order"),
+        ("per_run_calls", "per-run Provider-call count"),
+        ("max_failures", "max_failures"),
+        ("max_duration", "max_total_duration_ms"),
+        ("fail_fast", "fail_fast"),
+    ],
+)
+def test_aligned_spec_and_plan_alternate_live_conditions_are_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    condition: str,
+    match: str,
+) -> None:
+    repository, inputs, manifest_path = _approval_case(tmp_path, monkeypatch)
+    spec = inputs.loaded_spec.spec
+    plan = inputs.plan
+    if condition == "experiment_id":
+        spec = spec.model_copy(update={"experiment_id": "phase6-java-alternate"})
+        plan = plan.model_copy(update={"experiment_id": "phase6-java-alternate"})
+    elif condition == "provider":
+        spec = spec.model_copy(update={"provider": Provider.ANTIGRAVITY})
+        plan = plan.model_copy(update={"provider": Provider.ANTIGRAVITY})
+    elif condition == "model":
+        spec = spec.model_copy(update={"model": "alternate-model"})
+        plan = plan.model_copy(update={"model": "alternate-model"})
+    elif condition == "reasoning_effort":
+        spec = spec.model_copy(update={"reasoning_effort": ReasoningEffort.MEDIUM})
+        plan = plan.model_copy(update={"reasoning_effort": ReasoningEffort.MEDIUM})
+    elif condition == "planned_runs":
+        spec = spec.model_copy(update={"repetitions": 2})
+        plan = plan.model_copy(update={"planned_run_count": 4})
+    elif condition == "exact_calls":
+        plan = plan.model_copy(update={"planned_provider_call_count": 4})
+    elif condition == "workflow_order":
+        plan = plan.model_copy(update={"runs": list(reversed(plan.runs))})
+    elif condition == "per_run_calls":
+        runs = [run.model_copy(update={"planned_provider_calls": 2}) for run in plan.runs]
+        plan = plan.model_copy(update={"runs": runs})
+    elif condition == "max_failures":
+        stop = spec.stop_conditions.model_copy(update={"max_failures": 1})
+        spec = spec.model_copy(update={"stop_conditions": stop})
+    elif condition == "max_duration":
+        stop = spec.stop_conditions.model_copy(update={"max_total_duration_ms": 1_800_000})
+        spec = spec.model_copy(update={"stop_conditions": stop})
+    elif condition == "fail_fast":
+        stop = spec.stop_conditions.model_copy(update={"fail_fast": True})
+        spec = spec.model_copy(update={"stop_conditions": stop})
+    else:  # pragma: no cover - parametrization is exhaustive
+        raise AssertionError(condition)
+    alternate = replace(
+        inputs,
+        loaded_spec=LoadedWorkflowSpecContract(
+            spec=spec,
+            sha256=inputs.loaded_spec.sha256,
+        ),
+        plan=plan,
+    )
+    monkeypatch.setattr(
+        approval,
+        "load_plan_bound_inputs",
+        lambda *_args, **_kwargs: alternate,
+    )
+
+    with pytest.raises(SupplementalApprovalError, match=match):
+        _generate(
+            repository,
+            alternate,
+            manifest_path,
+            repository / f"{condition}.json",
         )
 
 

@@ -51,6 +51,16 @@ from agentlab.phase6_fixtures import (
 )
 from agentlab.workflow import plan_publication_path
 
+_JAVA_EXPERIMENT_ID = "phase6-java-workflow"
+_JAVA_MODEL = "gpt-5.6-sol"
+_JAVA_REASONING_EFFORT = ReasoningEffort.HIGH
+_JAVA_PLANNED_RUNS = 2
+_JAVA_EXACT_PROVIDER_CALLS = 2
+_JAVA_WORKFLOW_ORDER = (Workflow.STAGED, Workflow.ONE_SHOT)
+_JAVA_PER_RUN_PROVIDER_CALLS = (1, 1)
+_JAVA_MAX_FAILURES = 2
+_JAVA_MAX_TOTAL_DURATION_MS = 3_600_000
+
 
 class SupplementalApprovalError(ValueError):
     """A fail-closed offline Supplemental Approval error."""
@@ -153,23 +163,33 @@ class SupplementalJavaArtifactBindings(ContractModel):
 
 
 class SupplementalStopPolicy(ContractModel):
-    max_failures: StrictInt | None = Field(default=None, gt=0)
-    max_total_duration_ms: StrictInt | None = Field(default=None, gt=0)
+    max_failures: StrictInt = Field(gt=0)
+    max_total_duration_ms: StrictInt = Field(gt=0)
     fail_fast: StrictBool
+
+    @model_validator(mode="after")
+    def policy_is_fixed_for_java_live(self) -> SupplementalStopPolicy:
+        if self.max_failures != _JAVA_MAX_FAILURES:
+            raise ValueError("max_failures must be 2")
+        if self.max_total_duration_ms != _JAVA_MAX_TOTAL_DURATION_MS:
+            raise ValueError("max_total_duration_ms must be 3600000")
+        if self.fail_fast:
+            raise ValueError("fail_fast must be false")
+        return self
 
 
 class SupplementalCampaignContract(ContractModel):
-    experiment_id: StrictStr = Field(pattern=r"^[a-z][a-z0-9_-]*$")
+    experiment_id: Literal["phase6-java-workflow"]
     output_root: StrictStr
     campaign_jsonl: StrictStr
     repository_root: Literal["."]
     provider: Literal[Provider.CODEX]
-    model: StrictStr = Field(min_length=1)
-    reasoning_effort: ReasoningEffort
+    model: Literal["gpt-5.6-sol"]
+    reasoning_effort: Literal[ReasoningEffort.HIGH]
     planned_runs: StrictInt = Field(gt=0)
     exact_provider_calls: StrictInt = Field(gt=0)
     workflow_order: list[Workflow] = Field(min_length=2)
-    per_run_provider_calls: list[Literal[1]] = Field(min_length=2)
+    per_run_provider_calls: list[StrictInt] = Field(min_length=2)
     retry_count: Literal[0]
     fallback_count: Literal[0]
     resume_count: Literal[0]
@@ -190,6 +210,14 @@ class SupplementalCampaignContract(ContractModel):
 
     @model_validator(mode="after")
     def run_and_call_counts_match(self) -> SupplementalCampaignContract:
+        if self.planned_runs != _JAVA_PLANNED_RUNS:
+            raise ValueError("planned_runs must be 2")
+        if self.exact_provider_calls != _JAVA_EXACT_PROVIDER_CALLS:
+            raise ValueError("exact_provider_calls must be 2")
+        if tuple(self.workflow_order) != _JAVA_WORKFLOW_ORDER:
+            raise ValueError("workflow_order must be staged then one_shot")
+        if tuple(self.per_run_provider_calls) != _JAVA_PER_RUN_PROVIDER_CALLS:
+            raise ValueError("per_run_provider_calls must be [1, 1]")
         if self.planned_runs != len(self.workflow_order):
             raise ValueError("planned_runs must match workflow_order")
         if self.planned_runs != len(self.per_run_provider_calls):
@@ -534,6 +562,7 @@ def _build_packet(
         raise SupplementalApprovalError("Supplemental Approval requires a Java Plan")
     if inputs.plan.reviewed_commit != commit:
         raise SupplementalApprovalError("reviewed repository HEAD differs from Plan")
+    _validate_java_live_contract(inputs)
     safe_campaign = _repository_path(
         repository,
         campaign_path,
@@ -547,26 +576,24 @@ def _build_packet(
         raise SupplementalApprovalError("Campaign output collision detected")
     artifacts = _artifact_bindings(repository, inputs)
     campaign = SupplementalCampaignContract(
-        experiment_id=inputs.plan.experiment_id,
+        experiment_id="phase6-java-workflow",
         output_root=_repository_relative(repository, inputs.artifact_root, "Campaign output root"),
         campaign_jsonl=_repository_relative(repository, safe_campaign, "Campaign JSONL path"),
         repository_root=".",
-        provider=inputs.plan.provider,
-        model=inputs.plan.model,
-        reasoning_effort=inputs.plan.reasoning_effort,
-        planned_runs=inputs.plan.planned_run_count,
-        exact_provider_calls=inputs.plan.planned_provider_call_count,
-        workflow_order=[run.workflow for run in inputs.plan.runs],
-        per_run_provider_calls=[run.planned_provider_calls for run in inputs.plan.runs],
+        provider=Provider.CODEX,
+        model="gpt-5.6-sol",
+        reasoning_effort=ReasoningEffort.HIGH,
+        planned_runs=_JAVA_PLANNED_RUNS,
+        exact_provider_calls=_JAVA_EXACT_PROVIDER_CALLS,
+        workflow_order=list(_JAVA_WORKFLOW_ORDER),
+        per_run_provider_calls=list(_JAVA_PER_RUN_PROVIDER_CALLS),
         retry_count=0,
         fallback_count=0,
         resume_count=0,
         stop_policy=SupplementalStopPolicy(
-            max_failures=inputs.loaded_spec.spec.stop_conditions.max_failures,
-            max_total_duration_ms=(
-                inputs.loaded_spec.spec.stop_conditions.max_total_duration_ms
-            ),
-            fail_fast=inputs.loaded_spec.spec.stop_conditions.fail_fast,
+            max_failures=_JAVA_MAX_FAILURES,
+            max_total_duration_ms=_JAVA_MAX_TOTAL_DURATION_MS,
+            fail_fast=False,
         ),
         create_only_output=True,
         stop_on_collision=True,
@@ -606,6 +633,54 @@ def _build_packet(
         ),
         exact_argv=exact_argv,
     )
+
+
+def _validate_java_live_contract(inputs: PlanBoundInputs) -> None:
+    """Enforce the independently approved Java Live conditions, not only Plan consistency."""
+    spec = inputs.loaded_spec.spec
+    if not isinstance(spec, WorkflowExperimentSpecV2_1):
+        raise SupplementalApprovalError("Java Live fixed contract requires Workflow Spec 2.1")
+    fixed_checks = (
+        (spec.experiment_id == _JAVA_EXPERIMENT_ID, "Spec experiment ID"),
+        (inputs.plan.experiment_id == _JAVA_EXPERIMENT_ID, "Plan experiment ID"),
+        (spec.provider is Provider.CODEX, "Spec Provider"),
+        (inputs.plan.provider is Provider.CODEX, "Plan Provider"),
+        (spec.model == _JAVA_MODEL, "Spec model"),
+        (inputs.plan.model == _JAVA_MODEL, "Plan model"),
+        (spec.reasoning_effort is _JAVA_REASONING_EFFORT, "Spec reasoning effort"),
+        (
+            inputs.plan.reasoning_effort is _JAVA_REASONING_EFFORT,
+            "Plan reasoning effort",
+        ),
+        (inputs.plan.planned_run_count == _JAVA_PLANNED_RUNS, "planned run count"),
+        (
+            inputs.plan.planned_provider_call_count == _JAVA_EXACT_PROVIDER_CALLS,
+            "exact Provider-call count",
+        ),
+        (
+            tuple(run.workflow for run in inputs.plan.runs) == _JAVA_WORKFLOW_ORDER,
+            "workflow order",
+        ),
+        (
+            tuple(run.planned_provider_calls for run in inputs.plan.runs)
+            == _JAVA_PER_RUN_PROVIDER_CALLS,
+            "per-run Provider-call count",
+        ),
+        (
+            spec.stop_conditions.max_failures == _JAVA_MAX_FAILURES,
+            "max_failures",
+        ),
+        (
+            spec.stop_conditions.max_total_duration_ms == _JAVA_MAX_TOTAL_DURATION_MS,
+            "max_total_duration_ms",
+        ),
+        (spec.stop_conditions.fail_fast is False, "fail_fast"),
+    )
+    for matches, label in fixed_checks:
+        if not matches:
+            raise SupplementalApprovalError(
+                f"Java Live fixed contract differs: {label}"
+            )
 
 
 def _model_from_bytes(content: bytes) -> SupplementalLiveCampaignApproval:
