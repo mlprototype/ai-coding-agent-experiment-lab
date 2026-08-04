@@ -216,10 +216,11 @@ rendererとのbyte一致は14/14である。Python／Javaは`evaluated`、schedu
 JavaのRecording／Live Evidence 1.3・nested Codex Evidence 1.6はstrict readerでともに検証し、
 再serializationせずmixed-version入力から正規化Public Run Recordを生成する。
 
-TypeScriptは3言語full targetの未完了項目として`not_ready`かつPublic Suite未掲載のまま
-保持するが、2言語engineering minimumの完了blockerではない。AntigravityはPhase 6の必須
-Providerではなく、`not_evaluated / upstream_artifact_signature_invalid`を既知残課題として
-維持する。Phase 7は`Planned`のままである。
+accepted engineering scopeはPython／Javaであり、この2言語でPhase 6 minimumを満たした。
+追加言語への展開はaccepted Phase 6 scope外で、現在のPhase 7 committed scopeにも含めない。
+必要になった場合だけ、別のProblem Statement／Spec／Acceptanceで再提案する。Antigravityは
+Phase 6の必須Providerではなく、`not_evaluated / upstream_artifact_signature_invalid`を既知
+残課題として維持する。Phase 7は`Planned`のままである。
 
 **受入条件:** Live-readyには最低2言語の実toolchain Fixture受入が必要で、offline実装だけ
 では到達しない。Completeには最低2言語で各1 complete pairを含む承認済みLiveとPublic

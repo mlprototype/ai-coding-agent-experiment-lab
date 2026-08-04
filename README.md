@@ -44,13 +44,13 @@ AI支援開発の比較では、model、tool、Prompt、Workflow、Fixture、評
 - accepted Suite ID: `phase6-java-evaluated-0e6d894d-001`
 - Python: `evaluated`、1 Fixture・1 complete pair
 - Java: `evaluated`、1 Fixture・1 complete pair
-- TypeScript: `not_ready`、Public Suite未掲載
 - Antigravity: `not_evaluated / upstream_artifact_signature_invalid`
 - automatic winner、leaderboard、統計的有意性: なし
 
-この結果は各言語1 Fixture・1 pair、固定Prompt／Gate、当該環境・実行時期の観測に限定されます。
-一般的なWorkflow、Provider、model性能の優劣や、cached inputを無視した確定的なコスト差は
-主張しません。
+Python／Javaの2言語で、同一評価契約に基づく`one_shot`／`staged`比較を実施し、各言語
+1 Fixture・1 complete pairをaccepted Public Suiteとして固定しました。この結果は固定Prompt／
+Gate、当該環境・実行時期の観測に限定されます。一般的なWorkflow、Provider、model性能の優劣や、
+cached inputを無視した確定的なコスト差は主張しません。
 
 Codex agent内のnested `codex exec`ではpermission failureが観測されましたが、OS-level root
 causeは未確定です。Mac Terminalと明示的な絶対`CODEX_HOME`ではJava Campaignが成功したため、
@@ -151,7 +151,7 @@ Spec、Fixture、commandだけに使用してください。
 ## Known limitations
 
 - Phase 6の公開評価はPython／Javaそれぞれ1 Fixture・1 complete pairに限られる。
-- TypeScriptはtoolchain入力未解決、Antigravityは上流署名blockerのため未評価である。
+- Antigravityは上流署名blockerのため未評価である。
 - nested Codex permission failureの詳細なOS-level root causeは未確定である。
 - Liveの成功は将来のmodel availability、quota、vendor event互換性を保証しない。
 - token値だけから一般的なコスト差を断定できない。
