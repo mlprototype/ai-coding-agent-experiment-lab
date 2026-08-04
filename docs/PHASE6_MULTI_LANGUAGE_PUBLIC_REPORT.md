@@ -431,8 +431,10 @@ health-check callを除外する。これらは削除せず監査Artifactとし�
 Provider消費の監査上の累積は`9または10 calls`である。確定下限は9、上限は10で、不確定性は
 旧Python Campaignの0または1 callに由来する。このaccountingは評価分母と分離する。
 
-TypeScriptは`typescript_compiler`未解決のため`not_ready`かつPublic Suite未掲載であり、3言語
-full targetの残課題として保持する。AntigravityはPhase 6の必須Providerではなく、
+TypeScriptはaccepted Public Suiteに含まれておらず、評価済みとは扱わない。accepted evaluation
+scopeはPython／Javaだけであり、追加言語評価はcurrent roadmapからde-scope済みである。将来
+必要になった場合は、新しい独立Approval／Spec／releaseとして扱い、Phase 6 Completeには影響
+させない。AntigravityはPhase 6の必須Providerではなく、
 `not_evaluated / upstream_artifact_signature_invalid`を維持する。Codex agent内のnested
 `codex exec`はpermission failureとなったが、詳細なOS-level root causeは未確定である。一方、
 Mac Terminalで明示的な絶対`CODEX_HOME`を設定したJava Campaignは成功した。現行運用ではLive
@@ -442,8 +444,9 @@ validation、Report、publication、監査はCodexから実施できる。承認
 
 Phase 6 Completeの最低条件は、最低2言語の実toolchain受入、各言語1 complete pairを持つ
 承認済みLive、Public Suite bundle完成である。Python／Javaでこのengineering minimumを満たした。
-2言語各3反復の12 callsはprimary publication target、3言語各3反復の18 callsはfull targetであり、
-minimumではない。
+2言語各3反復の12 callsは初期のprimary publication target、3言語各3反復の18 callsは初期の
+full targetであり、いずれもhistorical planであってminimumではない。追加言語は現在の必須作業
+ではない。
 
 automatic winner、leaderboard、統計的有意性は生成しない。観測値は当該Fixture、Prompt、Gate、
 environment、実行時期へ限定し、一般的なWorkflow、Provider、model性能差へ一般化しない。
