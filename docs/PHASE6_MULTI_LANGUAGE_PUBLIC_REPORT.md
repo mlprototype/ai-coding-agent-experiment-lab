@@ -437,7 +437,8 @@ full targetの残課題として保持する。AntigravityはPhase 6の必須Pro
 `codex exec`はpermission failureとなったが、詳細なOS-level root causeは未確定である。一方、
 Mac Terminalで明示的な絶対`CODEX_HOME`を設定したJava Campaignは成功した。現行運用ではLive
 CampaignだけをHost Terminalから実行し、sandbox制約を回避する実装は行わない。offline準備、
-validation、Report、publication、監査はCodexから実施できる。
+validation、Report、publication、監査はCodexから実施できる。承認境界と手順は
+[Host Terminal Live Campaign Runbook](HOST_TERMINAL_LIVE_RUNBOOK.md)に固定する。
 
 Phase 6 Completeの最低条件は、最低2言語の実toolchain受入、各言語1 complete pairを持つ
 承認済みLive、Public Suite bundle完成である。Python／Javaでこのengineering minimumを満たした。

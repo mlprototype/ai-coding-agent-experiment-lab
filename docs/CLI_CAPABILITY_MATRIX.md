@@ -2,7 +2,12 @@
 
 最終read-only再確認: 2026-07-30（Asia/Tokyo）
 
-この文書は、Phase 3のread-only CLI確認とPhase 5の実行前artifact静的監査を記録する。
+この文書は2026-07-30時点のhistorical read-only snapshotであり、現行のHost Terminal Live
+運用手順ではない。当時確認したCLI pathとLive未実施記録はhistorical factとして保持する。
+現在の承認境界と実行手順は
+[Host Terminal Live Campaign Runbook](HOST_TERMINAL_LIVE_RUNBOOK.md)を参照する。
+
+このsnapshotは、Phase 3のread-only CLI確認とPhase 5の実行前artifact静的監査を記録する。
 利用できないCLIの能力は推測しない。CLIや環境の更新後は、承認されたread-only手順で
 再確認する。
 

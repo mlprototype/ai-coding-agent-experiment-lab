@@ -10,6 +10,12 @@ Codexだけを使う。manual Liveは累計8試行で、
 過去runは再実行せず、新しいLiveにはレビュー済みcommit、新しいSpec／run-id／出力先、
 別の明示承認を必要とする。
 
+現在の承認済みLive Campaignは、Codex agent内のnested `codex exec`で観測したpermission
+failureを一般化せず、Mac Terminalから実行する。OS-level root causeは未確定であり、実行者は
+[Host Terminal Live Campaign Runbook](HOST_TERMINAL_LIVE_RUNBOOK.md)に従って、個別Approval、
+明示的な絶対`CODEX_HOME`、Packet-bound argv、create-only出力を確認する。この運用境界は
+Provider実装のsandbox回避を意味しない。
+
 ## Read-only preflight
 
 `live-codex`は確認flag、Spec/Prompt/Fixture/output検証後、`codex`のPATH存在、
@@ -272,7 +278,8 @@ Phase 3は一つの`one_shot` taskを手動実行するだけである。複数t
 
 実装、Prompt非保存、JSONL parser、環境分離、process tree、Recording/Replayをレビューし、
 CLI helpが必須flagをすべて持ち、ChatGPT-managed auth、model/quota、送信対象を確認した後、
-READMEの`live-codex ... --confirm-live-codex`を明示承認の範囲で手動実行した。
+当時READMEに掲載していた`live-codex ... --confirm-live-codex`を、明示承認の範囲で
+手動実行した。
 
 現在確認した`codex-cli 0.146.0-alpha.3.1`は
 `headless_exec_explicit_never_v2`のversion allowlistとread-only preflightに成功した。
