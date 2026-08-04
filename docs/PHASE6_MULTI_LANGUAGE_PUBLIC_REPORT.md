@@ -2,13 +2,13 @@
 
 ## Status
 
-**Phase 6: Current**
+**Phase 6: Complete**
 
 - Slice 6A Contract / strict loader: implemented (offline)
 - Slice 6B Fixture Acceptance: implemented (local-only; no status transition)
-- Slice 6C Plan-bound Campaign execution: implemented (offline/fake accepted; Live 0)
-- Slice 6D Public Suite renderer and atomic publication: implemented (offline/fake; review pending)
-- Slice 6E reviewed Live Campaign and public bundle: not started
+- Slice 6C Plan-bound Campaign execution: implemented; Python／Java Live accepted
+- Slice 6D Public Suite renderer and atomic publication: implemented and published
+- Slice 6E reviewed Live Campaign and public bundle: complete
 
 Phase 6はPhase 4 Completeに依存し、Phase 5には依存しない。Phase 5、Slice 5B、
 Slice 5Cは`upstream_artifact_signature_invalid`により`Blocked`のまま維持する。
@@ -70,8 +70,9 @@ engineering minimum、3言語をfull targetとする。これはFixture受入条
 | Workflow Experiment Spec | 2.1 | 言語とAcceptance／Policy入力pathをSpec 2.0へ追加 |
 | Workflow Plan | 1.2 | Fixture、Acceptance、Policy、Gate、toolchain、commitを事前登録 |
 | Campaign | 1.2 | `output_contract_violation`と`input_changed`を含むrun状態 |
-| Recording | 1.2 | Phase 6 terminal状態。nested Evidenceは既存1.5のまま |
-| LiveRunArtifact | 1.2 | top-level出力拒否、Gate非実行理由、Plan-bound hash |
+| Recording | 1.3（current writer）／1.2（accepted Python） | Phase 6 terminal状態とProvider診断metadata |
+| Live Evidence／LiveRunArtifact | 1.3（current writer）／1.2（accepted Python） | top-level出力拒否、Gate非実行理由、Plan-bound hash |
+| nested Codex Execution Evidence | 1.6（current writer）／1.5（accepted Python） | Provider実行と安全な診断metadata |
 | Historical Verification Record | 1.0 | Campaign 002の非再実行検証。toolchainは`unknown`固定 |
 | Public Suite Manifest | 1.0 | 明示入力、期待言語status、coverage、cutoff、予定出力 |
 | Public Run Record | 1.0 | 公開allowlistだけからなる正規化run |
@@ -80,11 +81,19 @@ engineering minimum、3言語をfull targetとする。これはFixture受入条
 
 新契約は未知field、型強制、重複JSON key、非有限数を拒否する。JSONはUTF-8、
 key sort、2-space indent、末尾newline、時刻のmicrosecond固定を含むcanonical bytesを
-要求する。Campaign／Recording 1.2はkey sort済みcompact JSONLとする。
+要求する。Campaign 1.2とcurrent writerのRecording 1.3はkey sort済みcompact JSONLとする。
 
 後方互換loaderは旧versionを既存loaderへ委譲する。特にPlan 1.1へPlan 1.2のcanonical
-制約を遡及しない。Spec 2.0、Plan 1.1、Campaign 1.1、Recording 1.0/1.1、
-LiveRunArtifact 1.0/1.1の意味とruntime経路は変えない。
+制約を遡及しない。Spec 2.0、Plan 1.1、Campaign 1.1、Recording 1.0/1.1/1.2、
+LiveRunArtifact 1.0/1.1/1.2の意味とruntime経路は変えない。
+
+accepted Python Campaignは診断schema拡張前のRecording 1.2、Live Evidence 1.2、nested Codex
+Evidence 1.5であり、accepted Java `java-independent-004`はcurrent writerと同じRecording 1.3、
+Live Evidence 1.3、nested Codex Execution Evidence 1.6である。strict reader／validatorは
+両versionをfail-closedで検証し、Public Suite rendererはmixed-version accepted inputsを
+正規化Public Run Recordへ変換する。既存Python Artifactはmigrationも再serializationも行わず、
+schema version差を評価条件差やbinding欠落として扱わない。未対応versionとunknown fieldは
+引き続きfail-closedで拒否する。
 
 ## Plan-bound provenance
 
@@ -249,7 +258,9 @@ Manifest自身はresolve前にsymlinkを拒否する。固定rootを`O_NOFOLLOW`
 identityおよびfile snapshotを再検証し、root／中間directory／fileの差し替えや内容変更を
 拒否する。
 
-LiveRunArtifact 1.2とRecording 1.2は同じGate、diff、Metrics、workspace lifecycle観測を持つ。
+current writerのLiveRunArtifact 1.3とRecording 1.3は同じGate、diff、Metrics、workspace
+lifecycle観測を持つ。後方互換readerで受け入れるaccepted Pythonの1.2 pairにも同じ共通binding
+検証を適用し、1.3固有の診断metadataは1.3のstrict規則で検証する。
 `passed`／`failed`のquality結果はCodex成功、全Gate commandの正常終了、完全なdiff line
 count、`workspace_lifecycle=removed`、MetricsとGate集計の一致を必須とする。`passed`は全
 Gate成功かつ`quality_gate_pass=true`、`failed`は通常終了したGateの不合格かつ
@@ -269,7 +280,7 @@ failureをtop-levelの`evidence_error`へ付け替えることはできない。
 process cleanup失敗を最優先とする。この照合はArtifact／Recordingのstrict modelだけでなく、
 Campaignとのcross-artifact validationでも再実行する。
 
-Recording 1.2は`Recording started <= Codex started <= Codex completed <= Recording
+Recording 1.2／1.3はいずれも`Recording started <= Codex started <= Codex completed <= Recording
 terminal`を要求する。
 
 ## Public allowlist and checksum trust
@@ -347,11 +358,11 @@ anchorのidentityを保存し、rename成功直後からrollback対象とする�
 確認し、macOSの`renamex_np(RENAME_EXCL)`またはLinuxの
 `renameat2(RENAME_NOREPLACE)`だけでpublishする。unsupported platformはfail closedとする。
 
-Slice 6Dの実装受入は一時directoryのsynthetic Artifactだけである。実Historical Verification
+Slice 6D実装受入時点の受入対象は一時directoryのsynthetic Artifactだけであった。実Historical Verification
 Record、実Public Suite bundle、実Codex／Antigravity CLI、Provider call、Prompt送信、Live、
 network、quota利用は0件である。Python／Javaは`ready_not_run`、TypeScriptは`not_ready`を
-維持する。Slice 6D完了だけではLive-readyでもPhase 6 Completeでもなく、Slice 6Eはレビュー
-承認まで開始しない。
+維持した。Slice 6D完了だけではLive-readyでもPhase 6 Completeでもなく、Slice 6Eはレビュー
+承認まで開始しないという当時の境界であり、後述のAccepted closeoutがこの状態をsupersedeした。
 
 ## Slice 6C Plan-bound Campaign execution
 
@@ -370,21 +381,69 @@ toolchainと固定PATHで実行し、各command前後のtoolchain identity、Gat
 canonical Campaignを完結する。cleanup failureは他の結果より優先する。
 
 engineering minimum用PlanはPython／Javaを独立に各1 task、one-shot／staged各1回、1 pair、2
-planned Provider calls（合計4 calls）とする。Plan生成成功後は両言語を`ready_not_run`とし、
-TypeScriptは`typescript_compiler`未解決のため`not_ready`を維持する。実Codex Provider call、
-Prompt送信、Live Campaignは0件である。Slice 6C完了だけではPhase 6はLive-readyでもCompleteでも
-ない。Public renderer／publisherは後続のSlice 6Dでoffline/fake実装し、現在はレビュー待ちで
-ある。
+planned Provider calls（合計4 calls）とした。Slice 6C完了時点では両言語を`ready_not_run`とし、
+TypeScriptは`typescript_compiler`未解決のため`not_ready`を維持した。実Codex Provider call、
+Prompt送信、Live Campaignは0件であった。Slice 6C完了だけではPhase 6はLive-readyでもComplete
+でもなく、Public renderer／publisherは後続Sliceとしてレビュー待ちだった。この初期計画と
+当時状態は、後述のAccepted closeoutに至る履歴として保持する。
 
-## Current acceptance boundary
+## Accepted closeout
 
-Slice 6Dのoffline/fake受入完了だけではLive-readyでもPhase 6 Completeでもない。実Codex／
-Antigravity CLI、Provider call、Prompt送信、network、quota利用、Live Campaign、実Historical
-Verification Record、実Public bundle生成は0件である。次はSlice 6Dレビューであり、Slice 6Eは
-承認まで開始しない。
+Phase 6の公式status正本は、人間が最終AcceptanceしたPublic Suite release
+`phase6-java-evaluated-0e6d894d-001`である。accepted identityは次のとおりである。
 
-Python、TypeScript、Javaは実装目標だが、Live-readyは最低2言語の実toolchain受入完了、
-Phase 6 Completeは最低2言語で各1 complete pairとPublic Suite bundle完成を条件とする。
-4 Provider callsはengineering minimum、2言語各3反復の12 callsはprimary publication
-target、3言語各3反復の18 callsはfull targetである。4 callsだけから傾向、優位性、
-再現性を主張しない。
+| Artifact | Bytes | SHA-256 |
+|---|---:|---|
+| Public Suite Manifest | 7,548 | `88db41ae59fe03cff87d6d775cdded5dfdf6117bf73db02d36baad535a54b819` |
+| `checksums.json` | 2,268 | `43352dc27e7f5ffca63b9bdd65a3e38b100b255241a6240d99905ce0dc21f526` |
+| External Checksum Anchor | 259 | `50de193368057c6e095ec7625a31b67d62c5cd90fd997975debe72931422b818` |
+
+新releaseはpublicationだけではcurrent正本にならず、人間による明示的な最終Acceptance後に
+current正本となり、旧accepted release `phase6-python-evaluated-8a0aa704-002`をsupersedeした。
+旧releaseのManifest（6,204 bytes、SHA-256
+`cebd6f88bfc8094456e94c48b232301cc055f0469afec143b5f6ccb48f29a6f3`）を含むArtifactは削除、
+上書き、変更せず、不変の監査Artifactとして保持する。複数Manifestが存在してもfilesystem上の
+新しさ、名前順、timestamp、HEADだけではcurrentを選択せず、人間がcurrentとして明示Acceptance
+したrelease内Manifestをstatus正本とする。repository内へ別のcurrent-selector Artifactは
+新設せず、本書とROADMAPがこの人間Acceptanceとcurrent選択をtracked closeout記録として残す。
+
+published bundleは14 filesで、保存入力からのin-memory rendererと14/14でbyte一致する。
+`checksums.json`は自身を除く13 filesを保護し、そのSHA-256をbundle外Anchorへ固定する。
+Manifest、bundle、Anchorはstrict／canonical validationと人間レビューを通過している。
+
+Primary評価対象は次の2 Campaignである。
+
+| Language | Primary Campaign | Experiment ID | Status | Complete pair |
+|---|---|---|---|---:|
+| Python | `phase6-python-workflow-independent-001` | `phase6-python-workflow-independent-001` | `evaluated` | 1/1 |
+| Java | `java-independent-004` | `phase6-java-workflow` | `evaluated` | 1/1 |
+
+Javaは`staged`／`one_shot`ともProvider成功かつ全Acceptance／Regression／lint／typecheck Gateが
+PASSした。Python／Javaとも評価範囲は1 Fixture・1 complete pairである。Public Suiteの
+language reportは保存Campaign／Evidenceからrendererが再導出する。`report-workflow`が生成した
+Formal Workflow Reportは別のprovenanceを持ち、Manifest inputやPublic bundleへ含めない。
+
+評価分母からは、Pythonのabandoned／inconclusive Campaign、Javaの`java-rebound-001`、
+`java-independent-002`、`java-independent-003`、Historical Campaign、Mac Terminalの
+health-check callを除外する。これらは削除せず監査Artifactとして保持する。Historical sourceは
+`included_in_primary_denominator=false`に固定する。
+
+Provider消費の監査上の累積は`9または10 calls`である。確定下限は9、上限は10で、不確定性は
+旧Python Campaignの0または1 callに由来する。このaccountingは評価分母と分離する。
+
+TypeScriptは`typescript_compiler`未解決のため`not_ready`かつPublic Suite未掲載であり、3言語
+full targetの残課題として保持する。AntigravityはPhase 6の必須Providerではなく、
+`not_evaluated / upstream_artifact_signature_invalid`を維持する。Codex agent内のnested
+`codex exec`はpermission failureとなったが、詳細なOS-level root causeは未確定である。一方、
+Mac Terminalで明示的な絶対`CODEX_HOME`を設定したJava Campaignは成功した。現行運用ではLive
+CampaignだけをHost Terminalから実行し、sandbox制約を回避する実装は行わない。offline準備、
+validation、Report、publication、監査はCodexから実施できる。
+
+Phase 6 Completeの最低条件は、最低2言語の実toolchain受入、各言語1 complete pairを持つ
+承認済みLive、Public Suite bundle完成である。Python／Javaでこのengineering minimumを満たした。
+2言語各3反復の12 callsはprimary publication target、3言語各3反復の18 callsはfull targetであり、
+minimumではない。
+
+automatic winner、leaderboard、統計的有意性は生成しない。観測値は当該Fixture、Prompt、Gate、
+environment、実行時期へ限定し、一般的なWorkflow、Provider、model性能差へ一般化しない。
+cached inputを考慮しない単純なtoken／コスト比較を確定的なコスト差として扱わない。

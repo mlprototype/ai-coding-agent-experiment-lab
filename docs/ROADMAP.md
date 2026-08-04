@@ -175,34 +175,58 @@ architectureを再検証したうえで、ローカル環境の
 
 ## Phase 6: Multi-language Fixtures and Public Report
 
-**Status: Current**
+**Status: Complete**
 
 **目的:** Phase 4 Completeを基礎として、Codex Provider上のWorkflow比較を複数言語へ
 広げ、保存済みArtifactから追跡可能な公開結果を作る。Phase 5には依存せず、同Phaseの
 Blocked状態を変更しない。
 
-**現在の範囲:** Slice 6Aとして、Fixture Manifest／Acceptance／Diff Policy 1.0、
-Workflow Spec 2.1、Plan／Campaign／Recording／LiveRunArtifact 1.2、Public Suite
+**完了範囲:** Slice 6Aとして、Fixture Manifest／Acceptance／Diff Policy 1.0、
+Workflow Spec 2.1、Plan／Campaign 1.2、current writerのRecording／LiveRunArtifact 1.3、nested
+Codex Execution Evidence 1.6、Public Suite
 Manifest／Run Record／Report 1.0、canonical serialization、後方互換loader、
 cross-artifact validatorをoffline実装した。Slice 6Bでは3言語の独立したTag Normalizer
 Fixture、local capability audit、baseline／reference Acceptance、create-only Record生成を
 実装した。実測Acceptanceはcleanな実装commitへ束縛し、結果をGit管理外へ保存する。
 Slice 6CではSpec 2.1／Plan 1.2の決定的なcreate-only準備、Plan-bound入力のCampaign開始前・
 各call直前検証、Provider後・Gate前Diff enforcement、Campaign／Recording／LiveRunArtifact
-1.2 runtimeを実装した。`output_contract_violation`ではGateを0件に保ち、Gate後のWorkspaceと
-toolchainも再検証する。Python／Javaは各1 pair／2 planned calls、TypeScriptは`not_ready`の
-ままとし、実Provider／Prompt／Liveは0件である。Slice 6DではManifestに明示列挙された保存済み
+runtimeを実装した。`output_contract_violation`ではGateを0件に保ち、Gate後のWorkspaceと
+toolchainも再検証する。Slice 6DではManifestに明示列挙された保存済み
 ArtifactだけからPublic Run Record、Language／Suite JSON／Markdown、coverage、checksum、
 bundle外anchorを決定的に生成し、stagingからatomic no-replaceでcreate-only publishする
-offline runtimeを実装した。受入はsynthetic Artifactだけであり、実Campaign 002 Historical
-Verification Recordと実Public Suite bundleは0件のまま、レビュー待ちである。詳細は
+offline runtimeを実装した。Slice 6Eでは人間承認済みのPython／Java Live Campaignを評価し、
+両言語でEvidence付きcomplete pairを各1組得た。保存済みArtifactからPublic Suiteを
+create-onlyで公開し、人間の最終AcceptanceによりPhase 6を完了した。詳細は
 [Phase 6詳細設計](PHASE6_MULTI_LANGUAGE_PUBLIC_REPORT.md)を参照する。
+
+accepted releaseは`phase6-java-evaluated-0e6d894d-001`である。Manifestは7,548 bytes／
+SHA-256 `88db41ae59fe03cff87d6d775cdded5dfdf6117bf73db02d36baad535a54b819`、
+`checksums.json`は2,268 bytes／SHA-256
+`43352dc27e7f5ffca63b9bdd65a3e38b100b255241a6240d99905ce0dc21f526`、bundle外External Anchorは
+259 bytes／SHA-256
+`50de193368057c6e095ec7625a31b67d62c5cd90fd997975debe72931422b818`である。bundleは14 filesで、
+rendererとのbyte一致は14/14である。Python／Javaは`evaluated`、scheduled／complete pairは
+各1/1であり、Public Run Recordから正規化Evidenceまで追跡できる。総合winner、leaderboard、
+統計的有意性、一般的なmodel性能は主張しない。
+
+このreleaseはpublication時点ではcandidateであり、人間の最終Acceptance後にcurrent正本となって
+旧accepted release `phase6-python-evaluated-8a0aa704-002`をsupersedeした。旧releaseは変更せず
+監査Artifactとして保持し、currentはfilesystem順ではなく人間が明示Acceptanceしたreleaseで
+選択する。accepted PythonのRecording／Live Evidence 1.2・nested Codex Evidence 1.5と、accepted
+JavaのRecording／Live Evidence 1.3・nested Codex Evidence 1.6はstrict readerでともに検証し、
+再serializationせずmixed-version入力から正規化Public Run Recordを生成する。
+
+TypeScriptは3言語full targetの未完了項目として`not_ready`かつPublic Suite未掲載のまま
+保持するが、2言語engineering minimumの完了blockerではない。AntigravityはPhase 6の必須
+Providerではなく、`not_evaluated / upstream_artifact_signature_invalid`を既知残課題として
+維持する。Phase 7は`Planned`のままである。
 
 **受入条件:** Live-readyには最低2言語の実toolchain Fixture受入が必要で、offline実装だけ
 では到達しない。Completeには最低2言語で各1 complete pairを含む承認済みLiveとPublic
-Suite bundleが必要である。未実行言語は`not_run`として示す。3言語・各3反復の18 callsは
-目標であり、最低条件ではない。レポート数値を正規化run証跡へ追跡でき、総合winner、
-leaderboard、統計的有意差、一般的モデル性能を主張しない。
+Suite bundleが必要である。Plan-bound入力が揃った未実行言語は`not_run`として示し、入力が
+不足する言語は`not_ready`として区別する。3言語・各3反復の18 callsは目標であり、最低条件
+ではない。レポート数値を正規化run証跡へ追跡でき、総合winner、leaderboard、統計的有意差、
+一般的モデル性能を主張しない。
 
 ## Phase 7: Optional Enhancements
 

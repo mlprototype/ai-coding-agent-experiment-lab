@@ -65,14 +65,47 @@ Phase 6はPhase 4 Completeへ依存し、Phase 5とは独立して開始しま�
 準備とPlan-bound Campaign runtimeを実装しました。Plan生成時、Campaign開始前、各call直前に
 入力を照合し、Provider後・Gate前にDiff Policyを適用します。違反は
 `output_contract_violation`としてGate 0件で拒否し、Gate後もWorkspaceを再検証します。
-Python／Javaのengineering planは言語ごとに1 pair／2 planned callsで、生成成功後は
-`ready_not_run`です。TypeScriptは`typescript_compiler`未解決のため`not_ready`です。実Codex
-Provider／Prompt送信／Liveは0件です。Slice 6Dでは保存済みの列挙Artifactだけを読む決定的な
-Public Suite renderer、Historical offline verifier、checksum／外部anchor、atomic create-only
-publisherを実装し、synthetic Artifactだけで受け入れました。実Campaign 002のHistorical
-Verification Recordと実Public bundleは生成していません。したがってPhase 6はまだLive-ready
-でもCompleteでもなく、Slice 6Dはレビュー待ちです。詳細と停止境界は
-[Phase 6詳細設計](docs/PHASE6_MULTI_LANGUAGE_PUBLIC_REPORT.md)を参照してください。
+Slice 6Dでは保存済みの列挙Artifactだけを読む決定的なPublic Suite renderer、Historical
+offline verifier、checksum／外部anchor、atomic create-only publisherを実装しました。
+人間が最終AcceptanceしたPublic Suite
+`phase6-java-evaluated-0e6d894d-001`を現在の公式status正本とし、Python／Javaは各1 Fixture・
+1 complete pairで`evaluated`、Phase 6はengineering minimumを満たして`Complete`です。
+TypeScriptは`typescript_compiler`未解決の`not_ready`かつPublic Suite未掲載、Antigravityは
+`not_evaluated / upstream_artifact_signature_invalid`のままです。Phase 7は`Planned`です。
+
+accepted Manifestは
+`.artifacts/phase6/public-suite-inputs/phase6-java-evaluated-0e6d894d-001/suite-manifest.json`
+（7,548 bytes、SHA-256
+`88db41ae59fe03cff87d6d775cdded5dfdf6117bf73db02d36baad535a54b819`）です。14 filesのbundleは
+`.artifacts/phase6/public-suite/phase6-java-evaluated-0e6d894d-001/bundle`へcreate-onlyで公開し、
+`checksums.json`は2,268 bytes、SHA-256
+`43352dc27e7f5ffca63b9bdd65a3e38b100b255241a6240d99905ce0dc21f526`です。bundle外の
+`.artifacts/phase6/public-suite/phase6-java-evaluated-0e6d894d-001/bundle.checksums.sha256.json`
+は259 bytes、SHA-256
+`50de193368057c6e095ec7625a31b67d62c5cd90fd997975debe72931422b818`で、rendererとのbyte一致は
+14/14です。Python／Javaのscheduled／complete pairは各1/1です。
+
+Python primary Campaignは`phase6-python-workflow-independent-001`、Java primary Campaignは
+`java-independent-004`（experiment ID `phase6-java-workflow`）です。Pythonのabandoned／
+inconclusive Campaignと、Javaの`java-rebound-001`、`java-independent-002`、
+`java-independent-003`は評価分母から除外し、削除せず監査Artifactとして保持します。累積
+Provider accountingは`9または10 calls`で、不確定性は旧Python Campaignの0または1 callです。
+
+Formal Workflow Reportは`report-workflow`が生成するCampaign単位の成果物です。Public Suiteの
+language reportは保存Campaign／Evidenceからrendererが再導出した別の公開契約であり、Formal
+ReportをManifest inputやbundleへ混入させていません。Public Suiteはcanonical JSON、
+`checksums.json`、bundle外External Anchorで固定します。
+
+Live運用ではCodex agent内のnested `codex exec`がpermission failureとなり、詳細なOS-level
+root causeは未確定です。一方、Mac Terminalで明示的な絶対`CODEX_HOME`を設定したJava
+Campaignは成功しました。現行運用ではLive CampaignだけをHost Terminalから実行し、sandbox
+制約を回避する実装は行いません。offline準備、validation、Report、publication、監査はCodex
+から実施できます。
+
+この評価はPython／Javaそれぞれ1 Fixture・1 complete pairのone-shot／staged比較に限定します。
+automatic winner、leaderboard、統計的有意性はなく、一般的なWorkflow、Provider、model性能の
+優劣を主張しません。cached inputを無視した単純なtoken／コスト比較も行いません。詳細と
+provenanceは[Phase 6詳細設計](docs/PHASE6_MULTI_LANGUAGE_PUBLIC_REPORT.md)を参照してください。
 
 Phase 4までに次を提供します。
 
@@ -272,8 +305,8 @@ macOSはlocal process-tree testで検証済みです。Linux実装経路は有�
 - Phase 4: Workflow A/B Experiment（完了、Campaign 002は3/3 complete pairs）
 - Phase 5: Antigravity CLI Provider（Blocked、Slice 5A offline実装済み、Slice 5B／5Cは
   上流artifact署名検証失敗により停止）
-- Phase 6: Multi-language Fixtures and Public Report（Current、Slice 6D offline/fake実装、
-  Live／実Public bundle 0件、レビュー待ち）
+- Phase 6: Multi-language Fixtures and Public Report（完了、Python／Java各1/1 complete pair、
+  accepted Public Suite公開済み）
 - Phase 7: Optional Enhancements
 
 詳細は [docs/ROADMAP.md](docs/ROADMAP.md) を参照してください。
