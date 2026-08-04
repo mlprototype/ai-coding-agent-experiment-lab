@@ -20,13 +20,19 @@ Artifact、Provider-call budgetの契約を再検証する。
 
 ## Approval境界
 
-Live実行前に、少なくとも次が人間レビュー済みでなければならない。
+Live実行前に、少なくとも次が人間レビュー済みでなければならない。固定値の由来は混同せず、
+次の3分類で扱う。
 
-- branch、reviewed HEAD、upstreamが固定されたWorkflow Spec
-- strict／canonical load済みのPlan
-- statusがpendingで、Spec／Plan／Campaign pathを束縛したSupplemental Approval Packet
-- exact Provider-call budgetとrun順序
-- 未作成のcreate-only Campaign／Recording／Evidence出力先
+- **Packet-bound**：`reviewed_repository_head`、Spec／PlanのArtifact binding、Campaignの
+  `output_root`／`campaign_jsonl`、`exact_argv`、exact Provider-call budgetとrun順序
+- **外部の人間承認値**：branch、upstream、Supplemental Approval Packet自身のbytes／SHA-256
+- **runtime preflight／実装allowlist**：Codex CLI version、CLI profile、executable identityと
+  executable SHA-256
+
+加えて、strict／canonical load済みのPlan、statusがpendingのSupplemental Approval Packet、
+未作成のcreate-only Campaign出力先、およびPlanとCampaign契約から正式validatorが全run分を
+導出したRecording／Evidence／Diagnostic出力先が必要である。
+
 - 固定入力のbytes／SHA-256
 - quotaと認証状態の人間確認
 - 対象Campaign／Provider／Gateの残存processがないことの確認
@@ -79,8 +85,9 @@ unset codex_home_contract
 
 ## Host Terminal preflight
 
-以下は順序を変えずに実施する。placeholderはSupplemental Approval Packetに記録された値で
-置き換える。個人固有path、Campaign ID、model、SHA-256をこのRunbookから推測しない。
+以下は順序を変えずに実施する。placeholderは、Packet-bound値、外部の人間承認値、または
+runtime preflight／実装allowlistのうち、明記された正しい出典から設定する。個人固有path、
+Campaign ID、model、SHA-256をこのRunbookから推測しない。
 
 ### 1. Repositoryへ移動
 
@@ -92,12 +99,13 @@ cd "$REPOSITORY_ROOT" || exit 1
 ### 2. Git identityとworktree
 
 ```sh
-export APPROVED_BRANCH="packet-bound-branch"
-export APPROVED_HEAD="packet-bound-full-commit"
+export APPROVED_BRANCH="human-approved-branch"
+export APPROVED_HEAD="packet-reviewed-repository-head"
+export APPROVED_UPSTREAM_HEAD="human-approved-upstream-head"
 
 test "$(git rev-parse --abbrev-ref HEAD)" = "$APPROVED_BRANCH" || exit 1
 test "$(git rev-parse HEAD)" = "$APPROVED_HEAD" || exit 1
-test "$(git rev-parse '@{upstream}')" = "$APPROVED_HEAD" || exit 1
+test "$(git rev-parse '@{upstream}')" = "$APPROVED_UPSTREAM_HEAD" || exit 1
 test "$(git rev-list --left-right --count HEAD...'@{upstream}')" = "0	0" || exit 1
 test -z "$(git status --porcelain --untracked-files=no)" || exit 1
 ```
@@ -105,36 +113,40 @@ test -z "$(git status --porcelain --untracked-files=no)" || exit 1
 Git fetch、branch変更、commit、stash、clean、resetはpreflightに含めない。期待値と違えばLiveを
 開始せず、人間レビューへ戻す。
 
-### 3. Packet-bound入力のbytes／SHA-256
+### 3. 固定入力のbytes／SHA-256
 
-Packetから各入力のpath、bytes、SHA-256を設定し、Spec、Plan、Acceptance、Manifest、metadata
-などPacketが列挙する全fileに同じ確認を行う。
+Spec／PlanなどはPacketのArtifact bindingから設定し、Packet自身のbytes／SHA-256は外部の
+人間承認値から設定する。Packetは自身のhashを内部に保持できない。Acceptance、Manifest、
+metadataなどは、Packet／Planのbindingと外部承認が要求する範囲を正式loaderで検証する。
 
 ```sh
-verify_packet_file() {
-  packet_path=$1
-  packet_bytes=$2
-  packet_sha256=$3
-  [ -f "$packet_path" ] && [ ! -L "$packet_path" ] || return 1
-  [ "$(wc -c < "$packet_path" | tr -d ' ')" = "$packet_bytes" ] || return 1
-  [ "$(shasum -a 256 "$packet_path" | awk '{print $1}')" = "$packet_sha256" ] || return 1
+verify_fixed_file() {
+  fixed_path=$1
+  fixed_bytes=$2
+  fixed_sha256=$3
+  [ -f "$fixed_path" ] && [ ! -L "$fixed_path" ] || return 1
+  [ "$(wc -c < "$fixed_path" | tr -d ' ')" = "$fixed_bytes" ] || return 1
+  [ "$(shasum -a 256 "$fixed_path" | awk '{print $1}')" = "$fixed_sha256" ] || return 1
 }
 
-verify_packet_file "$SPEC_PATH" "$SPEC_BYTES" "$SPEC_SHA256" || exit 1
-verify_packet_file "$PLAN_PATH" "$PLAN_BYTES" "$PLAN_SHA256" || exit 1
-verify_packet_file "$SUPPLEMENTAL_APPROVAL_PATH" "$PACKET_BYTES" "$PACKET_SHA256" || exit 1
+verify_fixed_file "$SPEC_PATH" "$SPEC_BYTES" "$SPEC_SHA256" || exit 1
+verify_fixed_file "$PLAN_PATH" "$PLAN_BYTES" "$PLAN_SHA256" || exit 1
+verify_fixed_file "$SUPPLEMENTAL_APPROVAL_PATH" \
+  "$HUMAN_APPROVED_PACKET_BYTES" "$HUMAN_APPROVED_PACKET_SHA256" || exit 1
 ```
 
 ### 4. create-only出力の不存在
 
-Packetに予約されたCampaign、Recording、Evidence、Diagnostic、Report pathをすべて列挙する。
-broken symlinkもcollisionとして扱う。
+PacketからCampaignの`output_root`と`campaign_jsonl`を取得する。Recording、Evidence、Diagnosticは
+PlanとCampaign契約から正式validatorで**全run分**を導出し、その完全なpath集合について
+collisionがないことを検証する。run pathを手書きで推測したり、先頭runだけを確認したりしない。
+ReportはLive preflightの出力ではなく、別のReport-only Approvalで出力先のcollisionを確認する。
+いずれもbroken symlinkをcollisionとして扱う。
 
 ```sh
 for packet_output in \
-  "$CAMPAIGN_PATH" \
-  "$RECORDING_PATH_1" \
-  "$EVIDENCE_PATH_1"
+  "$CAMPAIGN_OUTPUT_ROOT" \
+  "$CAMPAIGN_JSONL"
 do
   if [ -e "$packet_output" ] || [ -L "$packet_output" ]; then
     printf '%s\n' OUTPUT_COLLISION
@@ -143,7 +155,9 @@ do
 done
 ```
 
-既存出力を削除、rename、上書きして続行しない。
+このshell例はPacketが直接保持するCampaign pathだけを示す。続ける前に、正式validatorによる
+全planned runのRecording／Evidence／Diagnostic path導出とcollision検証が成功していなければ
+ならない。既存出力を削除、rename、上書きして続行しない。
 
 ### 5. `CODEX_HOME`契約
 
@@ -161,8 +175,11 @@ shasum -a 256 "$CODEX_BIN"
 codex login status
 ```
 
-versionとexecutable SHA-256はPacketの許可値へ照合する。`codex login status`は、明示した
-`CODEX_HOME`がexportされた同じshellで実行し、認証済みであることだけを人間が確認する。
+versionとCLI profileは現行実装のallowlistへ照合する。executable identityとSHA-256はruntime
+preflightで観測し、identityがverifiedであることを確認する。現行実装はexecutable SHA-256の
+固定allowlistを持たない。人間がSHA-256を事前承認した場合だけ、その外部承認値とも照合する。
+これらはPacket fieldではない。`codex login status`は、明示した`CODEX_HOME`がexportされた同じ
+shellで実行し、認証済みであることだけを人間が確認する。
 認証fileや`CODEX_HOME`値を表示せず、出力をArtifactへ保存しない。
 
 `command -v`、version、help、login statusはpreflight用のread-only確認である。これらと、
@@ -189,8 +206,8 @@ OS権限制約で一覧を取得できない場合は成功と推測せず、人
 
 ## Live実行
 
-実際のargvはSupplemental Approval Packetの`exact_argv`をbyte単位で確認し、そのまま使用する。
-次は形を示すplaceholderであり、実commandの正本ではない。
+実際のargvはSupplemental Approval Packetの`exact_argv`の全配列要素を、順序を含め完全一致で
+確認し、そのまま使用する。次は形を示すplaceholderであり、実commandの正本ではない。
 
 ```sh
 .venv/bin/agentlab run-phase6-campaign \
