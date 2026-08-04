@@ -1,0 +1,19 @@
+{
+  "attempted_runs": 0,
+  "complete_pair_count": 0,
+  "completed_runs": 0,
+  "estimability": "not_estimable",
+  "failed_runs": 0,
+  "gate_not_executed_reason": {
+    "output_contract_violation": 1
+  },
+  "gate_not_executed_runs": 1,
+  "interrupted_runs": 0,
+  "language": "python",
+  "not_run_runs": 1,
+  "output_rejected_runs": 1,
+  "scheduled_pair_count": 0,
+  "scheduled_runs": 1,
+  "schema_version": "1.0",
+  "status": "blocked"
+}

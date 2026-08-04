@@ -1,0 +1,26 @@
+{
+  "editable_paths": [
+    {
+      "allow_create": false,
+      "allow_delete": false,
+      "path": "TagNormalizer.java"
+    }
+  ],
+  "fixture_revision": "tag-normalizer-java-v1",
+  "language": "java",
+  "protected_paths": [
+    {
+      "path": "GateHelper.java",
+      "role": "gate_helper"
+    },
+    {
+      "path": "fixture.json",
+      "role": "configuration"
+    }
+  ],
+  "reject_hardlinks": true,
+  "reject_special_files": true,
+  "reject_symlinks": true,
+  "reject_unclassified_paths": true,
+  "schema_version": "1.0"
+}

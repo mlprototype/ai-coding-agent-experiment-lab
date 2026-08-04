@@ -435,6 +435,37 @@ class CodexProviderFailureHint(StrEnum):
     CONFLICTING = "conflicting"
 
 
+class CodexStderrFailureCategory(StrEnum):
+    """Safe classification derived from bounded, discarded stderr bytes."""
+
+    NOT_APPLICABLE = "not_applicable"
+    AUTHENTICATION = "authentication"
+    QUOTA_OR_RATE_LIMIT = "quota_or_rate_limit"
+    MODEL_ACCESS = "model_access"
+    STRICT_CONFIG_OR_OPTION = "strict_config_or_option"
+    PERMISSION = "permission"
+    PROVIDER_SERVICE = "provider_service"
+    UNKNOWN = "unknown"
+
+
+class CodexStderrRuleId(StrEnum):
+    """Fixed classifier rule identifier; it never contains Provider text."""
+
+    NOT_APPLICABLE = "not_applicable"
+    UNCLASSIFIED = "unclassified"
+    AUTHENTICATION_REQUIRED = "authentication_required"
+    QUOTA_OR_RATE_LIMIT = "quota_or_rate_limit"
+    MODEL_ACCESS = "model_access"
+    STRICT_CONFIG_OR_OPTION = "strict_config_or_option"
+    PERMISSION_DENIED = "permission_denied"
+    PROVIDER_SERVICE = "provider_service"
+
+
+class CodexExecutableIdentityStatus(StrEnum):
+    VERIFIED = "verified"
+    UNAVAILABLE = "unavailable"
+
+
 class CodexItemType(StrEnum):
     AGENT_MESSAGE = "agent_message"
     COMMAND = "command"
@@ -1259,10 +1290,89 @@ class LiveEvaluationSummary(ContractModel):
         return self
 
 
+_EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+class CodexStderrDiagnostic(ContractModel):
+    """Identity and fixed classification for stderr whose bytes are discarded."""
+
+    stderr_bytes: StrictInt = Field(ge=0)
+    stderr_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    stderr_truncated: StrictBool
+    stderr_nonempty: StrictBool
+    failure_category: CodexStderrFailureCategory
+    rule_id: CodexStderrRuleId
+
+    @model_validator(mode="after")
+    def values_are_coherent(self) -> CodexStderrDiagnostic:
+        if self.stderr_nonempty is not (self.stderr_bytes > 0):
+            raise ValueError("stderr_nonempty must match stderr_bytes")
+        if self.stderr_bytes == 0 and self.stderr_sha256 != _EMPTY_SHA256:
+            raise ValueError("empty stderr requires the SHA-256 of empty bytes")
+        if self.stderr_truncated and not self.stderr_nonempty:
+            raise ValueError("truncated stderr must be nonempty")
+        expected_rules = {
+            CodexStderrFailureCategory.NOT_APPLICABLE:
+            CodexStderrRuleId.NOT_APPLICABLE,
+            CodexStderrFailureCategory.AUTHENTICATION:
+            CodexStderrRuleId.AUTHENTICATION_REQUIRED,
+            CodexStderrFailureCategory.QUOTA_OR_RATE_LIMIT:
+            CodexStderrRuleId.QUOTA_OR_RATE_LIMIT,
+            CodexStderrFailureCategory.MODEL_ACCESS:
+            CodexStderrRuleId.MODEL_ACCESS,
+            CodexStderrFailureCategory.STRICT_CONFIG_OR_OPTION:
+            CodexStderrRuleId.STRICT_CONFIG_OR_OPTION,
+            CodexStderrFailureCategory.PERMISSION:
+            CodexStderrRuleId.PERMISSION_DENIED,
+            CodexStderrFailureCategory.PROVIDER_SERVICE:
+            CodexStderrRuleId.PROVIDER_SERVICE,
+            CodexStderrFailureCategory.UNKNOWN:
+            CodexStderrRuleId.UNCLASSIFIED,
+        }
+        if self.rule_id is not expected_rules[self.failure_category]:
+            raise ValueError("stderr failure category and rule ID differ")
+        return self
+
+
+class CodexExecutableIdentity(ContractModel):
+    """Path-free identity for the executable selected by preflight."""
+
+    status: CodexExecutableIdentityStatus
+    sha256: StrictStr | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+    @model_validator(mode="after")
+    def status_matches_digest(self) -> CodexExecutableIdentity:
+        if (self.status is CodexExecutableIdentityStatus.VERIFIED) is not (
+            self.sha256 is not None
+        ):
+            raise ValueError("verified executable identity requires exactly one digest")
+        return self
+
+
+class CodexArgvIdentity(ContractModel):
+    """Digest of a path-free canonical argv representation."""
+
+    profile_id: Literal[CodexCliProfile.HEADLESS_EXEC_EXPLICIT_NEVER_V2]
+    sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    prompt_in_argv: Literal[False]
+
+
+class CodexChildEnvironmentContract(ContractModel):
+    """Boolean safety claims only; no child environment values are persisted."""
+
+    codex_home_included: Literal[True]
+    credential_environment_excluded: Literal[True]
+    path_from_allowlist: Literal[True]
+    cwd_verified_ephemeral_workspace: Literal[True]
+
+
 class CodexExecutionEvidence(ContractModel):
     """Redacted summary of one Codex CLI process; raw events are never persisted."""
 
-    schema_version: Literal["1.1", "1.2", "1.3", "1.4", "1.5"]
+    schema_version: Literal["1.1", "1.2", "1.3", "1.4", "1.5", "1.6"]
     provider: Literal[Provider.CODEX]
     cli_version: StrictStr | None
     cli_profile: CodexCliProfile
@@ -1306,6 +1416,22 @@ class CodexExecutionEvidence(ContractModel):
     stderr_bytes: StrictInt = Field(ge=0)
     stdout_limit_exceeded: StrictBool
     stderr_truncated: StrictBool
+    stderr_diagnostic: CodexStderrDiagnostic | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    executable_identity: CodexExecutableIdentity | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    argv_identity: CodexArgvIdentity | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    child_environment: CodexChildEnvironmentContract | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     termination: TerminationEvidence
 
     @field_validator("preflight_checked_at", "started_at", "completed_at", mode="before")
@@ -1384,6 +1510,70 @@ class CodexExecutionEvidence(ContractModel):
             ):
                 raise ValueError(
                     "pre-spawn Evidence cannot contain a Provider message hint"
+                )
+
+        version_1_6_values = (
+            self.stderr_diagnostic,
+            self.executable_identity,
+            self.argv_identity,
+            self.child_environment,
+        )
+        if self.schema_version != "1.6":
+            if any(value is not None for value in version_1_6_values):
+                raise ValueError(
+                    "Codex Evidence before 1.6 must not contain startup diagnostics"
+                )
+        else:
+            if self.stderr_diagnostic is None or self.executable_identity is None:
+                raise ValueError(
+                    "Codex Evidence 1.6 requires stderr and executable identity"
+                )
+            if (
+                self.stderr_diagnostic.stderr_bytes != self.stderr_bytes
+                or self.stderr_diagnostic.stderr_truncated is not self.stderr_truncated
+            ):
+                raise ValueError(
+                    "Codex Evidence stderr identity differs from existing counters"
+                )
+            invocation_attempted = self.invocation_state in {
+                CodexInvocationState.SPAWN_ATTEMPTED,
+                CodexInvocationState.PROCESS_STARTED,
+            }
+            if invocation_attempted:
+                if self.argv_identity is None or self.child_environment is None:
+                    raise ValueError(
+                        "attempted Codex Evidence 1.6 requires argv and environment identity"
+                    )
+                if self.argv_identity.profile_id is not self.cli_profile:
+                    raise ValueError("argv profile must match the selected CLI profile")
+            elif self.argv_identity is not None or self.child_environment is not None:
+                raise ValueError(
+                    "pre-invocation Codex Evidence must omit argv and child environment"
+                )
+            nonzero = self.exit_code is not None and self.exit_code != 0
+            if nonzero:
+                if (
+                    self.stderr_diagnostic.failure_category
+                    is CodexStderrFailureCategory.NOT_APPLICABLE
+                ):
+                    raise ValueError(
+                        "non-zero exit requires a stderr failure category"
+                    )
+                if (
+                    self.stderr_diagnostic.stderr_truncated
+                    and self.stderr_diagnostic.failure_category
+                    is not CodexStderrFailureCategory.UNKNOWN
+                ):
+                    raise ValueError(
+                        "truncated stderr from a non-zero exit "
+                        "must remain unclassified"
+                    )
+            elif (
+                self.stderr_diagnostic.failure_category
+                is not CodexStderrFailureCategory.NOT_APPLICABLE
+            ):
+                raise ValueError(
+                    "stderr failure category applies only to positive non-zero exit"
                 )
 
         if self.schema_version == "1.1":
@@ -1558,7 +1748,7 @@ class CodexExecutionEvidence(ContractModel):
             )
         if (
             self.failure_stage in lifecycle_dependent_failure_stages
-            and self.schema_version not in {"1.3", "1.4", "1.5"}
+            and self.schema_version not in {"1.3", "1.4", "1.5", "1.6"}
         ):
             raise ValueError(
                 "runner handoff failure stages require Codex Evidence 1.3+"
@@ -1713,7 +1903,7 @@ class CodexExecutionEvidence(ContractModel):
             raise ValueError("normalized Codex event counts must equal event_count")
         if self.verified_flags != sorted(set(self.verified_flags)):
             raise ValueError("verified_flags must be unique and sorted")
-        if self.schema_version in {"1.4", "1.5"}:
+        if self.schema_version in {"1.4", "1.5", "1.6"}:
             if self.terminal_event is CodexTerminalEvent.NONE:
                 terminal_counts_match = (
                     self.turn_completed_count,
@@ -1817,7 +2007,7 @@ class CodexExecutionEvidence(ContractModel):
                 raise ValueError("successful Codex Evidence requires process cleanup")
             if self.stdout_limit_exceeded:
                 raise ValueError("successful Codex Evidence cannot exceed stdout limit")
-            if self.schema_version == "1.5" and (
+            if self.schema_version in {"1.5", "1.6"} and (
                 self.stdin_write_state is not CodexStdinWriteState.COMPLETE
                 or self.provider_failure_hint
                 is not CodexProviderFailureHint.NOT_APPLICABLE
@@ -1862,7 +2052,7 @@ class CodexExecutionEvidence(ContractModel):
         ):
             raise ValueError("provider_turn_failed requires a failed terminal event")
         if (
-            self.schema_version == "1.5"
+            self.schema_version in {"1.5", "1.6"}
             and self.failure_kind is LiveFailureKind.PROVIDER_TURN_FAILED
             and self.provider_failure_hint
             is CodexProviderFailureHint.NOT_APPLICABLE
@@ -2704,7 +2894,7 @@ class LiveRunArtifact(ContractModel):
         if not self.prompt_redacted or self.raw_provider_output_persisted:
             raise ValueError("Live Prompt/provider redaction flags must use required values")
         if (
-            self.codex.schema_version == "1.5"
+            self.codex.schema_version in {"1.5", "1.6"}
             and self.codex.stdin_bytes_total is not None
             and self.codex.stdin_bytes_total != self.prompt_bytes
         ):

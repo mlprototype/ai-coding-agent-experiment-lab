@@ -1,4 +1,4 @@
-"""Offline-only aggregation for Phase 4 Workflow Campaign Artifacts."""
+"""Offline-only aggregation for versioned Workflow Campaign Artifacts."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
@@ -45,6 +46,34 @@ from agentlab.models import (
     Workflow,
     WorkspaceLifecycle,
 )
+from agentlab.phase6 import (
+    ArtifactReference,
+    LanguageStatus,
+    LiveRunArtifactV1_2,
+    LiveRunArtifactV1_3,
+    LoadedPhase6Campaign,
+    Phase6CampaignOutcome,
+    Phase6CampaignRunEvent,
+    Phase6ContractError,
+    Phase6LiveRunArtifact,
+    Phase6Recording,
+    PrimarySuiteSource,
+    SourceClass,
+    WorkflowExperimentSpecV2_1,
+    WorkflowPlanV1_2,
+    _canonical_jsonl_line,
+    _validate_primary_live_bindings,
+    canonical_json_bytes,
+    load_campaign_contract,
+    load_diff_policy,
+    load_fixture_acceptance,
+    load_fixture_manifest,
+    load_live_run_artifact_contract,
+    load_recording_contract,
+    load_workflow_plan_contract,
+    load_workflow_spec_contract,
+    validate_plan_bindings,
+)
 from agentlab.recording import (
     LiveRunCompletedEvent,
     LiveRunFailedEvent,
@@ -57,12 +86,22 @@ from agentlab.workflow import (
     WorkflowPlan,
     WorkflowPlanError,
     WorkflowPlanRun,
+    WorkflowSpecError,
     _publish_create_only_pair,
     _strict_json,
-    load_workflow_plan,
     workflow_plan_bytes,
     workflow_prompt_fingerprint,
 )
+
+ReportArtifact = LiveRunArtifact | Phase6LiveRunArtifact
+
+
+@dataclass(frozen=True)
+class _ReportRunEvent:
+    status: CampaignRunStatus
+    outcome: CampaignOutcome
+    provider_call_count: int | None
+    retry_count: int
 
 
 class WorkflowReportError(ValueError):
@@ -251,7 +290,7 @@ def _observed(values: Sequence[int | None]) -> ObservedIntegerAggregate:
     )
 
 
-def _gate(artifacts: list[LiveRunArtifact], gate: GateKind) -> GateResultAggregate:
+def _gate(artifacts: list[ReportArtifact], gate: GateKind) -> GateResultAggregate:
     commands = [
         command
         for artifact in artifacts
@@ -282,7 +321,7 @@ def _usage_metric(
 
 
 def _usage_source(
-    artifacts: list[LiveRunArtifact],
+    artifacts: list[ReportArtifact],
     source: UsageMetricSource,
 ) -> UsageSourceAggregate:
     selected = [
@@ -300,7 +339,7 @@ def _usage_source(
     )
 
 
-def _usage(artifacts: list[LiveRunArtifact]) -> UsageAggregate:
+def _usage(artifacts: list[ReportArtifact]) -> UsageAggregate:
     available = [
         artifact
         for artifact in artifacts
@@ -542,11 +581,222 @@ def _terminal_events(events: Sequence[object]) -> dict[str, CampaignRunEvent]:
     return result
 
 
+def _legacy_report_events(
+    terminal: dict[str, CampaignRunEvent],
+) -> dict[str, _ReportRunEvent]:
+    normalized: dict[str, _ReportRunEvent] = {}
+    for run_id, event in terminal.items():
+        if event.outcome is None:
+            raise WorkflowReportError(f"Campaign terminal outcome is absent for {run_id}")
+        normalized[run_id] = _ReportRunEvent(
+            status=event.status,
+            outcome=event.outcome,
+            provider_call_count=event.provider_call_count,
+            retry_count=event.retry_count,
+        )
+    return normalized
+
+
+def _phase6_report_events(
+    campaign: LoadedPhase6Campaign,
+) -> dict[str, _ReportRunEvent]:
+    normalized: dict[str, _ReportRunEvent] = {}
+    for event in campaign.events:
+        if (
+            not isinstance(event, Phase6CampaignRunEvent)
+            or event.status is CampaignRunStatus.STARTED
+        ):
+            continue
+        if event.outcome is None:
+            raise WorkflowReportError(
+                f"Campaign 1.2 terminal outcome is absent for {event.run_id}"
+            )
+        if event.outcome is Phase6CampaignOutcome.OUTPUT_CONTRACT_VIOLATION:
+            raise WorkflowReportError(
+                "Workflow Report 1.0 cannot represent output_contract_violation"
+            )
+        try:
+            outcome = CampaignOutcome(event.outcome.value)
+        except ValueError as error:
+            raise WorkflowReportError(
+                f"unsupported Campaign 1.2 outcome for {event.run_id}"
+            ) from error
+        normalized[event.run_id] = _ReportRunEvent(
+            status=event.status,
+            outcome=outcome,
+            provider_call_count=event.provider_call_count,
+            retry_count=campaign.finished.retry_count,
+        )
+    return normalized
+
+
+def _phase6_recording_bytes(recording: Phase6Recording) -> bytes:
+    return b"".join(
+        _canonical_jsonl_line(event)
+        for event in (recording.started, recording.terminal)
+    )
+
+
+def _load_phase6_report_inputs(
+    spec_path: Path,
+    plan_path: Path,
+    campaign_path: Path,
+    plan: WorkflowPlanV1_2,
+) -> tuple[
+    bytes,
+    bytes,
+    dict[str, _ReportRunEvent],
+    dict[str, ReportArtifact],
+]:
+    loaded_spec = load_workflow_spec_contract(spec_path)
+    if not isinstance(loaded_spec.spec, WorkflowExperimentSpecV2_1):
+        raise WorkflowReportError("Workflow Plan 1.2 requires Workflow Spec 2.1")
+    spec = loaded_spec.spec
+    fixture_manifest = load_fixture_manifest(
+        spec_path.parent / Path(spec.fixture_manifest_path)
+    )
+    fixture_acceptance = load_fixture_acceptance(
+        spec_path.parent / Path(spec.fixture_acceptance_path)
+    )
+    diff_policy = load_diff_policy(spec_path.parent / Path(spec.diff_policy_path))
+    fixture_manifest_bytes = canonical_json_bytes(fixture_manifest)
+    fixture_acceptance_bytes = canonical_json_bytes(fixture_acceptance)
+    diff_policy_bytes = canonical_json_bytes(diff_policy)
+    validate_plan_bindings(
+        loaded_spec=loaded_spec,
+        plan=plan,
+        fixture_manifest_bytes=fixture_manifest_bytes,
+        fixture_manifest=fixture_manifest,
+        fixture_acceptance_bytes=fixture_acceptance_bytes,
+        fixture_acceptance=fixture_acceptance,
+        diff_policy_bytes=diff_policy_bytes,
+        diff_policy=diff_policy,
+    )
+
+    campaign = load_campaign_contract(campaign_path)
+    if not isinstance(campaign, LoadedPhase6Campaign):
+        raise WorkflowReportError("Workflow Plan 1.2 requires Campaign 1.2")
+    terminal = _phase6_report_events(campaign)
+    expected_ids = {run.run_id for run in plan.runs}
+    if set(terminal) != expected_ids:
+        raise WorkflowReportError(
+            "Campaign must retain one terminal state for every planned run"
+        )
+
+    artifacts: list[Phase6LiveRunArtifact] = []
+    recordings: list[Phase6Recording] = []
+    evidence_references: list[ArtifactReference] = []
+    recording_references: list[ArtifactReference] = []
+    artifacts_by_run: dict[str, ReportArtifact] = {}
+    for run in plan.runs:
+        event = terminal[run.run_id]
+        evidence_path = spec_path.parent / Path(run.evidence_path)
+        recording_path = spec_path.parent / Path(run.recording_path)
+        artifact_required = event.status in {
+            CampaignRunStatus.COMPLETED,
+            CampaignRunStatus.FAILED,
+        }
+        if not artifact_required:
+            if os.path.lexists(evidence_path) or os.path.lexists(recording_path):
+                raise WorkflowReportError(
+                    f"unattempted or interrupted run has saved Artifacts: {run.run_id}"
+                )
+            continue
+        artifact = load_live_run_artifact_contract(evidence_path)
+        recording = load_recording_contract(recording_path)
+        if not isinstance(
+            artifact,
+            (LiveRunArtifactV1_2, LiveRunArtifactV1_3),
+        ) or not isinstance(
+            recording,
+            Phase6Recording,
+        ):
+            raise WorkflowReportError(
+                "Workflow Plan 1.2 requires Phase 6 Artifact schema 1.2 or "
+                f"1.3 for {run.run_id}"
+            )
+        evidence_sha256 = hashlib.sha256(canonical_json_bytes(artifact)).hexdigest()
+        recording_sha256 = hashlib.sha256(
+            _phase6_recording_bytes(recording)
+        ).hexdigest()
+        artifacts.append(artifact)
+        recordings.append(recording)
+        evidence_references.append(
+            ArtifactReference(
+                role="evidence",
+                path=run.evidence_path,
+                sha256=evidence_sha256,
+            )
+        )
+        recording_references.append(
+            ArtifactReference(
+                role="recording",
+                path=run.recording_path,
+                sha256=recording_sha256,
+            )
+        )
+        artifacts_by_run[run.run_id] = artifact
+
+    canonical_plan = workflow_plan_bytes(plan)
+    campaign_bytes = b"".join(
+        _canonical_jsonl_line(event) for event in campaign.events
+    )
+    source = PrimarySuiteSource(
+        source_class=SourceClass.PRIMARY,
+        language=plan.language,
+        expected_language_status=(
+            LanguageStatus.EVALUATED if artifacts else LanguageStatus.BLOCKED
+        ),
+        blocker=None if artifacts else "no_attempted_run_artifacts",
+        spec=ArtifactReference(
+            role="spec",
+            path=spec_path.name,
+            sha256=loaded_spec.sha256,
+        ),
+        fixture_manifest=ArtifactReference(
+            role="fixture_manifest",
+            path=spec.fixture_manifest_path,
+            sha256=hashlib.sha256(fixture_manifest_bytes).hexdigest(),
+        ),
+        fixture_acceptance=ArtifactReference(
+            role="fixture_acceptance",
+            path=spec.fixture_acceptance_path,
+            sha256=hashlib.sha256(fixture_acceptance_bytes).hexdigest(),
+        ),
+        diff_policy=ArtifactReference(
+            role="diff_policy",
+            path=spec.diff_policy_path,
+            sha256=hashlib.sha256(diff_policy_bytes).hexdigest(),
+        ),
+        plan=ArtifactReference(
+            role="plan",
+            path=plan_path.name,
+            sha256=hashlib.sha256(canonical_plan).hexdigest(),
+        ),
+        campaign=ArtifactReference(
+            role="campaign",
+            path=campaign_path.name,
+            sha256=hashlib.sha256(campaign_bytes).hexdigest(),
+        ),
+        evidence=evidence_references,
+        recordings=recording_references,
+    )
+    _validate_primary_live_bindings(
+        source=source,
+        spec=spec,
+        plan=plan,
+        campaign=campaign,
+        evidence=artifacts,
+        recordings=recordings,
+    )
+    return canonical_plan, campaign_bytes, terminal, artifacts_by_run
+
+
 def _aggregate_workflow(
     workflow: Workflow,
     planned_runs: list[WorkflowPlanRun],
-    terminal: dict[str, CampaignRunEvent],
-    artifacts_by_run: dict[str, LiveRunArtifact],
+    terminal: dict[str, _ReportRunEvent],
+    artifacts_by_run: dict[str, ReportArtifact],
 ) -> WorkflowAggregate:
     runs = [run for run in planned_runs if run.workflow is workflow]
     events = [terminal[run.run_id] for run in runs]
@@ -627,30 +877,55 @@ def aggregate_workflow_campaign(
 ) -> WorkflowReport:
     """Read only persisted Artifacts; this function has no execution dependency."""
     try:
-        plan = load_workflow_plan(plan_path)
-        events = load_campaign(campaign_path)
-    except (WorkflowPlanError, CampaignError) as error:
-        raise WorkflowReportError(str(error)) from error
-    first = events[0]
-    assert isinstance(first, CampaignStartedEvent)
-    canonical = workflow_plan_bytes(plan)
-    if first.plan_sha256 != hashlib.sha256(canonical).hexdigest():
-        raise WorkflowReportError("Campaign does not match Plan")
-    terminal = _terminal_events(events)
-    expected_ids = {run.run_id for run in plan.runs}
-    if set(terminal) != expected_ids:
-        raise WorkflowReportError("Campaign must retain one terminal state for every planned run")
-    for run in plan.runs:
-        event = terminal[run.run_id]
-        if (
-            event.task_id != run.task_id
-            or event.workflow is not run.workflow
-            or event.repetition_index != run.repetition_index
-        ):
-            raise WorkflowReportError(
-                f"Campaign run identity differs from Plan for {run.run_id}"
+        plan = load_workflow_plan_contract(plan_path)
+        if isinstance(plan, WorkflowPlanV1_2):
+            canonical, campaign_bytes, terminal, artifacts = (
+                _load_phase6_report_inputs(
+                    spec_path,
+                    plan_path,
+                    campaign_path,
+                    plan,
+                )
             )
-    artifacts = _load_artifacts(spec_path, plan, terminal)
+        else:
+            events = load_campaign(campaign_path)
+            first = events[0]
+            assert isinstance(first, CampaignStartedEvent)
+            canonical = workflow_plan_bytes(plan)
+            if first.plan_sha256 != hashlib.sha256(canonical).hexdigest():
+                raise WorkflowReportError("Campaign does not match Plan")
+            legacy_terminal = _terminal_events(events)
+            expected_ids = {run.run_id for run in plan.runs}
+            if set(legacy_terminal) != expected_ids:
+                raise WorkflowReportError(
+                    "Campaign must retain one terminal state for every planned run"
+                )
+            for run in plan.runs:
+                event = legacy_terminal[run.run_id]
+                if (
+                    event.task_id != run.task_id
+                    or event.workflow is not run.workflow
+                    or event.repetition_index != run.repetition_index
+                ):
+                    raise WorkflowReportError(
+                        f"Campaign run identity differs from Plan for {run.run_id}"
+                    )
+            legacy_artifacts = _load_artifacts(
+                spec_path,
+                plan,
+                legacy_terminal,
+            )
+            terminal = _legacy_report_events(legacy_terminal)
+            artifacts = dict(legacy_artifacts)
+            campaign_bytes = campaign_path.read_bytes()
+    except (
+        CampaignError,
+        Phase6ContractError,
+        ValidationError,
+        WorkflowPlanError,
+        WorkflowSpecError,
+    ) as error:
+        raise WorkflowReportError(str(error)) from error
     blocks: dict[tuple[str, int], list[WorkflowPlanRun]] = {}
     for run in plan.runs:
         blocks.setdefault((run.task_id, run.repetition_index), []).append(run)
@@ -665,7 +940,7 @@ def aggregate_workflow_campaign(
         schema_version="1.0",
         experiment_id=plan.experiment_id,
         plan_sha256=hashlib.sha256(canonical).hexdigest(),
-        campaign_sha256=hashlib.sha256(campaign_path.read_bytes()).hexdigest(),
+        campaign_sha256=hashlib.sha256(campaign_bytes).hexdigest(),
         created_at=datetime.now(UTC),
         comparison_axis="workflow",
         automatic_winner_selected=False,
@@ -789,7 +1064,10 @@ def create_workflow_report(
     markdown_path: Path,
 ) -> WorkflowReport:
     report = aggregate_workflow_campaign(spec_path, plan_path, campaign_path)
-    plan = load_workflow_plan(plan_path)
+    try:
+        plan = load_workflow_plan_contract(plan_path)
+    except (Phase6ContractError, WorkflowPlanError) as error:
+        raise WorkflowReportError(str(error)) from error
     artifact_roots = {
         PurePosixPath(run.evidence_path).parent.parent
         for run in plan.runs

@@ -12,6 +12,25 @@ from agentlab.capabilities import doctor_report
 from agentlab.gates import RunGatesError, run_gates
 from agentlab.live import LiveCodexError, run_live_codex
 from agentlab.models import EvidenceOverallStatus, LiveOverallStatus
+from agentlab.phase6 import Language, Phase6ContractError
+from agentlab.phase6_approval import (
+    SupplementalApprovalError,
+    prepare_supplemental_live_campaign_approval,
+)
+from agentlab.phase6_campaign import (
+    Phase6CampaignError,
+    prepare_phase6_campaign,
+    run_phase6_campaign,
+)
+from agentlab.phase6_fixtures import (
+    FixtureAcceptanceError,
+    accept_phase6_fixtures,
+)
+from agentlab.phase6_public import (
+    Phase6PublicError,
+    publish_public_suite,
+    verify_phase6_historical,
+)
 from agentlab.recording import RecordingLoadError
 from agentlab.replay import ReplayError, run_replay
 from agentlab.specs import SpecLoadError, load_experiment_spec
@@ -29,6 +48,343 @@ app = typer.Typer(
     help="Reproducible AI coding-agent experiment foundation.",
     no_args_is_help=True,
 )
+
+
+@app.command("prepare-phase6-supplemental-approval")
+def prepare_phase6_supplemental_approval_command(
+    spec_path: Annotated[Path, typer.Argument()],
+    approval_id: Annotated[str, typer.Option("--approval-id")],
+    plan_path: Annotated[Path, typer.Option("--plan")],
+    campaign_path: Annotated[Path, typer.Option("--campaign")],
+    accepted_manifest_path: Annotated[
+        Path,
+        typer.Option("--accepted-manifest"),
+    ],
+    prior_provider_call_minimum: Annotated[
+        int,
+        typer.Option("--prior-provider-call-min"),
+    ],
+    prior_provider_call_maximum: Annotated[
+        int,
+        typer.Option("--prior-provider-call-max"),
+    ],
+    output_path: Annotated[Path, typer.Option("--output")],
+    repository_root: Annotated[Path, typer.Option("--repository-root")] = Path("."),
+    confirm_local_execution: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-local-execution",
+            help=(
+                "Create one pending, create-only offline packet. This is not Live "
+                "approval, performs no Provider call, and requires separate human approval."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Prepare a pending Java Live control-plane packet without executing Live work."""
+    if not confirm_local_execution:
+        typer.echo(
+            "prepare-phase6-supplemental-approval stopped: "
+            "--confirm-local-execution is required",
+            err=True,
+        )
+        typer.echo("files created: 0")
+        typer.echo("Provider calls, Prompt transmissions, Gates, and Campaigns: 0")
+        raise typer.Exit(code=2)
+    try:
+        publication = prepare_supplemental_live_campaign_approval(
+            repository_root=repository_root,
+            approval_id=approval_id,
+            spec_path=spec_path,
+            plan_path=plan_path,
+            campaign_path=campaign_path,
+            accepted_manifest_path=accepted_manifest_path,
+            prior_provider_call_minimum=prior_provider_call_minimum,
+            prior_provider_call_maximum=prior_provider_call_maximum,
+            output_path=output_path,
+            confirm_local_execution=True,
+        )
+    except SupplementalApprovalError as error:
+        typer.echo(f"prepare-phase6-supplemental-approval stopped: {error}", err=True)
+        typer.echo("Provider calls, Prompt transmissions, Gates, and Campaigns: 0")
+        raise typer.Exit(code=2) from error
+    typer.echo(f"pending Supplemental Approval: {publication.output_path}")
+    typer.echo(f"bytes: {publication.byte_count}")
+    typer.echo(f"SHA-256: {publication.sha256}")
+    typer.echo("Live approval granted: no; separate human approval is required")
+    typer.echo("Provider calls, Prompt transmissions, Gates, and Campaigns: 0")
+
+
+@app.command("verify-phase6-historical")
+def verify_phase6_historical_command(
+    repository_root: Annotated[Path, typer.Option("--repository-root")],
+    historical_root: Annotated[Path, typer.Option("--historical-root")],
+    reviewed_spec_path: Annotated[str, typer.Option("--reviewed-spec")],
+    plan_path: Annotated[str, typer.Option("--plan")],
+    campaign_path: Annotated[str, typer.Option("--campaign")],
+    report_json_path: Annotated[str, typer.Option("--report-json")],
+    report_markdown_path: Annotated[str, typer.Option("--report-markdown")],
+    output_path: Annotated[Path, typer.Option("--output")],
+    language: Annotated[Language, typer.Option("--language")],
+    confirm_local_execution: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-local-execution",
+            help="Allow only bounded read-only Git verification; never rerun a Campaign.",
+        ),
+    ] = False,
+) -> None:
+    """Create one Historical Verification Record from saved Artifacts only."""
+    if not confirm_local_execution:
+        typer.echo(
+            "verify-phase6-historical stopped: "
+            "--confirm-local-execution is required",
+            err=True,
+        )
+        typer.echo("subprocesses executed: 0")
+        typer.echo("files or directories created: 0")
+        typer.echo("Provider calls, Prompt transmissions, and Gate executions: 0")
+        raise typer.Exit(code=2)
+    try:
+        result = verify_phase6_historical(
+            repository=repository_root,
+            historical_root=historical_root,
+            reviewed_spec_path=reviewed_spec_path,
+            plan_path=plan_path,
+            campaign_path=campaign_path,
+            report_json_path=report_json_path,
+            report_markdown_path=report_markdown_path,
+            output_path=output_path,
+            language=language,
+            confirm_local_execution=True,
+        )
+    except Phase6PublicError as error:
+        typer.echo(f"verify-phase6-historical stopped: {error}", err=True)
+        typer.echo("Provider calls, Prompt transmissions, and Gate executions: 0")
+        raise typer.Exit(code=2) from error
+    typer.echo(f"Historical Verification Record: {result.output_path}")
+    typer.echo(f"source reviewed commit: {result.record.source_reviewed_commit}")
+    typer.echo(f"verification commit: {result.record.verification_agentlab_commit}")
+    typer.echo("Artifact regeneration and Campaign reexecution: 0")
+    typer.echo("Provider calls, Prompt transmissions, and Gate executions: 0")
+
+
+@app.command("publish-phase6-public-suite")
+def publish_phase6_public_suite_command(
+    manifest_path: Annotated[Path, typer.Argument()],
+    root: Annotated[Path, typer.Option("--root")],
+    destination: Annotated[Path, typer.Option("--destination")],
+    external_anchor_path: Annotated[
+        Path,
+        typer.Option("--external-anchor"),
+    ],
+    confirm_publication: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-publication",
+            help="Create one immutable offline bundle and checksum anchor.",
+        ),
+    ] = False,
+) -> None:
+    """Publish a deterministic Phase 6 public bundle from listed inputs only."""
+    if not confirm_publication:
+        typer.echo(
+            "publish-phase6-public-suite stopped: --confirm-publication is required",
+            err=True,
+        )
+        typer.echo("files or directories created: 0")
+        typer.echo("subprocesses, Provider calls, Prompt transmissions, and Gates: 0")
+        raise typer.Exit(code=2)
+    try:
+        result = publish_public_suite(
+            manifest_path=manifest_path,
+            root=root,
+            destination=destination,
+            external_anchor_path=external_anchor_path,
+            confirm_publication=True,
+        )
+    except (Phase6PublicError, Phase6ContractError) as error:
+        typer.echo(f"publish-phase6-public-suite stopped: {error}", err=True)
+        typer.echo("subprocesses, Provider calls, Prompt transmissions, and Gates: 0")
+        raise typer.Exit(code=2) from error
+    typer.echo(f"Public Suite bundle: {result.destination}")
+    typer.echo(f"External checksum anchor: {result.external_anchor_path}")
+    typer.echo(f"checksums.json SHA-256: {result.checksum_manifest_sha256}")
+    typer.echo(f"published files: {result.published_file_count}")
+    typer.echo("subprocesses, Provider calls, Prompt transmissions, and Gates: 0")
+
+
+@app.command("prepare-phase6-campaign")
+def prepare_phase6_campaign_command(
+    language: Annotated[Language, typer.Option("--language")],
+    repository_root: Annotated[Path, typer.Option("--repository-root")] = Path("."),
+    acceptance_root: Annotated[Path, typer.Option("--acceptance-root")] = Path(
+        ".artifacts/phase6/fixture-acceptance"
+    ),
+    output_root: Annotated[Path, typer.Option("--output-root")] = Path(
+        ".artifacts/phase6/campaign-preparation"
+    ),
+    confirm_local_execution: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-local-execution",
+            help="Allow fixed local Git/toolchain checks; never calls a Provider.",
+        ),
+    ] = False,
+) -> None:
+    """Create one strict Phase 6 Spec 2.1 and Plan 1.2 offline."""
+    if not confirm_local_execution:
+        typer.echo(
+            "prepare-phase6-campaign stopped: --confirm-local-execution is required", err=True
+        )
+        typer.echo("local subprocesses executed: 0")
+        typer.echo("Provider calls and Prompt transmissions: 0")
+        raise typer.Exit(code=2)
+    try:
+        outcome = prepare_phase6_campaign(
+            repository_root,
+            acceptance_root,
+            output_root,
+            language=language,
+            confirm_local_execution=True,
+        )
+    except (Phase6CampaignError, FixtureAcceptanceError) as error:
+        typer.echo(f"prepare-phase6-campaign stopped: {error}", err=True)
+        typer.echo("Provider calls and Prompt transmissions: 0")
+        raise typer.Exit(code=2) from error
+    typer.echo(f"reviewed commit: {outcome.reviewed_commit}")
+    typer.echo(f"Spec 2.1: {outcome.spec_path}")
+    typer.echo(f"Plan 1.2: {outcome.plan_path}")
+    typer.echo(f"planned Provider calls: {outcome.plan.planned_provider_call_count}")
+    typer.echo("Provider calls and Prompt transmissions: 0")
+
+
+@app.command("run-phase6-campaign")
+def run_phase6_campaign_command(
+    spec_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    plan_path: Annotated[Path, typer.Option("--plan", exists=True, dir_okay=False)],
+    campaign_path: Annotated[Path, typer.Option("--campaign")],
+    repository_root: Annotated[Path, typer.Option("--repository-root")] = Path("."),
+    confirm_live_codex: Annotated[bool, typer.Option("--confirm-live-codex")] = False,
+    confirm_provider_calls: Annotated[int | None, typer.Option("--confirm-provider-calls")] = None,
+) -> None:
+    """Run a preregistered Phase 6 Campaign; never retry or resume."""
+    if not confirm_live_codex:
+        typer.echo("run-phase6-campaign stopped: --confirm-live-codex is required", err=True)
+        typer.echo("subprocesses and Provider calls executed: 0")
+        raise typer.Exit(code=2)
+    try:
+        outcome = run_phase6_campaign(
+            repository_root,
+            spec_path,
+            plan_path,
+            campaign_path,
+            confirm_live_codex=True,
+            confirm_provider_calls=confirm_provider_calls,
+        )
+    except Phase6CampaignError as error:
+        typer.echo(f"run-phase6-campaign stopped: {error}", err=True)
+        typer.echo("automatic retry/fallback/resume: 0")
+        raise typer.Exit(code=2) from error
+    typer.echo(f"campaign: {outcome.campaign_path}")
+    typer.echo(f"Provider calls: {outcome.provider_call_count}")
+    typer.echo(f"stop reason: {outcome.stop_reason.value}")
+    typer.echo("automatic retry/fallback/resume: 0")
+
+
+@app.command("accept-phase6-fixtures")
+def accept_phase6_fixtures_command(
+    language: Annotated[
+        list[Language] | None,
+        typer.Option(
+            "--language",
+            metavar="LANGUAGE",
+            help=(
+                "Accept exactly one selected language. Omit for the existing "
+                "python, typescript, java sequence; duplicate selection is rejected."
+            ),
+        ),
+    ] = None,
+    repository_root: Annotated[
+        Path,
+        typer.Option(
+            "--repository-root",
+            exists=True,
+            file_okay=False,
+            resolve_path=True,
+            help="Clean repository containing the committed Phase 6 Fixtures.",
+        ),
+    ] = Path("."),
+    output_root: Annotated[
+        Path,
+        typer.Option(
+            "--output-root",
+            help=(
+                "Create-only root below .artifacts/phase6/fixture-acceptance; "
+                "language subdirectories are preserved. Default: "
+                ".artifacts/phase6/fixture-acceptance."
+            ),
+        ),
+    ] = Path(".artifacts/phase6/fixture-acceptance"),
+    confirm_local_execution: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-local-execution",
+            help=(
+                "Explicitly allow bounded local toolchain version commands and "
+                "trusted Fixture Gate subprocesses; no Provider is called."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Audit local toolchains and accept independent Phase 6 Fixtures offline."""
+    if not confirm_local_execution:
+        typer.echo(
+            "accept-phase6-fixtures stopped: --confirm-local-execution is required",
+            err=True,
+        )
+        typer.echo("local subprocesses executed: 0")
+        typer.echo("Provider calls, Prompt transmissions, network, and quota: 0")
+        raise typer.Exit(code=2)
+    if language is not None and len(language) != 1:
+        typer.echo(
+            "accept-phase6-fixtures stopped: --language must be supplied at most once",
+            err=True,
+        )
+        typer.echo("local subprocesses executed: 0")
+        typer.echo("Provider calls, Prompt transmissions, network, and quota: 0")
+        raise typer.Exit(code=2)
+    try:
+        outcome = accept_phase6_fixtures(
+            repository_root,
+            output_root,
+            confirm_local_execution=confirm_local_execution,
+            language=language[0] if language else None,
+        )
+    except FixtureAcceptanceError as error:
+        typer.echo(f"accept-phase6-fixtures stopped: {error}", err=True)
+        typer.echo("Provider calls, Prompt transmissions, network, and quota: 0")
+        raise typer.Exit(code=2) from error
+
+    typer.echo(f"reviewed commit: {outcome.commit_sha}")
+    for result in outcome.results:
+        typer.echo(f"{result.language.value}: {result.status}")
+        if result.status == "accepted":
+            typer.echo(f"  manifest: {result.manifest_path}")
+            typer.echo(f"  acceptance: {result.acceptance_path}")
+        else:
+            typer.echo(f"  blocker: {result.blocker}")
+            typer.echo(f"  detail: {result.detail}")
+    typer.echo(f"engineering minimum met: {outcome.engineering_minimum_met}")
+    typer.echo(f"full target met: {outcome.full_target_met}")
+    typer.echo("Provider calls, Prompt transmissions, network, and quota: 0")
+    succeeded = (
+        all(result.status == "accepted" for result in outcome.results)
+        if language
+        else outcome.engineering_minimum_met
+    )
+    if not succeeded:
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -158,10 +514,7 @@ def run_workflow_campaign_command(
     typer.echo(f"campaign: {outcome.campaign_path}")
     typer.echo(f"attempted runs: {outcome.attempted_run_count}")
     typer.echo(f"Provider calls: {outcome.provider_call_count}")
-    typer.echo(
-        "Provider call count unknown runs: "
-        f"{outcome.provider_call_count_unknown_runs}"
-    )
+    typer.echo(f"Provider call count unknown runs: {outcome.provider_call_count_unknown_runs}")
     typer.echo(f"stop reason: {outcome.stop_reason.value}")
     typer.echo("automatic retry/fallback: 0")
     if outcome.stop_reason is not CampaignStopReason.NONE:

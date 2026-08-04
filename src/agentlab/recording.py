@@ -463,7 +463,7 @@ def _validate_recording(path: Path, events: list[RecordingEvent]) -> ReplayRecor
                 f"{path}: CLI version mismatch between Live recording events"
             )
         if (
-            codex.schema_version == "1.5"
+            codex.schema_version in {"1.5", "1.6"}
             and codex.stdin_bytes_total is not None
             and started.prompt_bytes != codex.stdin_bytes_total
         ):

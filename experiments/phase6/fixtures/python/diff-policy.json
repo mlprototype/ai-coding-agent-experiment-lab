@@ -1,0 +1,26 @@
+{
+  "editable_paths": [
+    {
+      "allow_create": false,
+      "allow_delete": false,
+      "path": "tag_normalizer.py"
+    }
+  ],
+  "fixture_revision": "tag-normalizer-python-v1",
+  "language": "python",
+  "protected_paths": [
+    {
+      "path": "fixture.json",
+      "role": "configuration"
+    },
+    {
+      "path": "gate_helper.py",
+      "role": "gate_helper"
+    }
+  ],
+  "reject_hardlinks": true,
+  "reject_special_files": true,
+  "reject_symlinks": true,
+  "reject_unclassified_paths": true,
+  "schema_version": "1.0"
+}

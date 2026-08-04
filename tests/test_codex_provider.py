@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import textwrap
@@ -17,6 +18,7 @@ from agentlab.codex_provider import (
     CodexProcessRunner,
     CodexProtocolError,
     build_codex_argv,
+    build_codex_argv_identity,
     preflight_codex,
     resolve_codex_home,
 )
@@ -24,12 +26,16 @@ from agentlab.models import (
     CODEX_EXPLICIT_NEVER_V2_CLI_VERSIONS,
     CodexCleanupState,
     CodexCliProfile,
+    CodexExecutableIdentityStatus,
+    CodexExecutionEvidence,
     CodexExecutionStage,
     CodexFailureStage,
     CodexInvocationState,
     CodexItemType,
     CodexProviderFailureHint,
     CodexRunnerState,
+    CodexStderrFailureCategory,
+    CodexStderrRuleId,
     CodexStdinWriteState,
     CodexTerminalEvent,
     LiveFailureKind,
@@ -1021,7 +1027,7 @@ def test_process_runner_uses_safe_argv_stdin_and_separate_environment(
     argv = observed["argv"]
 
     assert result.evidence.status is ProviderExecutionStatus.SUCCEEDED
-    assert result.evidence.schema_version == "1.5"
+    assert result.evidence.schema_version == "1.6"
     assert result.evidence.runner_state is CodexRunnerState.STARTED
     assert (
         result.evidence.invocation_state
@@ -1050,6 +1056,30 @@ def test_process_runner_uses_safe_argv_stdin_and_separate_environment(
     assert "--ask-for-approval" not in argv
     assert result.evidence.approval_policy == "never"
     assert result.evidence.approval_basis == "explicit_config_never"
+    assert result.evidence.stderr_diagnostic is not None
+    assert result.evidence.stderr_diagnostic.stderr_bytes == len(
+        stderr_secret.encode()
+    )
+    assert result.evidence.stderr_diagnostic.stderr_sha256 == hashlib.sha256(
+        stderr_secret.encode()
+    ).hexdigest()
+    assert (
+        result.evidence.stderr_diagnostic.failure_category
+        is CodexStderrFailureCategory.NOT_APPLICABLE
+    )
+    assert result.evidence.executable_identity == preflight.executable_identity
+    assert (
+        result.evidence.executable_identity.status
+        is CodexExecutableIdentityStatus.VERIFIED
+    )
+    assert result.evidence.argv_identity == build_codex_argv_identity(argv)
+    assert result.evidence.child_environment is not None
+    assert result.evidence.child_environment.codex_home_included is True
+    assert result.evidence.child_environment.credential_environment_excluded is True
+    assert result.evidence.child_environment.path_from_allowlist is True
+    assert (
+        result.evidence.child_environment.cwd_verified_ephemeral_workspace is True
+    )
     config_values = [
         argv[index + 1]
         for index, argument in enumerate(argv)
@@ -1176,6 +1206,295 @@ def test_process_runner_classifies_cli_and_protocol_failures(
     assert result.evidence.failure_kind is expected
 
 
+def _run_nonzero_stderr(
+    tmp_path: Path,
+    stderr: bytes,
+    *,
+    max_provider_output_bytes: int = 1024 * 1024,
+) -> CodexExecutionEvidence:
+    live_code = (
+        "sys.stdin.read()\n"
+        f"sys.stderr.buffer.write({stderr!r})\n"
+        "sys.stderr.buffer.flush()\n"
+        "raise SystemExit(7)"
+    )
+    environment, _inspection = _fake_codex(tmp_path, live_code=live_code)
+    preflight = preflight_codex(parent_environment=environment)
+    workspace, environment_root = _workspace(tmp_path)
+    return CodexProcessRunner(
+        live=_live_settings(
+            max_event_line_bytes=min(65536, max_provider_output_bytes),
+            max_provider_output_bytes=max_provider_output_bytes,
+        ),
+        runner=_runner_settings(),
+    ).run(
+        preflight=preflight,
+        prompt=b"synthetic prompt",
+        workspace=workspace,
+        environment_root=environment_root,
+        parent_environment=environment,
+    ).evidence
+
+
+@pytest.mark.parametrize(
+    ("stderr", "category", "rule_id"),
+    [
+        (
+            b"authentication required",
+            CodexStderrFailureCategory.AUTHENTICATION,
+            CodexStderrRuleId.AUTHENTICATION_REQUIRED,
+        ),
+        (
+            b"quota exceeded",
+            CodexStderrFailureCategory.QUOTA_OR_RATE_LIMIT,
+            CodexStderrRuleId.QUOTA_OR_RATE_LIMIT,
+        ),
+        (
+            b"model gpt-fixed is not available",
+            CodexStderrFailureCategory.MODEL_ACCESS,
+            CodexStderrRuleId.MODEL_ACCESS,
+        ),
+        (
+            b"unknown configuration key model_reasoning_effort",
+            CodexStderrFailureCategory.STRICT_CONFIG_OR_OPTION,
+            CodexStderrRuleId.STRICT_CONFIG_OR_OPTION,
+        ),
+        (
+            b"permission denied",
+            CodexStderrFailureCategory.PERMISSION,
+            CodexStderrRuleId.PERMISSION_DENIED,
+        ),
+        (
+            b"service unavailable",
+            CodexStderrFailureCategory.PROVIDER_SERVICE,
+            CodexStderrRuleId.PROVIDER_SERVICE,
+        ),
+        (
+            b"unclassified startup failure",
+            CodexStderrFailureCategory.UNKNOWN,
+            CodexStderrRuleId.UNCLASSIFIED,
+        ),
+        (
+            b"",
+            CodexStderrFailureCategory.UNKNOWN,
+            CodexStderrRuleId.UNCLASSIFIED,
+        ),
+        (
+            b"\xff\xfeinvalid utf8",
+            CodexStderrFailureCategory.UNKNOWN,
+            CodexStderrRuleId.UNCLASSIFIED,
+        ),
+    ],
+)
+def test_nonzero_stderr_has_safe_deterministic_diagnostics(
+    tmp_path: Path,
+    stderr: bytes,
+    category: CodexStderrFailureCategory,
+    rule_id: CodexStderrRuleId,
+) -> None:
+    evidence = _run_nonzero_stderr(tmp_path, stderr)
+
+    assert evidence.failure_kind is LiveFailureKind.PROVIDER_CLI_NONZERO
+    assert evidence.stderr_diagnostic is not None
+    assert evidence.stderr_diagnostic.stderr_bytes == len(stderr)
+    assert evidence.stderr_diagnostic.stderr_sha256 == hashlib.sha256(stderr).hexdigest()
+    assert evidence.stderr_diagnostic.stderr_nonempty is bool(stderr)
+    assert evidence.stderr_diagnostic.stderr_truncated is False
+    assert evidence.stderr_diagnostic.failure_category is category
+    assert evidence.stderr_diagnostic.rule_id is rule_id
+    if stderr:
+        assert stderr not in evidence.model_dump_json().encode()
+
+
+def test_stderr_classifier_priority_is_fixed(tmp_path: Path) -> None:
+    evidence = _run_nonzero_stderr(
+        tmp_path,
+        b"quota exceeded and authentication required",
+    )
+
+    assert evidence.stderr_diagnostic is not None
+    assert (
+        evidence.stderr_diagnostic.failure_category
+        is CodexStderrFailureCategory.AUTHENTICATION
+    )
+    assert (
+        evidence.stderr_diagnostic.rule_id
+        is CodexStderrRuleId.AUTHENTICATION_REQUIRED
+    )
+
+
+def test_path_alias_warning_alone_remains_unknown(tmp_path: Path) -> None:
+    warning = (
+        b"WARNING: proceeding, even though we could not create PATH aliases: "
+        b"Operation not permitted (os error 1)\n"
+    )
+    evidence = _run_nonzero_stderr(tmp_path, warning)
+
+    assert evidence.stderr_diagnostic is not None
+    assert (
+        evidence.stderr_diagnostic.failure_category
+        is CodexStderrFailureCategory.UNKNOWN
+    )
+
+
+def test_path_alias_warning_does_not_hide_known_error(tmp_path: Path) -> None:
+    warning_and_error = (
+        b"WARNING: proceeding, even though we could not create PATH aliases: "
+        b"Operation not permitted (os error 1)\n"
+        b"unknown option --synthetic\n"
+    )
+    evidence = _run_nonzero_stderr(tmp_path, warning_and_error)
+
+    assert evidence.stderr_diagnostic is not None
+    assert (
+        evidence.stderr_diagnostic.failure_category
+        is CodexStderrFailureCategory.STRICT_CONFIG_OR_OPTION
+    )
+
+
+def test_truncated_stderr_hashes_all_bytes_and_remains_unknown(
+    tmp_path: Path,
+) -> None:
+    stderr = b"authentication required " * 8
+    evidence = _run_nonzero_stderr(
+        tmp_path,
+        stderr,
+        max_provider_output_bytes=32,
+    )
+
+    assert evidence.stderr_diagnostic is not None
+    assert evidence.stderr_diagnostic.stderr_bytes == len(stderr)
+    assert evidence.stderr_diagnostic.stderr_sha256 == hashlib.sha256(stderr).hexdigest()
+    assert evidence.stderr_diagnostic.stderr_truncated is True
+    assert (
+        evidence.stderr_diagnostic.failure_category
+        is CodexStderrFailureCategory.UNKNOWN
+    )
+
+
+def test_startup_diagnostics_never_persist_secrets(tmp_path: Path) -> None:
+    secrets = (
+        "fake-token-123",
+        "fake-api-key-456",
+        "synthetic-user",
+        "/Users/synthetic-user/private",
+        "raw-prompt-secret",
+    )
+    stderr = (
+        b"authentication required token=fake-token-123 api_key=fake-api-key-456 "
+        b"user=synthetic-user path=/Users/synthetic-user/private"
+    )
+    live_code = (
+        "sys.stdin.read()\n"
+        f"sys.stderr.buffer.write({stderr!r})\n"
+        "raise SystemExit(7)"
+    )
+    environment, _inspection = _fake_codex(tmp_path, live_code=live_code)
+    preflight = preflight_codex(parent_environment=environment)
+    workspace, environment_root = _workspace(tmp_path)
+    evidence = CodexProcessRunner(
+        live=_live_settings(),
+        runner=_runner_settings(),
+    ).run(
+        preflight=preflight,
+        prompt=secrets[-1].encode(),
+        workspace=workspace,
+        environment_root=environment_root,
+        parent_environment=environment,
+    ).evidence
+    persisted = evidence.model_dump_json().encode()
+
+    for secret in secrets:
+        assert secret.encode() not in persisted
+
+
+def test_executable_identity_can_be_explicitly_unavailable(tmp_path: Path) -> None:
+    identity = codex_provider_module._executable_identity(str(tmp_path))
+
+    assert identity.status is CodexExecutableIdentityStatus.UNAVAILABLE
+    assert identity.sha256 is None
+
+
+def test_codex_evidence_1_6_round_trips_strictly(tmp_path: Path) -> None:
+    evidence = _run_nonzero_stderr(tmp_path, b"authentication required")
+    payload = json.loads(evidence.model_dump_json())
+
+    loaded = CodexExecutionEvidence.model_validate(payload)
+
+    assert loaded == evidence
+    assert loaded.stderr_diagnostic is not None
+    assert loaded.stderr_diagnostic.stderr_sha256 == hashlib.sha256(
+        b"authentication required"
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "unknown_field",
+        "missing_field",
+        "unsupported_new_version",
+        "unsupported_old_version",
+        "strict_integer",
+        "strict_boolean",
+        "stderr_binding_drift",
+        "exit_category_drift",
+    ],
+)
+def test_codex_evidence_1_6_rejects_invalid_contract(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    payload = json.loads(
+        _run_nonzero_stderr(
+            tmp_path,
+            b"authentication required",
+        ).model_dump_json()
+    )
+    if mutation == "unknown_field":
+        payload["raw_stderr"] = "forbidden"
+    elif mutation == "missing_field":
+        del payload["stderr_diagnostic"]
+    elif mutation == "unsupported_new_version":
+        payload["schema_version"] = "1.7"
+    elif mutation == "unsupported_old_version":
+        payload["schema_version"] = "1.0"
+    elif mutation == "strict_integer":
+        payload["stderr_diagnostic"]["stderr_bytes"] = True
+    elif mutation == "strict_boolean":
+        payload["stderr_diagnostic"]["stderr_nonempty"] = 1
+    elif mutation == "stderr_binding_drift":
+        payload["stderr_diagnostic"]["stderr_bytes"] += 1
+    elif mutation == "exit_category_drift":
+        payload["stderr_diagnostic"]["failure_category"] = "not_applicable"
+        payload["stderr_diagnostic"]["rule_id"] = "not_applicable"
+
+    with pytest.raises(ValueError):
+        CodexExecutionEvidence.model_validate(payload)
+
+
+def test_codex_evidence_1_5_remains_strict_loadable(tmp_path: Path) -> None:
+    payload = json.loads(
+        _run_nonzero_stderr(
+            tmp_path,
+            b"authentication required",
+        ).model_dump_json()
+    )
+    payload["schema_version"] = "1.5"
+    for field_name in (
+        "stderr_diagnostic",
+        "executable_identity",
+        "argv_identity",
+        "child_environment",
+    ):
+        del payload[field_name]
+
+    loaded = CodexExecutionEvidence.model_validate(payload)
+
+    assert loaded.schema_version == "1.5"
+    assert loaded.stderr_diagnostic is None
+
+
 def test_process_runner_prioritizes_rejected_buffered_event_over_nonzero_exit(
     tmp_path: Path,
 ) -> None:
@@ -1284,7 +1603,7 @@ def test_process_runner_preserves_pre_turn_warning_and_official_failed_turn(
     )
     evidence = result.evidence
 
-    assert evidence.schema_version == "1.5"
+    assert evidence.schema_version == "1.6"
     assert evidence.failure_kind is LiveFailureKind.PROVIDER_TURN_FAILED
     assert evidence.terminal_event is CodexTerminalEvent.TURN_FAILED
     assert evidence.error_event_count == 1
@@ -1323,7 +1642,7 @@ def test_process_runner_protocol_error_keeps_only_accepted_event_counts(
     )
     evidence = result.evidence
 
-    assert evidence.schema_version == "1.5"
+    assert evidence.schema_version == "1.6"
     assert evidence.failure_kind is LiveFailureKind.PROVIDER_PROTOCOL_ERROR
     assert evidence.process_started is True
     assert evidence.cleanup_state is CodexCleanupState.CLEARED
@@ -1363,6 +1682,11 @@ def test_process_runner_classifies_signal_termination(tmp_path: Path) -> None:
     )
     assert result.evidence.exit_code is not None
     assert result.evidence.exit_code < 0
+    assert result.evidence.stderr_diagnostic is not None
+    assert (
+        result.evidence.stderr_diagnostic.failure_category
+        is CodexStderrFailureCategory.UNKNOWN
+    )
 
 
 def test_process_runner_classifies_spawn_failure(
