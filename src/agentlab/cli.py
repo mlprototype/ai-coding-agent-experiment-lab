@@ -31,6 +31,13 @@ from agentlab.phase6_public import (
     publish_public_suite,
     verify_phase6_historical,
 )
+from agentlab.phase7_inventory import (
+    InventoryContractError,
+    InventoryPublicationError,
+    InventorySafetyError,
+    VerificationStatus,
+    create_inventory_publication,
+)
 from agentlab.recording import RecordingLoadError
 from agentlab.replay import ReplayError, run_replay
 from agentlab.specs import SpecLoadError, load_experiment_spec
@@ -385,6 +392,58 @@ def accept_phase6_fixtures_command(
     )
     if not succeeded:
         raise typer.Exit(code=1)
+
+
+@app.command()
+def inventory_phase6_evidence(
+    request_path: Annotated[Path, typer.Argument()],
+    output_path: Annotated[Path, typer.Option("--output")],
+    markdown_path: Annotated[Path, typer.Option("--markdown")],
+    metadata_path: Annotated[Path, typer.Option("--metadata")],
+    repository_root: Annotated[Path, typer.Option("--repository-root")] = Path("."),
+    confirm_local_execution: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-local-execution",
+            help="Allow bounded read-only Artifact checks and one Git checkout HEAD observation.",
+        ),
+    ] = False,
+) -> None:
+    """Create one Phase 6 Evidence Inventory from a reviewed Request."""
+    if not confirm_local_execution:
+        typer.echo(
+            "inventory-phase6-evidence stopped: --confirm-local-execution is required",
+            err=True,
+        )
+        typer.echo("new complete publication: 0; existing or partial outputs may remain unchanged")
+        typer.echo("Provider, Prompt, Gate, Campaign, Report, Public Suite, and network: 0")
+        raise typer.Exit(code=1)
+    try:
+        publication = create_inventory_publication(
+            request_path=request_path,
+            repository_root=repository_root,
+            output_path=output_path,
+            markdown_path=markdown_path,
+            metadata_path=metadata_path,
+            confirm_local_execution=True,
+        )
+    except (InventoryContractError, InventoryPublicationError, InventorySafetyError) as error:
+        typer.echo(f"inventory-phase6-evidence stopped: {error}", err=True)
+        typer.echo("new complete publication: 0; existing or partial outputs may remain unchanged")
+        typer.echo("Provider, Prompt, Gate, Campaign, Report, Public Suite, and network: 0")
+        raise typer.Exit(code=1) from error
+    typer.echo(f"Inventory: {publication.output_path}")
+    typer.echo(f"Markdown: {publication.markdown_path}")
+    typer.echo(f"metadata: {publication.metadata_path}")
+    typer.echo(f"request correlation ID: {publication.inventory.request_correlation_id}")
+    typer.echo(
+        f"observed execution repository HEAD: "
+        f"{publication.metadata.observed_execution_repository_head}"
+    )
+    typer.echo(f"verification status: {publication.inventory.verification_status.value}")
+    typer.echo("Provider, Prompt, Gate, Campaign, Report, Public Suite, and network: 0")
+    if publication.inventory.verification_status is VerificationStatus.FAILED:
+        raise typer.Exit(code=2)
 
 
 @app.command()

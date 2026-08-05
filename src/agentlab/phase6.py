@@ -4042,3 +4042,46 @@ def legacy_loaded_spec(
 def legacy_plan(path: Path) -> WorkflowPlan:
     """Exercise the unchanged Plan 1.1 loader through the compatibility surface."""
     return load_workflow_plan(path)
+
+
+def validate_phase6_snapshot_contract(role: str, content: bytes) -> None:
+    """Validate one Phase 6 contract from a stable in-memory snapshot.
+
+    This is the small public facade used by Phase 7. It keeps the existing
+    byte-oriented strict loaders behind a stable API without publishing,
+    regenerating, or executing any Artifact.
+    """
+    if role == "suite_manifest":
+        _load_canonical_model_bytes(content, PublicSuiteManifest, "Public Suite Manifest")
+    elif role == "checksums":
+        _load_canonical_model_bytes(content, PublicChecksums, "Public checksums")
+    elif role == "external_anchor":
+        _load_canonical_model_bytes(content, ExternalChecksumAnchor, "External anchor")
+    elif role == "release_metadata":
+        _load_canonical_model_bytes(content, ReleaseMetadata, "Release metadata")
+    elif role == "fixture_manifest":
+        _load_canonical_model_bytes(content, FixtureManifest, "Fixture Manifest")
+    elif role == "fixture_acceptance":
+        _load_canonical_model_bytes(
+            content,
+            FixtureAcceptanceRecord,
+            "Fixture Acceptance Record",
+        )
+    elif role == "historical_verification":
+        _load_canonical_model_bytes(
+            content,
+            HistoricalVerificationRecord,
+            "Historical Verification Record",
+        )
+    elif role == "plan":
+        _load_workflow_plan_1_2_bytes(content)
+    elif role == "campaign":
+        _load_phase6_campaign_bytes(content)
+    elif role == "recording":
+        _load_phase6_recording_bytes(content)
+    elif role == "evidence":
+        _load_phase6_live_run_artifact_bytes(content)
+    elif role == "spec":
+        _load_workflow_spec_contract_bytes(content)
+    else:
+        raise ValueError(f"unsupported Phase 6 snapshot contract role: {role}")
