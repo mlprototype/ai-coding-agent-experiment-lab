@@ -66,6 +66,7 @@ from agentlab.phase6 import (
     _canonical_jsonl_line,
     canonical_json_bytes,
     derive_primary_snapshot_binding,
+    derive_public_suite_source_provenance,
     load_historical_verification,
     load_public_suite_inputs,
     validate_public_suite_inputs,
@@ -413,9 +414,15 @@ def test_public_suite_facades_validate_caller_owned_bytes_only(tmp_path: Path) -
     source = manifest.primary_sources[0]
     binding = derive_primary_snapshot_binding(source, validated.loaded.bytes_by_path)
 
-    assert binding.campaign_id == "workflow-ab-smoke"
+    assert binding.experiment_id == "workflow-ab-smoke"
+    assert binding.reviewed_commit == COMMIT
     assert len(binding.planned_run_ids) == 2
     assert binding.complete_pairs
+    provenance = derive_public_suite_source_provenance(validated)
+    assert len(provenance) == 1
+    assert provenance[0].role == "primary"
+    assert provenance[0].experiment_id == "workflow-ab-smoke"
+    assert provenance[0].reviewed_commit == COMMIT
 
 
 def test_ready_not_run_render_is_deterministic_and_ignores_unlisted_secret(

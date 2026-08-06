@@ -1,6 +1,6 @@
 # Phase 7A: Evidence Inventory & Retention Policy — 実装計画書
 
-**Status:** Slice 7A-1〜7A-4実装済み（real ArtifactのInventory生成とPhase status変更は未実施）
+**Status:** Slice 7A-1〜7A-4実装済み。Slice 7A-4R2はreal Artifact contract remediationであり、real ArtifactのRequest生成／Inventory実行とPhase status変更は未実施。
 **対象branch:** `feature/phase7`
 **対象scope:** Phase 6の保存Artifactだけ
 **設計原則:** Catalogは新しいstatus正本ではなく、既存正本と保存Artifactの一致を検証して表示する、非権威的な派生成果物である。
@@ -16,6 +16,35 @@ Phase 7Aの目的は、Phase 6のreleaseとCampaignを一箇所から発見し�
 - `evidence-inventory.metadata.json`: 生成時刻など非決定的metadataのsidecar
 
 Artifactに欠落・drift・classification不整合があっても、入力Request自体と安全な読取境界が健全なら、`verification_status=failed`とfindingを含むInventoryを生成する。これは既存のaccepted status、current release、Human Acceptance、Phase statusを変えない。
+
+## Slice 7A-4R2 implementation record and 7A-5 gate
+
+### Scope fixed for 7A-4R2
+
+7A-4R2はsynthetic testとAuthority文書だけで、実Artifactには書き込まない。Schemaは初回公開前の訂正としてliteral `1.0`を維持し、1.1へのbump及び旧Request shapeのcompatibility loaderは追加しない。
+
+実装対象は以下である。
+
+1. `ReleaseEntry`／`InventoryReleaseEntry`の`artifact_reviewed_commits` sorted unique set、exact observed-set verification、safe sorted mismatch finding、Markdown及びsubject digestのcollection表示。
+2. Phase 6のbyte-oriented public provenance facade。Primaryはtyped Spec 2.1／Plan 1.2（Fixture Acceptance bindingを通過）共有commit、Historicalは`source_reviewed_commit`のみである。generic Report JSON、bundle run、renderer output、mirror、unknown roleの値は採用しない。
+3. Campaign Authority IDとArtifact Experiment IDの別field、Manifest parentとbundle rootのexact resolver、denominator tupleの両ID比較。
+4. 同一Releaseのscalar `checksums`とtree member `checksums.json`だけのstrict alias exception。
+5. declared Campaign entry scopeだけのProvider total state、Requestを含むstrict publication byte verifier、共通snapshot verifier。
+6. stdin bytesとhuman-approved SHA-256を先に照合するcreate-only Request publisher。existing `.artifacts`はreal directory必須、`phase7`／`evidence-inventory`はidentity安定なら再利用、inventory leafと`request.json`はcreate-onlyとする。
+
+publisherはstdinを`MAX_REQUEST_BYTES + 1`まで一度だけ読み、strict/canonical loadと`hmac.compare_digest`でのSHA照合成功後にだけdirectoryを作る。leaf内の`request.json`は`O_CREAT|O_EXCL|O_NOFOLLOW`、fsync、descriptor reloadで同bytes／SHAを確認する。将来のoutput triadの不存在も同leaf descriptorで確認する。write失敗後はowned request fileをidentity一致時だけunlinkし、leafとcreated intermediateは同じowned identityかつempty時だけreverse rmdirする。rollback不能又はnonempty／identity driftはforensic leafを保持し、再利用しない。
+
+### 7A-5 is not complete
+
+次の実行は**別の人間承認**を要するcurrent-only pilotであり、Phase 7A-5完了ではない。
+
+- Pilot IDは`phase6-accepted-current-pilot-001`のように対象を明示し、Phase 6全体Inventoryと誤認させない。
+- approved Request SHA、clean reviewed full HEAD、全入力のbytes／SHA／tree digestをpreflightで再観測し、leafが不存在のときだけRequestをcreate-onlyでprepareする。
+- 実行は一回だけ。exit `0`とexit `2`の両方で、Requestを含むpublic strict publication verifier、Markdown re-render、metadata hash/correlation、declared inputsのpost-checkを行う。exit `1`はcomplete publicationなしとして分離する。
+- post-checkは同じ共通snapshot verifierを使い、Requestのexpected bytes／SHA／treeに対するcall時一致を検証する。Phase 6 Artifactの別call間inode不変又はremote livenessは主張しない。
+- accepted supersededはmirror ownership schemaが未設計のため未収載、Authority不足のcandidate／空directoryも未収載対象として明記する。
+
+7A-4R2及び将来pilotともProvider、Gate、Replay、network、Live、Report／Public Suite再生成、新しいmodel fixingは0件である。crosswalk上のPhase 6 `9または10` Authority値を、pilot Request scopeの合計へ再解釈・変更しない。
 
 ## 2. Authority境界（最初に固定するDecision）
 
@@ -111,7 +140,7 @@ Slice 7A-1で次の集合を固定し、実装はこの外のfinding codeを出�
 | `bundle_renderer_mismatch` | in-memory rendererのbytesと保存bundleが不一致 | `2` |
 | `checksum_contract_mismatch` | `checksums.json`又はそのcoverageが不一致 | `2` |
 | `external_anchor_mismatch` | External Anchorがchecksum contractと不一致 | `2` |
-| `artifact_reviewed_commit_mismatch` | entryの`artifact_reviewed_commit`が既存Artifactのreviewed commitと不一致 | `2` |
+| `artifact_reviewed_commit_mismatch` | entryのrole-aware reviewed commit set（Campaignはtyped single commit）が既存typed Artifact provenanceと不一致 | `2` |
 | `artifact_reviewed_commit_not_verifiable` | profileが内部commitを要求しない又はArtifactに内部commitがなく、Request／declaration basis以外から照合できない | `2` |
 | `classification_mismatch` | entry classification又はprofileが明示Artifact topologyと矛盾 | `2` |
 | `denominator_mismatch` | primary denominator又はcomplete pairがaccepted Manifest由来の値と不一致 | `2` |
@@ -153,27 +182,27 @@ Requestは次のtop-level fieldを持つ。
 
 Release file roleの例は`suite_manifest`、`checksums`、`external_anchor`、Release tree roleは`bundle_root`、Campaign file roleの例は`spec`、`plan`、`campaign`、`recording`、`evidence`、`report_json`、`report_markdown`、`historical_verification`とする。role、kind、classificationの対応はmodel validatorで検証する。
 
-`ReleaseEntry`は少なくとも`release_id`、`artifact_reviewed_commit`、`commit_verification_mode`、`classification`、`verification_profile`、`declaration_basis`、`file_artifacts`、`trees`、`superseded_by`を持つ。
+`ReleaseEntry`は少なくとも`release_id`、sorted unique `artifact_reviewed_commits`、`commit_verification_mode`、`classification`、`verification_profile`、`declaration_basis`、`file_artifacts`、`trees`、`superseded_by`を持つ。
 
 - `accepted_current`はscope内にちょうど1件だけ許可する。複数候補から選ぶ機能ではない。
 - `accepted_superseded`は`superseded_by`を明示し、cycleを禁止する。
 - accepted releaseは`accepted_manifest`の根拠と`phase6_public_suite` profileを必須にする。
-- `artifact_reviewed_commit`はPhase 6 Artifactに束縛されたcommitであり、Public Suite Manifest内の既存`reviewed_commit`とそのbound sourceから再導出して照合する。Phase 7のobserved execution repository checkout HEADとは比較しない。
+- `artifact_reviewed_commits`はPhase 6 Artifactに束縛されたcommit集合であり、Manifest列挙済みtyped sourceからrole-awareに再導出してexact照合する。PrimaryはSpec 2.1／Plan 1.2の共有commit、Historicalは`source_reviewed_commit`だけである。Phase 7のobserved execution repository checkout HEADとは比較しない。
 - `historical`、`candidate_unaccepted`、`abandoned_preparation`でもprofileと期待Artifactを明示し、空の存在主張を許さない。
 
-`CampaignEntry`は少なくとも`campaign_id`、`artifact_reviewed_commit`、`commit_verification_mode`、`classification`、`included_in_primary_denominator`、`release_id`、`verification_profile`、`declaration_basis`、`file_artifacts`、`trees`を持つ。
+`CampaignEntry`は少なくともAuthority `campaign_id`、Artifact `experiment_id`、`artifact_reviewed_commit`、`commit_verification_mode`、`classification`、`included_in_primary_denominator`、`release_id`、`verification_profile`、`declaration_basis`、`file_artifacts`、`trees`を持つ。
 
 - `primary_evaluation`だけが`included_in_primary_denominator=true`である。
 - `audit_only_failure`、`abandoned_inconclusive`、`historical_non_primary`は必ず`false`である。
 - `campaign_id`、Artifact path、roleの組はRequest内で重複させない。
-- `artifact_reviewed_commit`は、CampaignとManifest／Planが保存している既存reviewed commitとの一致をentry単位で確認する。
+- `artifact_reviewed_commit`は、Campaign profileが許可するtyped source（PrimaryのSpec／Plan又はHistorical Verification Record）との一致をentry単位で確認する。generic report key又はbundle mirrorは採用しない。
 - `primary_evaluation`はaccepted releaseを参照し、同releaseのPublic Suite Manifestが列挙するprimary sourceのCampaign／Language／run集合と一致しなければならない。
 - primary以外をManifestのprimary sourceへ紐づけること、又は同じCampaignを複数classificationで登録することを拒否する。
 
 `CommitVerificationMode`は`internal_required`、`internal_if_present`、`declaration_basis_only`の閉じたEnumにする。`artifact_reviewed_commit`はRequestとdeclaration basisが期待するPhase 6 commitとして保持する。
 
 - accepted／complete profileは`internal_required`だけを許可し、Public Suite Manifest、Plan、Campaign等の内部commitとの一致を必須にする。不在又は不一致は`artifact_reviewed_commit_mismatch`である。
-- abandoned／missing profileは`internal_if_present`又は`declaration_basis_only`を明示できる。内部commitが存在すれば照合し、不在なら`commit_verification=not_verifiable`と`artifact_reviewed_commit_not_verifiable`を記録する。内部commitが存在しないこと自体をmismatchにはしない。
+- `internal_if_present`はtyped internal provenanceがなければ`commit_verification=not_verifiable`と`artifact_reviewed_commit_not_verifiable`を記録する。`declaration_basis_only`はArtifact内commitを探索せず、宣言basisだけを表示する。内部commitが存在しないこと自体をmismatchにはしない。
 - `verification_profile`はclassificationと独立した明示値とし、最低限`phase6_public_suite`、`phase6_campaign_complete`、`historical_verification`、`declared_artifact_set`を用意する。profile別の必須file role、tree role、commit verification mode表はSlice 7A-1のDecision Recordで固定し、実装後に勝手なprofileを追加しない。
 
 ### 4.4 Retention expectation
@@ -188,14 +217,14 @@ Verifierはnetwork接続や外部保存先のliveness確認をしない。すべ
 
 ### 4.5 出力契約
 
-`EvidenceInventory 1.0`は`schema_version`、`inventory_id`、`request_correlation_id`、`authoritative: false`、`scope: phase6`、`request_sha256`、`source_of_truth_references`、entry単位の`artifact_reviewed_commit`、`releases`、`campaigns`、`findings`、`summary`、`verification_status`を持つ。Phase 7 execution repository HEADはcanonical Inventoryへ混入させない。
+`EvidenceInventory 1.0`は`schema_version`、`inventory_id`、`request_correlation_id`、`authoritative: false`、`scope: phase6`、`request_sha256`、`source_of_truth_references`、Releaseの`artifact_reviewed_commits`、CampaignのAuthority `campaign_id`／Artifact `experiment_id`／typed `artifact_reviewed_commit`、`releases`、`campaigns`、`findings`、`summary`、`verification_status`を持つ。Phase 7 execution repository HEADはcanonical Inventoryへ混入させない。
 
 `request_correlation_id`は`inventory_id`とRequest SHA-256から決定的に導出し、Inventory JSON、Markdown、metadataの3ファイルへ同じ値を保存する。これはRequest相関用であり、出力内容固有の識別子ではない。同一内容の照合にはmetadata内のInventory SHA-256とMarkdown SHA-256を使う。
 
 - `generated_at`、host固有absolute path、環境変数、Prompt、raw Provider outputは含めない。
 - release、campaign、findingはRequest順ではなく固定sort keyとidentityで決定的にsortする。
 - findingはsubject kind、subject ID、artifact role／path、固定code、safe detailを持つ。raw Artifact本文は保存しない。
-- `summary`はclassification別件数、`primary_campaign_count`、state別件数、Provider call accountingの`provider_call_count_observed`、`provider_call_count_unknown_runs`、`campaigns_without_total`を持つ。Usage又はコストを推定しない。canonical Campaign totalを確定できないentryは`campaigns_without_total`へ残し、observed値から暗黙に除外したまま消去しない。
+- `summary`はclassification別件数、`primary_campaign_count`、state別件数、literal `provider_accounting_scope=declared_campaign_entries`、Provider call accountingの`provider_call_count_observed`、`provider_call_count_unknown_runs`、`campaigns_without_total`を持つ。Campaign outputは`observed`／`partially_unknown`／`unavailable`と対応するcount fieldを持つ。Usage又はコストを推定しない。canonical Campaign totalを確定できないentryは`campaigns_without_total`へ残し、observed値から暗黙に除外したまま消去しない。
 
 sidecarの`EvidenceInventoryMetadata 1.0`だけが`generated_at`を持つ。ほかに`request_correlation_id`、request SHA-256、Inventory SHA-256、Markdown SHA-256、`expected_execution_repository_head`（指定時）、`observed_execution_repository_head`、renderer version、tool versionを持たせる。`observed_execution_repository_head`は指定repository rootのcheckout HEADだけを表し、binary provenanceではない。sidecarもcanonical JSONにし、Inventory本体のbytesを変えない。
 

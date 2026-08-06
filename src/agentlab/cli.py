@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Annotated
 
@@ -32,11 +33,13 @@ from agentlab.phase6_public import (
     verify_phase6_historical,
 )
 from agentlab.phase7_inventory import (
+    MAX_REQUEST_BYTES,
     InventoryContractError,
     InventoryPublicationError,
     InventorySafetyError,
     VerificationStatus,
     create_inventory_publication,
+    publish_inventory_request_bytes,
 )
 from agentlab.recording import RecordingLoadError
 from agentlab.replay import ReplayError, run_replay
@@ -444,6 +447,40 @@ def inventory_phase6_evidence(
     typer.echo("Provider, Prompt, Gate, Campaign, Report, Public Suite, and network: 0")
     if publication.inventory.verification_status is VerificationStatus.FAILED:
         raise typer.Exit(code=2)
+
+
+@app.command("publish-phase6-evidence-inventory-request")
+def publish_phase6_evidence_inventory_request(
+    expected_request_sha256: Annotated[
+        str,
+        typer.Option("--expected-request-sha256"),
+    ],
+    repository_root: Annotated[Path, typer.Option("--repository-root")] = Path("."),
+    confirm_local_write: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-local-write",
+            help="Create one SHA-bound reviewed Request below the fixed Phase 7 evidence root.",
+        ),
+    ] = False,
+) -> None:
+    """Read canonical Request bytes from stdin and publish them create-only."""
+    request_bytes = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
+    try:
+        publication = publish_inventory_request_bytes(
+            request_bytes,
+            repository_root,
+            expected_request_sha256=expected_request_sha256,
+            confirm_local_write=confirm_local_write,
+        )
+    except (InventoryContractError, InventoryPublicationError, InventorySafetyError) as error:
+        typer.echo(f"publish-phase6-evidence-inventory-request stopped: {error}", err=True)
+        typer.echo("new Request publication: 0; existing leaves were not reused")
+        typer.echo("Provider, Prompt, Gate, Campaign, Report, Public Suite, and network: 0")
+        raise typer.Exit(code=1) from error
+    typer.echo(f"Request: {publication.request_path}")
+    typer.echo(f"request SHA-256: {publication.request_sha256}")
+    typer.echo("Provider, Prompt, Gate, Campaign, Report, Public Suite, and network: 0")
 
 
 @app.command()

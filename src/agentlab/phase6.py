@@ -3262,12 +3262,30 @@ class Phase6PrimarySnapshotBinding:
 
     language: Language
     campaign_path: str
-    campaign_id: str
+    experiment_id: str
+    reviewed_commit: str
     planned_run_ids: frozenset[str]
     complete_pairs: frozenset[tuple[str, int]]
     planned_provider_call_count: int
     provider_call_count: int
     provider_call_count_unknown_runs: int
+
+
+@dataclass(frozen=True)
+class Phase6SourceProvenance:
+    """One Manifest-listed source's typed reviewed-commit provenance.
+
+    This is deliberately derived only from a validated, caller-owned byte
+    snapshot.  Rendered bundle files, reports, and arbitrary JSON fields are
+    not independent commit authorities.
+    """
+
+    language: Language
+    source_class: SourceClass
+    role: Literal["primary", "historical"]
+    reviewed_commit: str
+    experiment_id: str
+    campaign_path: str
 
 
 def load_public_suite_inputs(
@@ -3804,6 +3822,8 @@ def derive_primary_snapshot_binding(
         raise Phase6ContractError("complete primary source requires Spec 2.1")
     if not isinstance(plan, WorkflowPlanV1_2):
         raise Phase6ContractError("complete primary source requires Plan 1.2")
+    if spec.spec.reviewed_commit != plan.reviewed_commit:
+        raise Phase6ContractError("Workflow Spec and Plan reviewed commits differ")
     for spec_relative, reference in (
         (spec.spec.fixture_manifest_path, source.fixture_manifest),
         (spec.spec.fixture_acceptance_path, source.fixture_acceptance),
@@ -3849,7 +3869,8 @@ def derive_primary_snapshot_binding(
     return Phase6PrimarySnapshotBinding(
         language=source.language,
         campaign_path=source.campaign.path,
-        campaign_id=campaign.started.experiment_id,
+        experiment_id=campaign.started.experiment_id,
+        reviewed_commit=spec.spec.reviewed_commit,
         planned_run_ids=frozenset(run.run_id for run in plan.runs),
         complete_pairs=frozenset(
             pair
@@ -3860,6 +3881,114 @@ def derive_primary_snapshot_binding(
         provider_call_count=campaign.finished.provider_call_count,
         provider_call_count_unknown_runs=campaign.finished.provider_call_count_unknown_runs,
     )
+
+
+def derive_public_suite_source_provenance(
+    validated: ValidatedPublicSuiteInputs,
+) -> tuple[Phase6SourceProvenance, ...]:
+    """Derive role-aware commit provenance from one validated Suite snapshot.
+
+    The caller supplies the result of :func:`validate_public_suite_snapshot`.
+    The facade therefore neither opens files nor discovers values by generic
+    JSON traversal.  Primary provenance is the reviewed commit shared by the
+    typed Workflow Spec 2.1 and Plan 1.2; historical provenance is only the
+    HistoricalVerificationRecord source_reviewed_commit.
+    """
+    bytes_by_path = validated.loaded.bytes_by_path
+    provenance: list[Phase6SourceProvenance] = []
+    for source in validated.loaded.manifest.primary_sources:
+        binding = derive_primary_snapshot_binding(source, bytes_by_path)
+        provenance.append(
+            Phase6SourceProvenance(
+                language=binding.language,
+                source_class=SourceClass.PRIMARY,
+                role="primary",
+                reviewed_commit=binding.reviewed_commit,
+                experiment_id=binding.experiment_id,
+                campaign_path=binding.campaign_path,
+            )
+        )
+    for historical_source in validated.loaded.manifest.historical_sources:
+        record = _load_canonical_model_bytes(
+            bytes_by_path[historical_source.verification_record.path],
+            HistoricalVerificationRecord,
+            "Historical Verification Record",
+        )
+        campaign = _load_phase6_campaign_bytes(
+            bytes_by_path[historical_source.campaign.path]
+        )
+        provenance.append(
+            Phase6SourceProvenance(
+                language=historical_source.language,
+                source_class=SourceClass.HISTORICAL,
+                role="historical",
+                reviewed_commit=record.source_reviewed_commit,
+                experiment_id=campaign.started.experiment_id,
+                campaign_path=historical_source.campaign.path,
+            )
+        )
+    return tuple(
+        sorted(
+            provenance,
+            key=lambda item: (
+                item.source_class.value,
+                item.language.value,
+                item.campaign_path,
+            ),
+        )
+    )
+
+
+def derive_primary_reviewed_commit_from_bytes(
+    *,
+    spec_bytes: bytes,
+    fixture_manifest_bytes: bytes,
+    fixture_acceptance_bytes: bytes,
+    diff_policy_bytes: bytes,
+    plan_bytes: bytes,
+) -> str:
+    """Return a primary source commit after the existing typed bindings hold."""
+    spec = _load_workflow_spec_contract_bytes(spec_bytes)
+    fixture_manifest = _load_canonical_model_bytes(
+        fixture_manifest_bytes, FixtureManifest, "Fixture Manifest"
+    )
+    fixture_acceptance = _load_canonical_model_bytes(
+        fixture_acceptance_bytes, FixtureAcceptanceRecord, "Fixture Acceptance Record"
+    )
+    diff_policy = _load_canonical_model_bytes(diff_policy_bytes, DiffPolicy, "Diff Policy")
+    plan = _load_workflow_plan_1_2_bytes(plan_bytes)
+    if not isinstance(spec.spec, WorkflowExperimentSpecV2_1) or not isinstance(
+        plan, WorkflowPlanV1_2
+    ):
+        raise Phase6ContractError("primary provenance requires Spec 2.1 and Plan 1.2")
+    validate_plan_bindings(
+        loaded_spec=spec,
+        plan=plan,
+        fixture_manifest_bytes=fixture_manifest_bytes,
+        fixture_manifest=fixture_manifest,
+        fixture_acceptance_bytes=fixture_acceptance_bytes,
+        fixture_acceptance=fixture_acceptance,
+        diff_policy_bytes=diff_policy_bytes,
+        diff_policy=diff_policy,
+    )
+    if spec.spec.reviewed_commit != plan.reviewed_commit:
+        raise Phase6ContractError("Workflow Spec and Plan reviewed commits differ")
+    return spec.spec.reviewed_commit
+
+
+def derive_historical_source_reviewed_commit_from_bytes(record_bytes: bytes) -> str:
+    """Return only HistoricalVerificationRecord.source_reviewed_commit."""
+    record = _load_canonical_model_bytes(
+        record_bytes,
+        HistoricalVerificationRecord,
+        "Historical Verification Record",
+    )
+    return record.source_reviewed_commit
+
+
+def derive_phase6_campaign_experiment_id_from_bytes(campaign_bytes: bytes) -> str:
+    """Strict-load one Campaign snapshot and return its started Experiment ID."""
+    return _load_phase6_campaign_bytes(campaign_bytes).started.experiment_id
 
 
 def _require_loaded_inputs_unchanged(

@@ -26,6 +26,7 @@ from agentlab.phase7_inventory import (
     InventoryPublicationError,
     InventorySafetyError,
     InventoryScope,
+    ProviderTotalStatus,
     ReleaseClassification,
     ReleaseEntry,
     RetentionExpectation,
@@ -42,6 +43,9 @@ from agentlab.phase7_inventory import (
     compute_tree_sha256,
     create_inventory_publication,
     load_inventory_request_bytes,
+    publish_inventory_request_bytes,
+    verify_declared_inventory_inputs,
+    verify_evidence_inventory_publication_bytes,
     verify_inventory_request,
 )
 
@@ -58,7 +62,7 @@ def _request(
     *,
     artifact_path: str,
     artifact_bytes: bytes,
-    commit_mode: CommitVerificationMode = CommitVerificationMode.INTERNAL_IF_PRESENT,
+    commit_mode: CommitVerificationMode = CommitVerificationMode.DECLARATION_BASIS_ONLY,
     commit: str = HEAD,
 ) -> Path:
     authority = b"synthetic authority\n"
@@ -186,7 +190,7 @@ def test_abandoned_missing_internal_commit_is_not_verifiable(
 
     codes = {finding.code.value for finding in inventory.findings}
     assert "artifact_missing" in codes
-    assert "artifact_reviewed_commit_not_verifiable" in codes
+    assert "artifact_reviewed_commit_not_verifiable" not in codes
     assert "artifact_reviewed_commit_mismatch" not in codes
 
 
@@ -834,7 +838,7 @@ def test_invalid_campaign_remains_visible_as_without_total(
     campaign = CampaignEntry(
         campaign_id="synthetic-campaign",
         artifact_reviewed_commit=HEAD,
-        commit_verification_mode=CommitVerificationMode.INTERNAL_IF_PRESENT,
+        commit_verification_mode=CommitVerificationMode.DECLARATION_BASIS_ONLY,
         classification=CampaignClassification.AUDIT_ONLY_FAILURE,
         included_in_primary_denominator=False,
         verification_profile="declared_artifact_set",
@@ -882,7 +886,7 @@ def test_non_public_release_does_not_propagate_manifest_drift_to_campaign(
     )
     current_release = ReleaseEntry(
         release_id="release-current",
-        artifact_reviewed_commit=HEAD,
+        artifact_reviewed_commits=[HEAD],
         commit_verification_mode=CommitVerificationMode.INTERNAL_REQUIRED,
         classification=ReleaseClassification.ACCEPTED_CURRENT,
         verification_profile="phase6_public_suite",
@@ -920,7 +924,7 @@ def test_non_public_release_does_not_propagate_manifest_drift_to_campaign(
     )
     historical_release = ReleaseEntry(
         release_id="release-historical",
-        artifact_reviewed_commit=HEAD,
+        artifact_reviewed_commits=[HEAD],
         commit_verification_mode=CommitVerificationMode.INTERNAL_IF_PRESENT,
         classification=ReleaseClassification.HISTORICAL,
         verification_profile="declared_artifact_set",
@@ -937,7 +941,7 @@ def test_non_public_release_does_not_propagate_manifest_drift_to_campaign(
     campaign = CampaignEntry(
         campaign_id="historical-campaign",
         artifact_reviewed_commit=HEAD,
-        commit_verification_mode=CommitVerificationMode.INTERNAL_IF_PRESENT,
+        commit_verification_mode=CommitVerificationMode.DECLARATION_BASIS_ONLY,
         classification=CampaignClassification.AUDIT_ONLY_FAILURE,
         included_in_primary_denominator=False,
         release_id="release-historical",
@@ -959,7 +963,7 @@ def test_non_public_release_does_not_propagate_manifest_drift_to_campaign(
     public_audit_campaign = CampaignEntry(
         campaign_id="public-audit-campaign",
         artifact_reviewed_commit=HEAD,
-        commit_verification_mode=CommitVerificationMode.INTERNAL_IF_PRESENT,
+        commit_verification_mode=CommitVerificationMode.DECLARATION_BASIS_ONLY,
         classification=CampaignClassification.AUDIT_ONLY_FAILURE,
         included_in_primary_denominator=False,
         release_id="release-current",
@@ -1178,7 +1182,7 @@ def test_release_request_requires_one_current_and_manifest_binding() -> None:
     )
     release = ReleaseEntry(
         release_id="release-current",
-        artifact_reviewed_commit=HEAD,
+        artifact_reviewed_commits=[HEAD],
         commit_verification_mode=CommitVerificationMode.INTERNAL_REQUIRED,
         classification=ReleaseClassification.ACCEPTED_CURRENT,
         verification_profile="phase6_public_suite",
@@ -1278,7 +1282,7 @@ def test_accepted_current_and_superseded_release_form_a_valid_pair() -> None:
         return (
             ReleaseEntry(
                 release_id=release_id,
-                artifact_reviewed_commit=HEAD,
+                artifact_reviewed_commits=[HEAD],
                 commit_verification_mode=CommitVerificationMode.INTERNAL_REQUIRED,
                 classification=classification,
                 verification_profile="phase6_public_suite",
@@ -1582,3 +1586,280 @@ def test_receipt_requires_a_subject_wide_digest(
 
     assert inventory.retention[0].retention_state is RetentionState.UNKNOWN
     assert any(finding.code.value == "retention_receipt_invalid" for finding in inventory.findings)
+
+
+def test_generic_reviewed_commit_is_not_typed_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = json.dumps({"reviewed_commit": HEAD}, sort_keys=True, indent=2).encode() + b"\n"
+    request_path = _request(
+        tmp_path,
+        artifact_path="report.json",
+        artifact_bytes=report,
+        commit_mode=CommitVerificationMode.INTERNAL_IF_PRESENT,
+    )
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._observe_execution_repository_head", lambda _root: HEAD
+    )
+
+    inventory = verify_inventory_request(
+        request_path=request_path,
+        repository_root=tmp_path,
+        confirm_local_execution=True,
+    )
+
+    assert inventory.campaigns[0].commit_verification.value == "not_verifiable"
+    assert inventory.campaigns[0].integrity_state.value == "not_verifiable"
+
+
+def test_release_commit_collection_rejects_legacy_duplicate_and_unsorted_shapes() -> None:
+    with pytest.raises(ValueError, match="artifact_reviewed_commits"):
+        ReleaseEntry(
+            release_id="release",
+            artifact_reviewed_commits=[OTHER_HEAD, HEAD],
+            commit_verification_mode=CommitVerificationMode.INTERNAL_REQUIRED,
+            classification=ReleaseClassification.HISTORICAL,
+            verification_profile="declared_artifact_set",
+            declaration_basis="test",
+            file_artifacts=[
+                ExpectedFileArtifact(
+                    role="release_metadata",
+                    path="metadata.json",
+                    byte_count=1,
+                    sha256=_sha256(b"x"),
+                )
+            ],
+        )
+    with pytest.raises(InventoryContractError):
+        load_inventory_request_bytes(
+            b'{"authoritative":false,"campaign_entries":[],"expected_execution_repository_head":null,'
+            b'"inventory_id":"legacy","release_entries":[{"artifact_reviewed_commit":"'
+            + HEAD.encode()
+            + b'"}],"retention_expectations":[],"schema_version":"1.0","scope":"phase6",'
+            b'"source_of_truth_references":[]}'
+        )
+
+
+def test_provider_accounting_exposes_unavailable_campaign_total(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invalid_campaign = b'{"event_type":"campaign_finished","provider_call_count":4}\n'
+    request_path = _request(
+        tmp_path,
+        artifact_path="unused-report.json",
+        artifact_bytes=b"{}\n",
+    )
+    request = load_inventory_request_bytes(request_path.read_bytes()).model_copy(
+        update={
+            "campaign_entries": [
+                CampaignEntry(
+                    campaign_id="synthetic-campaign",
+                    artifact_reviewed_commit=HEAD,
+                    commit_verification_mode=CommitVerificationMode.DECLARATION_BASIS_ONLY,
+                    classification=CampaignClassification.AUDIT_ONLY_FAILURE,
+                    included_in_primary_denominator=False,
+                    verification_profile="declared_artifact_set",
+                    declaration_basis="test",
+                    file_artifacts=[
+                        ExpectedFileArtifact(
+                            role="campaign",
+                            path="campaign.jsonl",
+                            byte_count=len(invalid_campaign),
+                            sha256=_sha256(invalid_campaign),
+                        )
+                    ],
+                )
+            ]
+        }
+    )
+    request_path.write_bytes(canonical_inventory_json_bytes(request))
+    (tmp_path / "campaign.jsonl").write_bytes(invalid_campaign)
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._observe_execution_repository_head", lambda _root: HEAD
+    )
+
+    inventory = verify_inventory_request(
+        request_path=request_path,
+        repository_root=tmp_path,
+        confirm_local_execution=True,
+    )
+
+    campaign = inventory.campaigns[0]
+    assert campaign.provider_total_status is ProviderTotalStatus.UNAVAILABLE
+    assert campaign.provider_call_count_observed is None
+    assert campaign.provider_call_count_unknown_runs is None
+    assert inventory.summary.provider_accounting_scope == "declared_campaign_entries"
+    assert inventory.summary.campaigns_without_total == 1
+
+
+def test_publication_verifier_binds_request_and_failed_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_path = _request(
+        tmp_path,
+        artifact_path="artifact.json",
+        artifact_bytes=b"{}\n",
+    )
+    (tmp_path / "artifact.json").unlink()
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._observe_execution_repository_head", lambda _root: HEAD
+    )
+    publication = create_inventory_publication(
+        request_path=request_path,
+        repository_root=tmp_path,
+        output_path=tmp_path / "inventory.json",
+        markdown_path=tmp_path / "inventory.md",
+        metadata_path=tmp_path / "inventory.metadata.json",
+        confirm_local_execution=True,
+    )
+
+    assert publication.exit_code == 2
+    verified = verify_evidence_inventory_publication_bytes(
+        request_path.read_bytes(),
+        publication.inventory_bytes,
+        publication.markdown_bytes,
+        publication.metadata_bytes,
+    )
+    assert verified.inventory.verification_status.value == "failed"
+
+
+def test_request_publisher_sha_mismatch_has_zero_mutation(tmp_path: Path) -> None:
+    request_path = _request(tmp_path, artifact_path="artifact.json", artifact_bytes=b"{}\n")
+    (tmp_path / ".artifacts").mkdir()
+
+    with pytest.raises(InventoryContractError, match="SHA-256"):
+        publish_inventory_request_bytes(
+            request_path.read_bytes(),
+            tmp_path,
+            expected_request_sha256="0" * 64,
+            confirm_local_write=True,
+        )
+
+    assert list((tmp_path / ".artifacts").iterdir()) == []
+
+
+def test_request_publisher_is_create_only_and_declared_verifier_is_byte_based(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_path = _request(tmp_path, artifact_path="artifact.json", artifact_bytes=b"{}\n")
+    request_bytes = request_path.read_bytes()
+    (tmp_path / ".artifacts").mkdir()
+    published = publish_inventory_request_bytes(
+        request_bytes,
+        tmp_path,
+        expected_request_sha256=_sha256(request_bytes),
+        confirm_local_write=True,
+    )
+    assert published.request_path.read_bytes() == request_bytes
+    with pytest.raises(InventoryPublicationError, match="already exists"):
+        publish_inventory_request_bytes(
+            request_bytes,
+            tmp_path,
+            expected_request_sha256=_sha256(request_bytes),
+            confirm_local_write=True,
+        )
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._observe_execution_repository_head", lambda _root: HEAD
+    )
+    verification = verify_declared_inventory_inputs(
+        request_bytes,
+        tmp_path,
+        confirm_local_execution=True,
+    )
+    assert verification.request_sha256 == _sha256(request_bytes)
+
+
+def test_only_matching_release_checksums_tree_alias_is_allowed() -> None:
+    manifest = ExpectedFileArtifact(
+        role="suite_manifest",
+        path="manifest.json",
+        byte_count=1,
+        sha256=_sha256(b"m"),
+    )
+    checksums = ExpectedFileArtifact(
+        role="checksums",
+        path="bundle/checksums.json",
+        byte_count=1,
+        sha256=_sha256(b"c"),
+    )
+    tree_member = ExpectedFileArtifact(
+        role="checksums",
+        path="checksums.json",
+        byte_count=1,
+        sha256=_sha256(b"c"),
+    )
+    tree = ExpectedTree(
+        role="bundle_root",
+        root_path="bundle",
+        file_artifacts=[tree_member],
+        expected_file_count=1,
+        tree_sha256=compute_tree_sha256(
+            {"checksums.json": (1, _sha256(b"c"))}, []
+        ),
+    )
+    release = ReleaseEntry(
+        release_id="release-current",
+        artifact_reviewed_commits=[HEAD],
+        commit_verification_mode=CommitVerificationMode.INTERNAL_REQUIRED,
+        classification=ReleaseClassification.ACCEPTED_CURRENT,
+        verification_profile="phase6_public_suite",
+        declaration_basis="alias test",
+        accepted_manifest_reference_id="manifest-ref",
+        file_artifacts=[
+            manifest,
+            checksums,
+            ExpectedFileArtifact(
+                role="external_anchor",
+                path="anchor.json",
+                byte_count=1,
+                sha256=_sha256(b"a"),
+            ),
+        ],
+        trees=[tree],
+    )
+    request = EvidenceInventoryRequest(
+        schema_version="1.0",
+        inventory_id="checksum-alias",
+        authoritative=False,
+        scope=InventoryScope.PHASE6,
+        source_of_truth_references=[
+            AuthorityReference(
+                reference_id="manifest-ref",
+                kind="accepted_manifest",
+                path="manifest.json",
+                byte_count=1,
+                sha256=_sha256(b"m"),
+                description="manifest",
+            )
+        ],
+        release_entries=[release],
+    )
+    assert request.release_entries[0].trees[0].file_artifacts[0].path == "checksums.json"
+
+    with pytest.raises(ValueError, match="paths must be unique"):
+        EvidenceInventoryRequest(
+            **{
+                **request.model_dump(mode="python"),
+                "release_entries": [
+                    release.model_copy(
+                        update={
+                            "trees": [
+                                tree.model_copy(
+                                    update={
+                                        "file_artifacts": [
+                                            tree_member.model_copy(
+                                                update={"role": "release_metadata"}
+                                            )
+                                        ]
+                                    }
+                                )
+                            ]
+                        }
+                    )
+                ],
+            }
+        )
