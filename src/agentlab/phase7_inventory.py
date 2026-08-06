@@ -4462,7 +4462,8 @@ def publish_inventory_request_bytes(
     created_directories: list[tuple[int, str, tuple[int, int, int, int, int, int, int]]] = []
     directory_entries: list[tuple[int, str, tuple[int, int, int, int, int, int, int]]] = []
     request_parent_fd: int | None = None
-    request_identity: tuple[int, int, int, int, int, int, int] | None = None
+    owned_request_identity: tuple[int, int, int, int, int, int, int] | None = None
+    committed_request_identity: tuple[int, int, int, int, int, int, int] | None = None
     request_relative = (
         PurePosixPath(".artifacts")
         / "phase7"
@@ -4555,7 +4556,7 @@ def publish_inventory_request_bytes(
             # Ownership begins at O_EXCL open, rather than only after a
             # successful write.  This permits a safe rollback if write,
             # fsync, or descriptor reload fails midway through publication.
-            request_identity = _identity(os.fstat(descriptor))
+            owned_request_identity = _identity(os.fstat(descriptor))
             view = memoryview(request_bytes)
             while view:
                 written = os.write(descriptor, view)
@@ -4565,11 +4566,12 @@ def publish_inventory_request_bytes(
             os.fsync(descriptor)
             written_stat = os.fstat(descriptor)
             if (
-                not _same_object_identity(written_stat, request_identity)
+                not _same_object_identity(written_stat, owned_request_identity)
                 or not stat.S_ISREG(written_stat.st_mode)
                 or written_stat.st_nlink != 1
             ):
                 raise InventoryPublicationError("published Request file is unsafe")
+            committed_request_identity = _identity(written_stat)
         finally:
             os.close(descriptor)
         reread = _read_regular_file(
@@ -4586,7 +4588,8 @@ def publish_inventory_request_bytes(
             or not hmac.compare_digest(reread.sha256, actual_sha256)
         ):
             raise InventoryPublicationError("published Request did not survive descriptor reload")
-        assert request_identity is not None
+        assert owned_request_identity is not None
+        assert committed_request_identity is not None
         try:
             reread_stat = os.stat("request.json", dir_fd=leaf_fd, follow_symlinks=False)
         except OSError as error:
@@ -4594,9 +4597,10 @@ def publish_inventory_request_bytes(
                 "published Request identity could not be rechecked"
             ) from error
         if (
-            not _same_object_identity(reread_stat, request_identity)
+            not _same_object_identity(reread_stat, owned_request_identity)
             or not stat.S_ISREG(reread_stat.st_mode)
             or reread_stat.st_nlink != 1
+            or _identity(reread_stat) != committed_request_identity
         ):
             raise InventoryPublicationError("published Request changed before reload completed")
         _require_directory_entries_stable(directory_entries)
@@ -4612,7 +4616,7 @@ def publish_inventory_request_bytes(
         try:
             _rollback_owned_request_publication(
                 request_parent_fd=request_parent_fd,
-                request_identity=request_identity,
+                request_identity=owned_request_identity,
                 created_directories=created_directories,
             )
         except Exception as error:

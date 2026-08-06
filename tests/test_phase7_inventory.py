@@ -1936,6 +1936,43 @@ def test_request_publisher_reload_failure_rolls_back_owned_file_and_leaf(
     assert list((tmp_path / ".artifacts").iterdir()) == []
 
 
+def test_request_publisher_rejects_same_inode_mutation_after_descriptor_reload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_path = _request(tmp_path, artifact_path="artifact.json", artifact_bytes=b"{}\n")
+    request_bytes = request_path.read_bytes()
+    (tmp_path / ".artifacts").mkdir()
+    from agentlab import phase7_inventory
+
+    original_read = phase7_inventory._read_regular_file
+
+    def truncate_after_read(*args: object, **kwargs: object) -> object:
+        result = original_read(*args, **kwargs)
+        request_file = (
+            tmp_path
+            / ".artifacts"
+            / "phase7"
+            / "evidence-inventory"
+            / "synthetic-inventory"
+            / "request.json"
+        )
+        with request_file.open("r+b") as handle:
+            handle.truncate(0)
+        return result
+
+    monkeypatch.setattr(phase7_inventory, "_read_regular_file", truncate_after_read)
+    with pytest.raises(InventoryPublicationError, match="changed before reload completed"):
+        publish_inventory_request_bytes(
+            request_bytes,
+            tmp_path,
+            expected_request_sha256=_sha256(request_bytes),
+            confirm_local_write=True,
+        )
+
+    assert list((tmp_path / ".artifacts").iterdir()) == []
+
+
 def test_request_publisher_preserves_leaf_when_request_identity_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
