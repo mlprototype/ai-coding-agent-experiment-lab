@@ -21,6 +21,7 @@ from agentlab.phase7_inventory import (
     ExpectedFileArtifact,
     ExpectedTree,
     ExternalCopyReceipt,
+    FindingCode,
     InventoryContractError,
     InventoryPublicationError,
     InventorySafetyError,
@@ -29,6 +30,7 @@ from agentlab.phase7_inventory import (
     ReleaseEntry,
     RetentionExpectation,
     RetentionState,
+    _finding,
     _ObservationResult,
     _observe_tree,
     _provider_counts,
@@ -502,6 +504,25 @@ def test_tree_file_and_byte_limits_are_safety_failures(
         _observe_test_tree(tmp_path, tree)
 
 
+def test_tree_directory_limit_is_a_safety_failure(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    directories = [f"dir_{index}" for index in range(257)]
+    for relative in directories:
+        (bundle / relative).mkdir()
+    tree = ExpectedTree(
+        role="bundle_root",
+        root_path="bundle",
+        allowed_directories=sorted(directories),
+        file_artifacts=[],
+        expected_file_count=0,
+        tree_sha256=compute_tree_sha256({}, directories),
+    )
+
+    with pytest.raises(InventorySafetyError, match="bounded directory limit"):
+        _observe_test_tree(tmp_path, tree)
+
+
 def test_tree_entry_replacement_is_caught_by_snapshot_revalidation(
     tmp_path: Path,
 ) -> None:
@@ -684,7 +705,7 @@ def test_provider_accounting_deduplicates_mirrors() -> None:
     assert _provider_counts({"campaign": campaign, "mirror": campaign}) == (3, 0)
 
 
-def test_provider_accounting_uses_one_canonical_campaign_finished_event() -> None:
+def test_provider_accounting_excludes_invalid_campaign() -> None:
     campaign = (
         b'{"event_type":"campaign_finished",'
         b'"provider_call_count":4,"provider_call_count_unknown_runs":1}\n'
@@ -694,7 +715,7 @@ def test_provider_accounting_uses_one_canonical_campaign_finished_event() -> Non
     assert _provider_counts(
         {"campaign.jsonl": campaign, "evidence.json": evidence_mirror},
         campaign_contents=[("campaign-a", campaign), ("campaign-a", evidence_mirror)],
-    ) == (4, 1)
+    ) == (0, 1)
 
 
 def test_output_parent_symlink_is_rejected_before_publication(
@@ -912,6 +933,157 @@ def test_release_request_requires_one_current_and_manifest_binding() -> None:
         )
 
 
+def test_accepted_current_and_superseded_release_form_a_valid_pair() -> None:
+    def accepted_release(
+        release_id: str,
+        classification: ReleaseClassification,
+        manifest_path: str,
+        reference_id: str,
+        superseded_by: str | None = None,
+    ) -> tuple[ReleaseEntry, AuthorityReference]:
+        manifest = b"manifest-" + release_id.encode()
+        files = [
+            ExpectedFileArtifact(
+                role="suite_manifest",
+                path=manifest_path,
+                byte_count=len(manifest),
+                sha256=_sha256(manifest),
+            ),
+            ExpectedFileArtifact(
+                role="checksums",
+                path=f"{release_id}/checksums.json",
+                byte_count=1,
+                sha256=_sha256(b"x"),
+            ),
+            ExpectedFileArtifact(
+                role="external_anchor",
+                path=f"{release_id}/anchor.json",
+                byte_count=1,
+                sha256=_sha256(b"x"),
+            ),
+        ]
+        return (
+            ReleaseEntry(
+                release_id=release_id,
+                artifact_reviewed_commit=HEAD,
+                commit_verification_mode=CommitVerificationMode.INTERNAL_REQUIRED,
+                classification=classification,
+                verification_profile="phase6_public_suite",
+                declaration_basis="accepted pair regression",
+                accepted_manifest_reference_id=reference_id,
+                superseded_by=superseded_by,
+                file_artifacts=files,
+                trees=[
+                    ExpectedTree(
+                        role="bundle_root",
+                        root_path=f"{release_id}/bundle",
+                        file_artifacts=[],
+                        expected_file_count=0,
+                        tree_sha256=_sha256(b"tree"),
+                    )
+                ],
+            ),
+            AuthorityReference(
+                reference_id=reference_id,
+                kind="accepted_manifest",
+                path=manifest_path,
+                byte_count=len(manifest),
+                sha256=_sha256(manifest),
+                description="accepted pair regression",
+            ),
+        )
+
+    current, current_reference = accepted_release(
+        "release-current",
+        ReleaseClassification.ACCEPTED_CURRENT,
+        "release-current/manifest.json",
+        "accepted-current",
+    )
+    superseded, superseded_reference = accepted_release(
+        "release-superseded",
+        ReleaseClassification.ACCEPTED_SUPERSEDED,
+        "release-superseded/manifest.json",
+        "accepted-superseded",
+        superseded_by="release-current",
+    )
+
+    request = EvidenceInventoryRequest(
+        schema_version="1.0",
+        inventory_id="accepted-pair",
+        authoritative=False,
+        scope=InventoryScope.PHASE6,
+        source_of_truth_references=[current_reference, superseded_reference],
+        release_entries=[current, superseded],
+    )
+
+    assert [entry.classification for entry in request.release_entries] == [
+        ReleaseClassification.ACCEPTED_CURRENT,
+        ReleaseClassification.ACCEPTED_SUPERSEDED,
+    ]
+    assert request.release_entries[1].superseded_by == "release-current"
+
+
+def test_semantic_finding_propagates_to_entry_and_retention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_path = _request(
+        tmp_path,
+        artifact_path="artifact.json",
+        artifact_bytes=b'{"reviewed_commit":"' + HEAD.encode() + b'"}\n',
+    )
+    request = load_inventory_request_bytes(request_path.read_bytes()).model_copy(
+        update={
+            "retention_expectations": [
+                RetentionExpectation(
+                    subject_kind="campaign",
+                    subject_id="synthetic-campaign",
+                    expected_retention_state=RetentionState.LOCAL_ONLY,
+                    declaration_basis="semantic finding regression",
+                )
+            ]
+        }
+    )
+    request_path.write_bytes(canonical_inventory_json_bytes(request))
+    from agentlab import phase7_inventory
+
+    original = phase7_inventory._commit_observation
+
+    def add_semantic_finding(**kwargs: Any) -> tuple[Any, tuple[Any, ...]]:
+        state, findings = original(**kwargs)
+        if kwargs["subject_kind"] == "campaign":
+            findings = (
+                *findings,
+                _finding(
+                    FindingCode.CROSS_ARTIFACT_MISMATCH,
+                    subject_kind="campaign",
+                    subject_id=kwargs["subject_id"],
+                    role="semantic_binding",
+                ),
+            )
+        return state, findings
+
+    monkeypatch.setattr(phase7_inventory, "_commit_observation", add_semantic_finding)
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._observe_execution_repository_head",
+        lambda _root: HEAD,
+    )
+
+    inventory = verify_inventory_request(
+        request_path=request_path,
+        repository_root=tmp_path,
+        confirm_local_execution=True,
+    )
+
+    assert inventory.campaigns[0].integrity_state.value == "drifted"
+    assert inventory.retention[0].retention_state is RetentionState.UNKNOWN
+    assert any(
+        finding.subject_kind == "campaign"
+        and finding.code is FindingCode.CROSS_ARTIFACT_MISMATCH
+        for finding in inventory.findings
+    )
+
+
 def test_complete_campaign_profile_requires_all_phase6_roles() -> None:
     with pytest.raises(ValueError, match="missing required file roles"):
         CampaignEntry(
@@ -996,7 +1168,7 @@ def test_local_only_requires_verified_local_subject(
     assert any(finding.subject_kind == "retention" for finding in inventory.findings)
 
 
-def test_receipt_cannot_bind_another_campaign_artifact(
+def test_receipt_requires_a_subject_wide_digest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1006,13 +1178,14 @@ def test_receipt_cannot_bind_another_campaign_artifact(
     b_bytes = json.dumps({"reviewed_commit": HEAD}, sort_keys=True, indent=2).encode() + b"\n"
     (tmp_path / "a.json").write_bytes(a_bytes)
     (tmp_path / "b.json").write_bytes(b_bytes)
+    a_markdown = b"# campaign-a\n"
+    (tmp_path / "a.md").write_bytes(a_markdown)
     receipt = ExternalCopyReceipt(
         schema_version="1.0",
         subject_kind="campaign",
         subject_id="campaign-a",
-        artifact_path="b.json",
-        artifact_byte_count=len(b_bytes),
-        artifact_sha256=_sha256(b_bytes),
+        # A digest of only one declared file must not claim the subject.
+        subject_digest=_sha256(a_bytes),
         created_at="2026-01-01T00:00:00.000000Z",
     )
     receipt_bytes = canonical_inventory_json_bytes(receipt)
@@ -1041,14 +1214,28 @@ def test_receipt_cannot_bind_another_campaign_artifact(
                 included_in_primary_denominator=False,
                 verification_profile="declared_artifact_set",
                 declaration_basis="declared",
-                file_artifacts=[
-                    ExpectedFileArtifact(
-                        role="report_json",
-                        path=f"{campaign_id[9]}.json",
-                        byte_count=len(data),
-                        sha256=_sha256(data),
+                file_artifacts=(
+                    [
+                        ExpectedFileArtifact(
+                            role="report_json",
+                            path=f"{campaign_id[9]}.json",
+                            byte_count=len(data),
+                            sha256=_sha256(data),
+                        )
+                    ]
+                    + (
+                        [
+                            ExpectedFileArtifact(
+                                role="report_markdown",
+                                path="a.md",
+                                byte_count=len(a_markdown),
+                                sha256=_sha256(a_markdown),
+                            )
+                        ]
+                        if campaign_id == "campaign-a"
+                        else []
                     )
-                ],
+                ),
             )
             for campaign_id, data in (("campaign-a", a_bytes), ("campaign-b", b_bytes))
         ],

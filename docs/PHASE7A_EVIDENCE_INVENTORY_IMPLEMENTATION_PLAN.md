@@ -119,7 +119,7 @@ Slice 7A-1で次の集合を固定し、実装はこの外のfinding codeを出�
 | `retention_receipt_missing` | receipt検証を要求したがreceiptが存在しない | `2` |
 | `retention_receipt_bytes_mismatch` | receiptのbyte countが期待値と異なる | `2` |
 | `retention_receipt_sha256_mismatch` | receiptのSHA-256が期待値と異なる | `2` |
-| `retention_receipt_invalid` | receiptがcanonical contract又は対象Artifact bindingを満たさない | `2` |
+| `retention_receipt_invalid` | receiptがcanonical contract又はsubject全体digest bindingを満たさない | `2` |
 
 findingの`detail`はcodeごとの固定templateから生成する。許可する差し込み値は閉じたsubject ID、role、repository-relative path、期待／観測のbyte count又はSHA-256だけとする。OS例外文字列、absolute path、Artifact本文、raw command outputをそのまま保存しない。
 
@@ -182,7 +182,7 @@ Release file roleの例は`suite_manifest`、`checksums`、`external_anchor`、R
 
 - `local_only`はローカルArtifactが検証可能で、外部copy receiptを主張しない状態である。
 - `unknown`は外部copyの有無を示す十分な証跡がない状態である。
-- `external_copy_receipt_verified`は、repository内の明示的なcanonical receiptが対象identity、bytes、SHA-256、作成時点を束縛し、そのreceipt自体がRequestの期待hashと一致する場合だけ表示する。
+- `external_copy_receipt_verified`は、repository内の明示的なcanonical receiptが対象identity、必須Artifact全体の`subject_digest`、作成時点を束縛し、そのreceipt自体がRequestの期待hashと一致する場合だけ表示する。単一fileのbytes／SHA-256だけを束縛するreceiptではsubject全体を主張できない。
 
 Verifierはnetwork接続や外部保存先のliveness確認をしない。すべてのretention評価には`verification_basis`と`remote_liveness`を出力し、receiptを検証した状態では必ず`verification_basis=receipt_only`、`remote_liveness=not_checked`とする。従って`external_copy_receipt_verified`は「保存済み証跡を検証できた」という意味であり、外部copyの現在可用性の保証ではない。この限定をMarkdownにも常に表示する。
 

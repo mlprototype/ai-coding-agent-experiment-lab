@@ -13,7 +13,7 @@ Phase 7AのEvidence Inventoryは、Phase 6の既存Artifactと人間がレビュ
 - root／親symlink、path escape、読取race、identity未確定はexit 1で新しいcomplete publicationを作らない。安全に観測できたfinal symlink／hardlink／special fileは`unsafe_artifact` finding、exit 2とする。
 - 3出力のpublicationはprocess内best-effort rollbackとincomplete publication検出を採用する。クラッシュatomic性は保証しない。
 - retentionの`external_copy_receipt_verified`はreceiptの検証だけを意味し、`verification_basis=receipt_only`、`remote_liveness=not_checked`を必ず表示する。
-- read-only snapshotの上限はRequest 4 MiB、1 Artifact file 64 MiB、tree 4,096 files／256 MiBとし、超過は安全なsnapshot不能としてexit 1にする。
+- read-only snapshotの上限はRequest 4 MiB、1 Artifact file 64 MiB、tree 4,096 files／256 directories／4,096 entries／256 MiBとし、超過は安全なsnapshot不能としてexit 1にする。
 
 ## Non-goals
 
