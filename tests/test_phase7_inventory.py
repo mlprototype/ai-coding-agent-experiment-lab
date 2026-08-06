@@ -32,6 +32,7 @@ from agentlab.phase7_inventory import (
     RetentionState,
     _finding,
     _ObservationResult,
+    _observe_file,
     _observe_tree,
     _publish_file_no_replace,
     _read_regular_file,
@@ -526,15 +527,30 @@ def test_tree_scan_does_not_cache_child_directory_fds(tmp_path: Path) -> None:
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     directories = [f"dir_{index}" for index in range(10)]
+    content = json.dumps({"reviewed_commit": HEAD}, sort_keys=True, indent=2).encode() + b"\n"
+    expected_files: dict[str, tuple[int, str]] = {}
+    expected_artifacts: list[ExpectedFileArtifact] = []
     for relative in directories:
-        (bundle / relative).mkdir()
+        directory = bundle / relative
+        directory.mkdir()
+        (directory / "entry.json").write_bytes(content)
+        path = f"{relative}/entry.json"
+        expected_files[path] = (len(content), _sha256(content))
+        expected_artifacts.append(
+            ExpectedFileArtifact(
+                role="report_json",
+                path=path,
+                byte_count=len(content),
+                sha256=_sha256(content),
+            )
+        )
     tree = ExpectedTree(
         role="bundle_root",
         root_path="bundle",
         allowed_directories=sorted(directories),
-        file_artifacts=[],
-        expected_file_count=0,
-        tree_sha256=compute_tree_sha256({}, directories),
+        file_artifacts=sorted(expected_artifacts, key=lambda item: item.path),
+        expected_file_count=len(expected_artifacts),
+        tree_sha256=compute_tree_sha256(expected_files, directories),
     )
     snapshot = _snapshot_root(tmp_path)
     try:
@@ -547,6 +563,64 @@ def test_tree_scan_does_not_cache_child_directory_fds(tmp_path: Path) -> None:
         )
         assert observed.observation.integrity_state.value == "verified"
         assert len(snapshot.directory_fds) == 2
+        assert len(snapshot.file_fds) == 10
+    finally:
+        snapshot.close()
+
+
+def test_tree_child_replacement_before_file_observation_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = json.dumps({"reviewed_commit": HEAD}, sort_keys=True, indent=2).encode() + b"\n"
+    original_child = tmp_path / "bundle" / "child"
+    original_child.mkdir(parents=True)
+    (original_child / "entry.json").write_bytes(content)
+    tree = ExpectedTree(
+        role="bundle_root",
+        root_path="bundle",
+        allowed_directories=["child"],
+        file_artifacts=[
+            ExpectedFileArtifact(
+                role="report_json",
+                path="child/entry.json",
+                byte_count=len(content),
+                sha256=_sha256(content),
+            )
+        ],
+        expected_file_count=1,
+        tree_sha256=compute_tree_sha256(
+            {"child/entry.json": (len(content), _sha256(content))},
+            ["child"],
+        ),
+    )
+    snapshot = _snapshot_root(tmp_path)
+    original_observe_file = _observe_file
+    replaced = False
+
+    def replace_child_before_file_read(*args: Any, **kwargs: Any) -> _ObservationResult:
+        nonlocal replaced
+        if not replaced:
+            original_child.rename(tmp_path / "bundle" / "child-original")
+            replacement = tmp_path / "bundle" / "child"
+            replacement.mkdir()
+            (replacement / "entry.json").write_bytes(content)
+            replaced = True
+        return original_observe_file(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._observe_file",
+        replace_child_before_file_read,
+    )
+    try:
+        with pytest.raises(InventorySafetyError, match="directory identity changed"):
+            _observe_tree(
+                root=tmp_path,
+                snapshot=snapshot,
+                subject_kind="release",
+                subject_id="synthetic-release",
+                tree=tree,
+            )
     finally:
         snapshot.close()
 
@@ -643,11 +717,12 @@ def test_final_hardlink_and_special_files_are_not_read(
     elif kind == "fifo":
         os.mkfifo(artifact)
     else:
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             listener.bind(str(artifact))
         except OSError as error:
-            listener.close()
+            if listener is not None:
+                listener.close()
             if temporary_root is not None:
                 temporary_root.cleanup()
             pytest.skip(f"filesystem UNIX sockets unavailable: {error}")
@@ -845,6 +920,28 @@ def test_non_public_release_does_not_propagate_manifest_drift_to_campaign(
             )
         ],
     )
+    public_audit_report = (
+        json.dumps({"reviewed_commit": HEAD}, sort_keys=True, indent=2).encode()
+        + b"\n"
+    )
+    public_audit_campaign = CampaignEntry(
+        campaign_id="public-audit-campaign",
+        artifact_reviewed_commit=HEAD,
+        commit_verification_mode=CommitVerificationMode.INTERNAL_IF_PRESENT,
+        classification=CampaignClassification.AUDIT_ONLY_FAILURE,
+        included_in_primary_denominator=False,
+        release_id="release-current",
+        verification_profile="declared_artifact_set",
+        declaration_basis="public suite non-primary propagation regression",
+        file_artifacts=[
+            ExpectedFileArtifact(
+                role="report_json",
+                path="current/campaign-report.json",
+                byte_count=len(public_audit_report),
+                sha256=_sha256(public_audit_report),
+            )
+        ],
+    )
     request = EvidenceInventoryRequest(
         schema_version="1.0",
         inventory_id="non-public-release-binding",
@@ -861,13 +958,15 @@ def test_non_public_release_does_not_propagate_manifest_drift_to_campaign(
             )
         ],
         release_entries=[current_release, historical_release],
-        campaign_entries=[campaign],
+        campaign_entries=[campaign, public_audit_campaign],
     )
     request_path = tmp_path / "request.json"
     request_path.write_bytes(canonical_inventory_json_bytes(request))
     (tmp_path / "historical").mkdir()
     (tmp_path / "historical/release-metadata.json").write_bytes(historical_release_bytes)
     (tmp_path / "historical/campaign-report.json").write_bytes(campaign_report)
+    (tmp_path / "current").mkdir()
+    (tmp_path / "current/campaign-report.json").write_bytes(public_audit_report)
     monkeypatch.setattr(
         "agentlab.phase7_inventory._observe_execution_repository_head",
         lambda _root: HEAD,
@@ -885,8 +984,16 @@ def test_non_public_release_does_not_propagate_manifest_drift_to_campaign(
     assert historical.storage_state.value == "present"
     assert historical.commit_verification.value == "verified"
     assert historical.integrity_state.value == "verified"
+    public_audit = next(
+        entry
+        for entry in inventory.campaigns
+        if entry.campaign_id == "public-audit-campaign"
+    )
+    assert public_audit.storage_state.value == "present"
+    assert public_audit.commit_verification.value == "verified"
+    assert public_audit.integrity_state.value == "verified"
     assert not any(
-        finding.subject_id == "historical-campaign"
+        finding.subject_id in {"historical-campaign", "public-audit-campaign"}
         and finding.code is FindingCode.CROSS_ARTIFACT_MISMATCH
         for finding in inventory.findings
     )

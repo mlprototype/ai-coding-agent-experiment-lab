@@ -1060,9 +1060,15 @@ def _open_snapshot_directory(
             if cached not in snapshot.directory_fds.values():
                 os.close(cached)
             raise InventorySafetyError(f"{label} directory changed while opening")
+        identity = _identity(opened)
+        previous = snapshot.directory_identities.get(child_relative)
+        if previous is not None and previous != identity:
+            if cached not in snapshot.directory_fds.values():
+                os.close(cached)
+            raise InventorySafetyError(f"{label} directory identity changed")
         if child_relative not in snapshot.directory_fds:
             snapshot.directory_fds[child_relative] = cached
-            snapshot.directory_identities[child_relative] = _identity(opened)
+        snapshot.directory_identities[child_relative] = identity
         parent_fd = cached
         current_relative = child_relative
     return parent_fd, None
@@ -1380,48 +1386,54 @@ def _read_regular_file(
         root = _real_directory(root, "repository root")
         snapshot = _snapshot_root(root)
     parent_relative, filename = _relative_parent(relative)
+    owned_descriptors: tuple[int, ...] = ()
     try:
-        parent_fd, parent_state = _open_snapshot_directory(
+        parent_fd, parent_state, owned_descriptors = _open_snapshot_directory_ephemeral(
             snapshot,
             parent_relative,
             label,
             final_kind="parent",
         )
-        if parent_state == "missing" or parent_fd is None:
-            if track:
-                _watch_path(snapshot, relative, None)
-            return _FileRead(False, True, None, None, None, "missing")
         try:
-            before = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            if track:
-                _watch_path(snapshot, relative, None)
-            return _FileRead(False, True, None, None, None, "missing")
-        except OSError as error:
-            raise InventorySafetyError(f"could not inspect {label}") from error
-        final_identity = _identity(before)
-        if stat.S_ISLNK(before.st_mode):
-            if track:
-                _watch_path(snapshot, relative, final_identity)
-            return _FileRead(True, True, None, None, None, "symlink")
-        if stat.S_ISREG(before.st_mode) and before.st_nlink != 1:
-            if track:
-                _watch_path(snapshot, relative, final_identity)
-            return _FileRead(True, True, None, None, None, "hardlink")
-        if not stat.S_ISREG(before.st_mode):
-            if track:
-                _watch_path(snapshot, relative, final_identity)
-            return _FileRead(True, True, None, None, None, "special_file")
-        return _read_open_file(
-            snapshot,
-            parent_fd,
-            filename,
-            relative,
-            label,
-            before,
-            max_bytes=max_bytes,
-            track=track,
-        )
+            if parent_state == "missing" or parent_fd is None:
+                if track:
+                    _watch_path(snapshot, relative, None)
+                return _FileRead(False, True, None, None, None, "missing")
+            try:
+                before = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if track:
+                    _watch_path(snapshot, relative, None)
+                return _FileRead(False, True, None, None, None, "missing")
+            except OSError as error:
+                raise InventorySafetyError(f"could not inspect {label}") from error
+            final_identity = _identity(before)
+            if stat.S_ISLNK(before.st_mode):
+                if track:
+                    _watch_path(snapshot, relative, final_identity)
+                return _FileRead(True, True, None, None, None, "symlink")
+            if stat.S_ISREG(before.st_mode) and before.st_nlink != 1:
+                if track:
+                    _watch_path(snapshot, relative, final_identity)
+                return _FileRead(True, True, None, None, None, "hardlink")
+            if not stat.S_ISREG(before.st_mode):
+                if track:
+                    _watch_path(snapshot, relative, final_identity)
+                return _FileRead(True, True, None, None, None, "special_file")
+            return _read_open_file(
+                snapshot,
+                parent_fd,
+                filename,
+                relative,
+                label,
+                before,
+                max_bytes=max_bytes,
+                track=track,
+            )
+        finally:
+            for owned_descriptor in reversed(owned_descriptors):
+                with suppress(OSError):
+                    os.close(owned_descriptor)
     finally:
         if owned_snapshot:
             snapshot.close()
@@ -3050,6 +3062,7 @@ def _build_inventory(
                 campaign.campaign_id
                 for campaign in request.campaign_entries
                 if campaign.release_id == release_entry.release_id
+                and campaign.classification is CampaignClassification.PRIMARY_EVALUATION
             )
         observed_commits = frozenset(
             (*release_commits_by_id[release_entry.release_id], *suite_commits)
