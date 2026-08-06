@@ -227,6 +227,13 @@ def _sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _execution_head_attestation_sha256(observed_head: str) -> str:
+    """Bind an execution HEAD without disclosing it in the Inventory payload."""
+    if not re.fullmatch(COMMIT_PATTERN, observed_head):
+        raise InventoryContractError("observed execution repository HEAD is invalid")
+    return _sha256(b"agentlab.phase7.execution-head.v1\0" + observed_head.encode("ascii"))
+
+
 def _canonical_timestamp(value: datetime) -> str:
     if value.tzinfo is None or value.utcoffset() != timedelta(0):
         raise ValueError("timestamp must be timezone-aware UTC")
@@ -350,6 +357,11 @@ class ReleaseEntry(ContractModel):
 
     @model_validator(mode="after")
     def release_roles_are_closed(self) -> ReleaseEntry:
+        if any(
+            not re.fullmatch(COMMIT_PATTERN, commit)
+            for commit in self.artifact_reviewed_commits
+        ):
+            raise ValueError("artifact_reviewed_commits must contain canonical commit IDs")
         if self.artifact_reviewed_commits != sorted(set(self.artifact_reviewed_commits)):
             raise ValueError("artifact_reviewed_commits must be sorted and unique")
         if (
@@ -834,6 +846,8 @@ class InventoryReleaseEntry(ContractModel):
     @field_validator("artifact_reviewed_commits")
     @classmethod
     def reviewed_commits_are_sorted(cls, values: list[str]) -> list[str]:
+        if any(not re.fullmatch(COMMIT_PATTERN, commit) for commit in values):
+            raise ValueError("artifact_reviewed_commits must contain canonical commit IDs")
         if values != sorted(set(values)):
             raise ValueError("artifact_reviewed_commits must be sorted and unique")
         return values
@@ -931,6 +945,7 @@ class EvidenceInventory(ContractModel):
     authoritative: Literal[False]
     scope: Literal[InventoryScope.PHASE6]
     request_sha256: StrictStr = Field(pattern=SHA256_PATTERN)
+    execution_head_attestation_sha256: StrictStr = Field(pattern=SHA256_PATTERN)
     source_of_truth_references: list[AuthorityReference]
     releases: list[InventoryReleaseEntry]
     campaigns: list[InventoryCampaignEntry]
@@ -1534,6 +1549,10 @@ def verify_evidence_inventory_publication_bytes(
         != request.expected_execution_repository_head
         or metadata.renderer_version != RENDERER_VERSION
         or metadata.tool_version != TOOL_VERSION
+        or inventory.execution_head_attestation_sha256
+        != _execution_head_attestation_sha256(
+            metadata.observed_execution_repository_head
+        )
     ):
         raise InventoryContractError("publication metadata does not bind to the supplied Request")
     if render_inventory_markdown(inventory) != markdown_bytes:
@@ -2651,7 +2670,7 @@ def _provider_counts(
     request: EvidenceInventoryRequest,
     campaign_outputs: Sequence[InventoryCampaignEntry],
     subject_contents: Mapping[tuple[str, str], Mapping[str, bytes]],
-) -> tuple[list[InventoryCampaignEntry], int, int, int]:
+) -> tuple[list[InventoryCampaignEntry], list[InventoryFinding], int, int, int]:
     """Account provider calls from each declared Campaign exactly once.
 
     Only the canonical Campaign finished event is an accounting source.
@@ -2665,6 +2684,7 @@ def _provider_counts(
     observed = 0
     unknown_runs = 0
     campaigns_without_total = 0
+    provider_findings: list[InventoryFinding] = []
     outputs_by_id = {item.campaign_id: item for item in campaign_outputs}
     updated_outputs: list[InventoryCampaignEntry] = []
     for campaign_entry in request.campaign_entries:
@@ -2732,14 +2752,27 @@ def _provider_counts(
         ):
             campaigns_without_total += 1
             assert output is not None
-            updated_outputs.append(
-                output.model_copy(
-                    update={
-                        "provider_total_status": ProviderTotalStatus.UNAVAILABLE,
-                        "provider_call_count_observed": None,
-                        "provider_call_count_unknown_runs": None,
-                    }
+            updates: dict[str, object] = {
+                "provider_total_status": ProviderTotalStatus.UNAVAILABLE,
+                "provider_call_count_observed": None,
+                "provider_call_count_unknown_runs": None,
+            }
+            if not validation.is_valid:
+                # A Campaign accounting source which cannot satisfy its strict
+                # contract invalidates the subject itself.  This must happen
+                # before subject digests and retention are derived.
+                updates["integrity_state"] = IntegrityState.DRIFTED
+                provider_findings.append(
+                    _finding(
+                        FindingCode.CANONICAL_LOAD_FAILED,
+                        subject_kind="campaign",
+                        subject_id=campaign_entry.campaign_id,
+                        path=campaign_artifact.path,
+                        role=CampaignArtifactRole.CAMPAIGN.value,
+                    )
                 )
+            updated_outputs.append(
+                output.model_copy(update=updates)
             )
             continue
         observed += validation.provider_call_count
@@ -2759,7 +2792,13 @@ def _provider_counts(
                 }
             )
         )
-    return updated_outputs, observed, unknown_runs, campaigns_without_total
+    return (
+        updated_outputs,
+        provider_findings,
+        observed,
+        unknown_runs,
+        campaigns_without_total,
+    )
 
 
 def _receipt_result(
@@ -3434,47 +3473,6 @@ def _build_inventory(
             update={"integrity_state": integrity}
         )
 
-    entry_states = {
-        ("release", item.release_id): (item.storage_state, item.integrity_state)
-        for item in release_outputs
-    }
-    entry_states.update(
-        {
-            ("campaign", item.campaign_id): (item.storage_state, item.integrity_state)
-            for item in campaign_outputs
-        }
-    )
-
-    subject_digests: dict[tuple[str, str], str] = {}
-    for release_entry in request.release_entries:
-        subject_key = ("release", release_entry.release_id)
-        if entry_states[subject_key][1] is IntegrityState.VERIFIED:
-            digest = compute_subject_digest(
-                subject_kind="release",
-                subject_id=release_entry.release_id,
-                experiment_id=None,
-                reviewed_commits=release_entry.artifact_reviewed_commits,
-                file_artifacts=release_entry.file_artifacts,
-                trees=release_entry.trees,
-                observations=subject_observations[subject_key],
-            )
-            if digest is not None:
-                subject_digests[subject_key] = digest
-    for campaign_entry in request.campaign_entries:
-        subject_key = ("campaign", campaign_entry.campaign_id)
-        if entry_states[subject_key][1] is IntegrityState.VERIFIED:
-            digest = compute_subject_digest(
-                subject_kind="campaign",
-                subject_id=campaign_entry.campaign_id,
-                experiment_id=campaign_entry.experiment_id,
-                reviewed_commits=[campaign_entry.artifact_reviewed_commit],
-                file_artifacts=campaign_entry.file_artifacts,
-                trees=campaign_entry.trees,
-                observations=subject_observations[subject_key],
-            )
-            if digest is not None:
-                subject_digests[subject_key] = digest
-
     primary = [
         item
         for item in request.campaign_entries
@@ -3629,13 +3627,61 @@ def _build_inventory(
             campaign_outputs[index] = campaign_output.model_copy(
                 update={"integrity_state": integrity}
             )
-            subject_digests.pop(("campaign", campaign_output.campaign_id), None)
+    (
+        campaign_outputs,
+        provider_findings,
+        observed_calls,
+        unknown_runs,
+        campaigns_without_total,
+    ) = _provider_counts(
+        request=request,
+        campaign_outputs=campaign_outputs,
+        subject_contents=subject_contents,
+    )
+    findings.extend(provider_findings)
+
+    # Provider strict-load failures are folded before either subject digests or
+    # retention.  Receipt binding must never use a digest for an invalid
+    # Campaign, and local-only retention must reflect that invalidity.
+    entry_states = {
+        ("release", item.release_id): (item.storage_state, item.integrity_state)
+        for item in release_outputs
+    }
     entry_states.update(
         {
             ("campaign", item.campaign_id): (item.storage_state, item.integrity_state)
             for item in campaign_outputs
         }
     )
+    subject_digests: dict[tuple[str, str], str] = {}
+    for release_entry in request.release_entries:
+        subject_key = ("release", release_entry.release_id)
+        if entry_states[subject_key][1] is IntegrityState.VERIFIED:
+            digest = compute_subject_digest(
+                subject_kind="release",
+                subject_id=release_entry.release_id,
+                experiment_id=None,
+                reviewed_commits=release_entry.artifact_reviewed_commits,
+                file_artifacts=release_entry.file_artifacts,
+                trees=release_entry.trees,
+                observations=subject_observations[subject_key],
+            )
+            if digest is not None:
+                subject_digests[subject_key] = digest
+    for campaign_entry in request.campaign_entries:
+        subject_key = ("campaign", campaign_entry.campaign_id)
+        if entry_states[subject_key][1] is IntegrityState.VERIFIED:
+            digest = compute_subject_digest(
+                subject_kind="campaign",
+                subject_id=campaign_entry.campaign_id,
+                experiment_id=campaign_entry.experiment_id,
+                reviewed_commits=[campaign_entry.artifact_reviewed_commit],
+                file_artifacts=campaign_entry.file_artifacts,
+                trees=campaign_entry.trees,
+                observations=subject_observations[subject_key],
+            )
+            if digest is not None:
+                subject_digests[subject_key] = digest
     if request.expected_execution_repository_head is not None and (
         request.expected_execution_repository_head != observed_head
     ):
@@ -3713,11 +3759,6 @@ def _build_inventory(
             retention_outputs.append(result)
             findings.extend(receipt_findings)
 
-    campaign_outputs, observed_calls, unknown_runs, campaigns_without_total = _provider_counts(
-        request=request,
-        campaign_outputs=campaign_outputs,
-        subject_contents=subject_contents,
-    )
     classification_counts: dict[str, int] = {}
     for release_entry in request.release_entries:
         classification = release_entry.classification.value
@@ -3763,6 +3804,7 @@ def _build_inventory(
         authoritative=False,
         scope=InventoryScope.PHASE6,
         request_sha256=request_sha256,
+        execution_head_attestation_sha256=_execution_head_attestation_sha256(observed_head),
         source_of_truth_references=request.source_of_truth_references,
         releases=sorted(release_outputs, key=lambda item: item.release_id),
         campaigns=sorted(campaign_outputs, key=lambda item: item.campaign_id),
@@ -3801,6 +3843,8 @@ def render_inventory_markdown(inventory: EvidenceInventory) -> bytes:
         f"- schema_version: '{inventory.schema_version}'",
         f"- inventory_id: '{inventory.inventory_id}'",
         f"- request_correlation_id: '{inventory.request_correlation_id}'",
+        "- execution_head_attestation_sha256: "
+        f"'{inventory.execution_head_attestation_sha256}'",
         "- authoritative: false",
         f"- scope: '{inventory.scope.value}'",
         f"- verification_status: '{inventory.verification_status.value}'",
@@ -4353,7 +4397,11 @@ def _rollback_owned_request_publication(
     if request_parent_fd is not None and request_identity is not None:
         try:
             current = os.stat("request.json", dir_fd=request_parent_fd, follow_symlinks=False)
-            if _identity(current) != request_identity or not stat.S_ISREG(current.st_mode):
+            if (
+                not _same_object_identity(current, request_identity)
+                or not stat.S_ISREG(current.st_mode)
+                or current.st_nlink != 1
+            ):
                 raise InventoryPublicationError("owned Request rollback refused a changed file")
             os.unlink("request.json", dir_fd=request_parent_fd)
             os.fsync(request_parent_fd)
@@ -4504,15 +4552,24 @@ def publish_inventory_request_bytes(
             dir_fd=leaf_fd,
         )
         try:
+            # Ownership begins at O_EXCL open, rather than only after a
+            # successful write.  This permits a safe rollback if write,
+            # fsync, or descriptor reload fails midway through publication.
+            request_identity = _identity(os.fstat(descriptor))
             view = memoryview(request_bytes)
             while view:
                 written = os.write(descriptor, view)
+                if written <= 0:
+                    raise InventoryPublicationError("published Request write made no progress")
                 view = view[written:]
             os.fsync(descriptor)
             written_stat = os.fstat(descriptor)
-            if not stat.S_ISREG(written_stat.st_mode) or written_stat.st_nlink != 1:
+            if (
+                not _same_object_identity(written_stat, request_identity)
+                or not stat.S_ISREG(written_stat.st_mode)
+                or written_stat.st_nlink != 1
+            ):
                 raise InventoryPublicationError("published Request file is unsafe")
-            request_identity = _identity(written_stat)
         finally:
             os.close(descriptor)
         reread = _read_regular_file(
@@ -4529,6 +4586,19 @@ def publish_inventory_request_bytes(
             or not hmac.compare_digest(reread.sha256, actual_sha256)
         ):
             raise InventoryPublicationError("published Request did not survive descriptor reload")
+        assert request_identity is not None
+        try:
+            reread_stat = os.stat("request.json", dir_fd=leaf_fd, follow_symlinks=False)
+        except OSError as error:
+            raise InventoryPublicationError(
+                "published Request identity could not be rechecked"
+            ) from error
+        if (
+            not _same_object_identity(reread_stat, request_identity)
+            or not stat.S_ISREG(reread_stat.st_mode)
+            or reread_stat.st_nlink != 1
+        ):
+            raise InventoryPublicationError("published Request changed before reload completed")
         _require_directory_entries_stable(directory_entries)
         _require_publisher_root_stable(snapshot)
         os.fsync(leaf_fd)

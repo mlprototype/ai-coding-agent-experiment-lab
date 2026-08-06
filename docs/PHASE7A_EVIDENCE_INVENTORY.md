@@ -6,7 +6,7 @@ Phase 7AのEvidence Inventoryは、Phase 6の既存Artifactと人間がレビュ
 
 ## Fixed boundaries
 
-- Phase 6 Artifactのrole-aware `artifact_reviewed_commits`集合（Campaignは単一のtyped `artifact_reviewed_commit`）と、実行時に指定repositoryで観測した`observed_execution_repository_head`は別の証拠である。後者はcheckout HEADだけを示し、agentlab binary／Python moduleのprovenanceは示さない。
+- Phase 6 Artifactのrole-aware `artifact_reviewed_commits`集合（Campaignは単一のtyped `artifact_reviewed_commit`）と、実行時に指定repositoryで観測した`observed_execution_repository_head`は別の証拠である。後者はcheckout HEADだけを示し、agentlab binary／Python moduleのprovenanceは示さない。raw HEADはmetadataだけに保存し、InventoryとMarkdownはdomain-separated `execution_head_attestation_sha256`でmetadataの値を束縛する。
 - `ExpectedFileArtifact`はsingle-link regular file専用、`ExpectedTree`はdirectoryと完全列挙した許可file集合専用であり、`bundle_root`は後者だけに属する。
 - `ExpectedTree.file_artifacts`は全件をrequiredとして列挙し、expected file countとtree digestの一致を必須にする。tree内のoptional fileでdigest検証を省略しない。
 - `request_correlation_id`は同じRequestを相関させるIDであり、publication内容のIDではない。内容の識別にはmetadata内のInventory／Markdown SHA-256を使う。
@@ -33,7 +33,7 @@ Phase 7A maintainerがschemaと安全境界を保守し、Phase 6 ownerが既存
 
 Slice 7A-4R2は、実Artifact Requestを作成又は実行する前のcontract remediationである。Schema `1.0`はまだ公開Inventoryを持たないため、今回の修正はSchema `1.1`へのversion bumpではなく、未公開`1.0`のfail-closedな事前公開修正として扱う。旧field shapeの互換loaderは提供しない。
 
-- Releaseは単一の`artifact_reviewed_commit`ではなく、昇順・重複なしの`artifact_reviewed_commits`でcommit集合を宣言する。`internal_required`では空集合を拒否し、観測集合とのexact matchだけをverifiedとする。
+- Releaseは単一の`artifact_reviewed_commit`ではなく、40又は64桁lowercase hexで昇順・重複なしの`artifact_reviewed_commits`でcommit集合を宣言する。`internal_required`では空集合を拒否し、観測集合とのexact matchだけをverifiedとする。
 - 観測commitはgeneric JSON／JSONL／YAMLのkey探索から取得しない。validated Public Suite snapshotではPrimaryのtyped Spec 2.1／Plan 1.2（Fixture Acceptance bindingを含む）共有commitだけ、Historicalでは`HistoricalVerificationRecord.source_reviewed_commit`だけを採用する。bundle run、report、Markdown、mirror、未知role、`verification_agentlab_commit`はcommit Authorityではない。
 - Campaignの`campaign_id`はtracked Authority上のCampaign ID、`experiment_id`はstrict-loadしたCampaign started eventのExperiment IDである。primary／historical profileは両方を必須とし、denominator、subject digest、Inventory、Markdownで別fieldとして保持する。run ID単独のRequest全体unique制約は置かない。
 - Manifest referenceは`dirname(suite_manifest.path)`、rendered bundle memberは`bundle_root.root_path`を基準にcanonical repository-relative exact pathへ解決する。suffix検索は行わない。
@@ -51,9 +51,9 @@ payloadは鍵順canonical JSONの`artifact_reviewed_commits`（昇順unique stri
 
 ### Publication verification and Request preparation
 
-`verify_evidence_inventory_publication_bytes(request_bytes, inventory_bytes, markdown_bytes, metadata_bytes)`は、exit `0`だけでなくfindingを含むexit `2` publicationもstrict/canonical reloadするpublic byte facadeである。Request SHA、correlation ID、inventory ID／scope／Authority references、metadata hash、expected HEAD、renderer/tool version、Markdown re-renderを照合する。
+`verify_evidence_inventory_publication_bytes(request_bytes, inventory_bytes, markdown_bytes, metadata_bytes)`は、exit `0`だけでなくfindingを含むexit `2` publicationもstrict/canonical reloadするpublic byte facadeである。Request SHA、correlation ID、inventory ID／scope／Authority references、metadata hash、expected HEAD、metadataのobserved HEADから再導出するexecution-head attestation、renderer/tool version、Markdown re-renderを照合する。
 
-`publish-phase6-evidence-inventory-request`は実行commandではなく、stdinのcanonical Request bytesを固定root `.artifacts/phase7/evidence-inventory/<inventory_id>/request.json`へprepareするcreate-only commandである。human-approved `--expected-request-sha256`をconstant-time比較し、SHA mismatch・empty・noncanonical inputではfilesystemを一切変更しない。`.artifacts`は既存real directory必須、`phase7`と`evidence-inventory`はstable real directoryなら再利用、なければcomponentごとに安全作成する。inventory leafと`request.json`は再利用しない。leaf作成後の失敗では、このprocessが作成しidentityが一致するempty leaf／intermediateだけをrollbackし、変更・非empty・identity不一致なら保持して失敗とする。
+`publish-phase6-evidence-inventory-request`は実行commandではなく、stdinのcanonical Request bytesを固定root `.artifacts/phase7/evidence-inventory/<inventory_id>/request.json`へprepareするcreate-only commandである。human-approved `--expected-request-sha256`をconstant-time比較し、SHA mismatch・empty・noncanonical inputではfilesystemを一切変更しない。`.artifacts`は既存real directory必須、`phase7`と`evidence-inventory`はstable real directoryなら再利用、なければcomponentごとに安全作成する。inventory leafと`request.json`は再利用しない。`request.json`は`O_EXCL` open直後のsingle-link regular-file identityを所有証跡として保存し、write／fsync／descriptor reloadの後も同一objectを確認する。leaf作成後の失敗では、このprocessが作成しidentityが一致するempty leaf／intermediateだけをrollbackし、変更・非empty・identity不一致なら保持して失敗とする。
 
 `verify_declared_inventory_inputs()`とpublication本体は同じdescriptor-backed snapshot verifierを共有する。このcallはRequestのexpected bytes／hash／treeとそのcall内のsnapshot安定性を検証するだけで、別call間のinode不変を主張しない。
 

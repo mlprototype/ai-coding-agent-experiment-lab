@@ -17,6 +17,7 @@ from agentlab.phase7_inventory import (
     CampaignClassification,
     CampaignEntry,
     CommitVerificationMode,
+    EvidenceInventoryMetadata,
     EvidenceInventoryRequest,
     ExpectedFileArtifact,
     ExpectedTree,
@@ -24,6 +25,7 @@ from agentlab.phase7_inventory import (
     FindingCode,
     InventoryContractError,
     InventoryPublicationError,
+    InventoryReleaseEntry,
     InventorySafetyError,
     InventoryScope,
     ProviderTotalStatus,
@@ -872,6 +874,85 @@ def test_invalid_campaign_remains_visible_as_without_total(
     assert inventory.summary.provider_call_count_observed == 0
     assert inventory.summary.provider_call_count_unknown_runs == 0
     assert inventory.summary.campaigns_without_total == 1
+
+
+def test_provider_strict_load_failure_drifts_campaign_before_retention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign_bytes = b"provider-source\n"
+    request_path = _request(
+        tmp_path,
+        artifact_path="unused-report.json",
+        artifact_bytes=b'{}\n',
+    )
+    campaign = CampaignEntry(
+        campaign_id="strict-provider-campaign",
+        artifact_reviewed_commit=HEAD,
+        commit_verification_mode=CommitVerificationMode.DECLARATION_BASIS_ONLY,
+        classification=CampaignClassification.AUDIT_ONLY_FAILURE,
+        included_in_primary_denominator=False,
+        verification_profile="declared_artifact_set",
+        declaration_basis="provider strict-load ordering regression",
+        file_artifacts=[
+            ExpectedFileArtifact(
+                role="campaign",
+                path="campaign.jsonl",
+                byte_count=len(campaign_bytes),
+                sha256=_sha256(campaign_bytes),
+            )
+        ],
+    )
+    request = load_inventory_request_bytes(request_path.read_bytes()).model_copy(
+        update={
+            "campaign_entries": [campaign],
+            "retention_expectations": [
+                RetentionExpectation(
+                    subject_kind="campaign",
+                    subject_id=campaign.campaign_id,
+                    expected_retention_state=RetentionState.LOCAL_ONLY,
+                    declaration_basis="provider strict-load retention regression",
+                )
+            ],
+        }
+    )
+    request_path.write_bytes(canonical_inventory_json_bytes(request))
+    (tmp_path / "campaign.jsonl").write_bytes(campaign_bytes)
+    from agentlab.phase6 import Phase6CampaignByteValidation
+
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._known_contract_is_valid", lambda _role, _content: True
+    )
+    monkeypatch.setattr(
+        "agentlab.phase6.load_phase6_campaign_from_bytes",
+        lambda _content: Phase6CampaignByteValidation(
+            is_valid=False,
+            provider_call_count=None,
+            provider_call_count_unknown_runs=None,
+            total_status="unknown",
+            error_detail="synthetic strict-load failure",
+        ),
+    )
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._observe_execution_repository_head", lambda _root: HEAD
+    )
+
+    inventory = verify_inventory_request(
+        request_path=request_path,
+        repository_root=tmp_path,
+        confirm_local_execution=True,
+    )
+
+    assert inventory.campaigns[0].integrity_state.value == "drifted"
+    assert inventory.campaigns[0].provider_total_status is ProviderTotalStatus.UNAVAILABLE
+    assert inventory.summary.campaigns_without_total == 1
+    assert inventory.retention[0].retention_state is RetentionState.UNKNOWN
+    assert any(
+        finding.code is FindingCode.CANONICAL_LOAD_FAILED
+        and finding.subject_kind == "campaign"
+        and finding.subject_id == campaign.campaign_id
+        for finding in inventory.findings
+    )
 
 
 def test_non_public_release_does_not_propagate_manifest_drift_to_campaign(
@@ -1726,6 +1807,72 @@ def test_publication_verifier_binds_request_and_failed_inventory(
     assert verified.inventory.verification_status.value == "failed"
 
 
+def test_publication_verifier_binds_execution_head_attestation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_path = _request(tmp_path, artifact_path="artifact.json", artifact_bytes=b"{}\n")
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._observe_execution_repository_head", lambda _root: HEAD
+    )
+    publication = create_inventory_publication(
+        request_path=request_path,
+        repository_root=tmp_path,
+        output_path=tmp_path / "inventory.json",
+        markdown_path=tmp_path / "inventory.md",
+        metadata_path=tmp_path / "inventory.metadata.json",
+        confirm_local_execution=True,
+    )
+    metadata = EvidenceInventoryMetadata.model_validate(json.loads(publication.metadata_bytes))
+    modified_metadata = metadata.model_copy(
+        update={"observed_execution_repository_head": OTHER_HEAD}
+    )
+
+    with pytest.raises(InventoryContractError, match="metadata"):
+        verify_evidence_inventory_publication_bytes(
+            request_path.read_bytes(),
+            publication.inventory_bytes,
+            publication.markdown_bytes,
+            canonical_inventory_json_bytes(modified_metadata),
+        )
+
+
+@pytest.mark.parametrize("invalid_commit", ["not-a-commit", "A" * 40, "a" * 39])
+def test_release_reviewed_commit_members_must_be_canonical(
+    invalid_commit: str,
+) -> None:
+    release_kwargs = {
+        "release_id": "release-invalid-commit",
+        "artifact_reviewed_commits": [invalid_commit],
+        "commit_verification_mode": CommitVerificationMode.INTERNAL_REQUIRED,
+        "classification": ReleaseClassification.HISTORICAL,
+        "verification_profile": "declared_artifact_set",
+        "declaration_basis": "commit pattern regression",
+        "file_artifacts": [
+            ExpectedFileArtifact(
+                role="release_metadata",
+                path="metadata.json",
+                byte_count=1,
+                sha256=_sha256(b"x"),
+            )
+        ],
+    }
+    with pytest.raises(ValueError, match="canonical commit IDs"):
+        ReleaseEntry(**release_kwargs)
+    with pytest.raises(ValueError, match="canonical commit IDs"):
+        InventoryReleaseEntry(
+            release_id="release-invalid-commit",
+            artifact_reviewed_commits=[invalid_commit],
+            commit_verification_mode=CommitVerificationMode.INTERNAL_REQUIRED,
+            commit_verification="verified",
+            classification=ReleaseClassification.HISTORICAL,
+            verification_profile="declared_artifact_set",
+            storage_state="present",
+            integrity_state="verified",
+            artifact_observations=[],
+        )
+
+
 def test_request_publisher_sha_mismatch_has_zero_mutation(tmp_path: Path) -> None:
     request_path = _request(tmp_path, artifact_path="artifact.json", artifact_bytes=b"{}\n")
     (tmp_path / ".artifacts").mkdir()
@@ -1739,6 +1886,172 @@ def test_request_publisher_sha_mismatch_has_zero_mutation(tmp_path: Path) -> Non
         )
 
     assert list((tmp_path / ".artifacts").iterdir()) == []
+
+
+def test_request_publisher_write_failure_rolls_back_owned_file_and_leaf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_path = _request(tmp_path, artifact_path="artifact.json", artifact_bytes=b"{}\n")
+    request_bytes = request_path.read_bytes()
+    (tmp_path / ".artifacts").mkdir()
+
+    def fail_write(_descriptor: int, _content: object) -> int:
+        raise OSError("synthetic write failure")
+
+    monkeypatch.setattr("agentlab.phase7_inventory.os.write", fail_write)
+    with pytest.raises(InventoryPublicationError, match="failed safely"):
+        publish_inventory_request_bytes(
+            request_bytes,
+            tmp_path,
+            expected_request_sha256=_sha256(request_bytes),
+            confirm_local_write=True,
+        )
+
+    assert list((tmp_path / ".artifacts").iterdir()) == []
+
+
+def test_request_publisher_reload_failure_rolls_back_owned_file_and_leaf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_path = _request(tmp_path, artifact_path="artifact.json", artifact_bytes=b"{}\n")
+    request_bytes = request_path.read_bytes()
+    (tmp_path / ".artifacts").mkdir()
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._read_regular_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            InventoryPublicationError("synthetic descriptor reload failure")
+        ),
+    )
+
+    with pytest.raises(InventoryPublicationError, match="synthetic descriptor reload failure"):
+        publish_inventory_request_bytes(
+            request_bytes,
+            tmp_path,
+            expected_request_sha256=_sha256(request_bytes),
+            confirm_local_write=True,
+        )
+
+    assert list((tmp_path / ".artifacts").iterdir()) == []
+
+
+def test_request_publisher_preserves_leaf_when_request_identity_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_path = _request(tmp_path, artifact_path="artifact.json", artifact_bytes=b"{}\n")
+    request_bytes = request_path.read_bytes()
+    (tmp_path / ".artifacts").mkdir()
+    from agentlab import phase7_inventory
+
+    original_read = phase7_inventory._read_regular_file
+
+    def replace_after_read(*args: object, **kwargs: object) -> object:
+        result = original_read(*args, **kwargs)
+        leaf = (
+            tmp_path
+            / ".artifacts"
+            / "phase7"
+            / "evidence-inventory"
+            / "synthetic-inventory"
+        )
+        replacement = leaf / "replacement.json"
+        replacement.write_bytes(request_bytes)
+        os.replace(replacement, leaf / "request.json")
+        return result
+
+    monkeypatch.setattr(phase7_inventory, "_read_regular_file", replace_after_read)
+    with pytest.raises(InventoryPublicationError, match="rollback could not be verified"):
+        publish_inventory_request_bytes(
+            request_bytes,
+            tmp_path,
+            expected_request_sha256=_sha256(request_bytes),
+            confirm_local_write=True,
+        )
+
+    assert (
+        tmp_path
+        / ".artifacts"
+        / "phase7"
+        / "evidence-inventory"
+        / "synthetic-inventory"
+        / "request.json"
+    ).exists()
+
+
+def test_request_publisher_preserves_nonempty_leaf_on_rollback_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_path = _request(tmp_path, artifact_path="artifact.json", artifact_bytes=b"{}\n")
+    request_bytes = request_path.read_bytes()
+    (tmp_path / ".artifacts").mkdir()
+
+    def add_unowned_file_then_fail(_descriptor: int, _content: object) -> int:
+        leaf = (
+            tmp_path
+            / ".artifacts"
+            / "phase7"
+            / "evidence-inventory"
+            / "synthetic-inventory"
+        )
+        (leaf / "unowned.txt").write_bytes(b"do not remove\n")
+        raise OSError("synthetic write failure")
+
+    monkeypatch.setattr("agentlab.phase7_inventory.os.write", add_unowned_file_then_fail)
+    with pytest.raises(InventoryPublicationError, match="rollback could not be verified"):
+        publish_inventory_request_bytes(
+            request_bytes,
+            tmp_path,
+            expected_request_sha256=_sha256(request_bytes),
+            confirm_local_write=True,
+        )
+
+    leaf = (
+        tmp_path
+        / ".artifacts"
+        / "phase7"
+        / "evidence-inventory"
+        / "synthetic-inventory"
+    )
+    assert (leaf / "unowned.txt").read_bytes() == b"do not remove\n"
+    assert not (leaf / "request.json").exists()
+
+
+def test_request_publisher_reports_rollback_failure_without_deleting_leaf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_path = _request(tmp_path, artifact_path="artifact.json", artifact_bytes=b"{}\n")
+    request_bytes = request_path.read_bytes()
+    (tmp_path / ".artifacts").mkdir()
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory.os.write",
+        lambda _descriptor, _content: (_ for _ in ()).throw(OSError("synthetic write failure")),
+    )
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._rollback_owned_request_publication",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            InventoryPublicationError("synthetic rollback failure")
+        ),
+    )
+
+    with pytest.raises(InventoryPublicationError, match="rollback could not be verified"):
+        publish_inventory_request_bytes(
+            request_bytes,
+            tmp_path,
+            expected_request_sha256=_sha256(request_bytes),
+            confirm_local_write=True,
+        )
+
+    assert (
+        tmp_path
+        / ".artifacts"
+        / "phase7"
+        / "evidence-inventory"
+        / "synthetic-inventory"
+    ).exists()
 
 
 def test_request_publisher_is_create_only_and_declared_verifier_is_byte_based(

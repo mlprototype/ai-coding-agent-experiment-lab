@@ -217,7 +217,7 @@ Verifierはnetwork接続や外部保存先のliveness確認をしない。すべ
 
 ### 4.5 出力契約
 
-`EvidenceInventory 1.0`は`schema_version`、`inventory_id`、`request_correlation_id`、`authoritative: false`、`scope: phase6`、`request_sha256`、`source_of_truth_references`、Releaseの`artifact_reviewed_commits`、CampaignのAuthority `campaign_id`／Artifact `experiment_id`／typed `artifact_reviewed_commit`、`releases`、`campaigns`、`findings`、`summary`、`verification_status`を持つ。Phase 7 execution repository HEADはcanonical Inventoryへ混入させない。
+`EvidenceInventory 1.0`は`schema_version`、`inventory_id`、`request_correlation_id`、`authoritative: false`、`scope: phase6`、`request_sha256`、`execution_head_attestation_sha256`、`source_of_truth_references`、Releaseの`artifact_reviewed_commits`、CampaignのAuthority `campaign_id`／Artifact `experiment_id`／typed `artifact_reviewed_commit`、`releases`、`campaigns`、`findings`、`summary`、`verification_status`を持つ。Phase 7 execution repositoryのraw HEADはcanonical Inventoryへ混入させず、attestationは`"agentlab.phase7.execution-head.v1\\0" || observed_head ASCII`のSHA-256である。
 
 `request_correlation_id`は`inventory_id`とRequest SHA-256から決定的に導出し、Inventory JSON、Markdown、metadataの3ファイルへ同じ値を保存する。これはRequest相関用であり、出力内容固有の識別子ではない。同一内容の照合にはmetadata内のInventory SHA-256とMarkdown SHA-256を使う。
 
