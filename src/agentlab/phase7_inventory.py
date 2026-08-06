@@ -1184,23 +1184,28 @@ def _watch_snapshot_entry(
 ) -> None:
     """Remember a present or absent non-file entry for final revalidation."""
     parent_relative, filename = _relative_parent(relative)
-    parent_fd, parent_state = _open_snapshot_directory(
+    parent_fd, parent_state, owned_descriptors = _open_snapshot_directory_ephemeral(
         snapshot,
         parent_relative,
         f"{label} parent",
         final_kind="parent",
     )
-    if parent_state == "missing" or parent_fd is None:
-        _watch_path(snapshot, relative, None)
-        return
     try:
-        metadata = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        _watch_path(snapshot, relative, None)
-    except OSError as error:
-        raise InventorySafetyError(f"could not inspect {label}") from error
-    else:
-        _watch_path(snapshot, relative, _identity(metadata))
+        if parent_state == "missing" or parent_fd is None:
+            _watch_path(snapshot, relative, None)
+            return
+        try:
+            metadata = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            _watch_path(snapshot, relative, None)
+        except OSError as error:
+            raise InventorySafetyError(f"could not inspect {label}") from error
+        else:
+            _watch_path(snapshot, relative, _identity(metadata))
+    finally:
+        for owned_descriptor in reversed(owned_descriptors):
+            with suppress(OSError):
+                os.close(owned_descriptor)
 
 
 def _read_open_file(

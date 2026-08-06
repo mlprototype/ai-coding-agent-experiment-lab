@@ -568,6 +568,38 @@ def test_tree_scan_does_not_cache_child_directory_fds(tmp_path: Path) -> None:
         snapshot.close()
 
 
+def test_missing_tree_directories_do_not_cache_present_parent_fds(
+    tmp_path: Path,
+) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    parents = [f"parent_{index}" for index in range(10)]
+    missing = [f"{parent}/allowed" for parent in parents]
+    for parent in parents:
+        (bundle / parent).mkdir()
+    tree = ExpectedTree(
+        role="bundle_root",
+        root_path="bundle",
+        allowed_directories=sorted([*parents, *missing]),
+        file_artifacts=[],
+        expected_file_count=0,
+        tree_sha256=compute_tree_sha256({}, parents),
+    )
+    snapshot = _snapshot_root(tmp_path)
+    try:
+        observed = _observe_tree(
+            root=tmp_path,
+            snapshot=snapshot,
+            subject_kind="release",
+            subject_id="synthetic-release",
+            tree=tree,
+        )
+        assert observed.observation.integrity_state.value == "not_verifiable"
+        assert len(snapshot.directory_fds) == 2
+    finally:
+        snapshot.close()
+
+
 def test_tree_child_replacement_before_file_observation_is_rejected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
