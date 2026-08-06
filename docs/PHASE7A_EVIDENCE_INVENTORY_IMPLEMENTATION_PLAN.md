@@ -195,7 +195,7 @@ Verifierはnetwork接続や外部保存先のliveness確認をしない。すべ
 - `generated_at`、host固有absolute path、環境変数、Prompt、raw Provider outputは含めない。
 - release、campaign、findingはRequest順ではなく固定sort keyとidentityで決定的にsortする。
 - findingはsubject kind、subject ID、artifact role／path、固定code、safe detailを持つ。raw Artifact本文は保存しない。
-- `summary`はclassification別件数、primary denominator、state別件数、Provider call accountingのobserved／unknownを持つ。Usage又はコストを推定しない。
+- `summary`はclassification別件数、`primary_campaign_count`、state別件数、Provider call accountingの`provider_call_count_observed`、`provider_call_count_unknown_runs`、`campaigns_without_total`を持つ。Usage又はコストを推定しない。canonical Campaign totalを確定できないentryは`campaigns_without_total`へ残し、observed値から暗黙に除外したまま消去しない。
 
 sidecarの`EvidenceInventoryMetadata 1.0`だけが`generated_at`を持つ。ほかに`request_correlation_id`、request SHA-256、Inventory SHA-256、Markdown SHA-256、`expected_execution_repository_head`（指定時）、`observed_execution_repository_head`、renderer version、tool versionを持たせる。`observed_execution_repository_head`は指定repository rootのcheckout HEADだけを表し、binary provenanceではない。sidecarもcanonical JSONにし、Inventory本体のbytesを変えない。
 
@@ -209,7 +209,7 @@ sidecarの`EvidenceInventoryMetadata 1.0`だけが`generated_at`を持つ。ほ�
 4. file／directoryの読取race、directory identity変化、tree scan中の置換、上限超過は安全なsnapshot不能としてexit `1`とし、新しいcomplete publicationは作らない。non-symlinkの明示Artifact又はrootが単に欠落している場合は`artifact_missing` findingでexit `2`とする。
 5. tree scanにはreview済みの最大file数、最大1 file bytes、最大tree bytesを設ける。上限値は実Artifactのサイズを収集せず、synthetic testにより決め、定数と文書に固定する。
 
-   実装で固定する値は、Request 4 MiB、1 Artifact file 64 MiB、tree 4,096 files／256 MiBである。超過はfindingではなくexit `1`の安全なsnapshot失敗とする。
+   実装で固定する値は、Request 4 MiB、1 Artifact file 64 MiB、tree 4,096 files／256 directories／4,096 entries／256 MiBである。超過はfindingではなくexit `1`の安全なsnapshot失敗とする。tree scanの子directory FDはscan直後に閉じ、再検証用にはidentityだけを保持する。
 6. `--confirm-local-execution`後に引数配列で固定したread-only `git rev-parse HEAD`を短いtimeout・最小環境で実行し、`observed_execution_repository_head`としてsidecarに必ず記録する。これは指定repository rootのcheckout HEADの観測であり、binary provenanceではない。network、fetch、status、mutationを行わない。観測不能ならexit `1`、optional `expected_execution_repository_head`が指定されていて不一致の場合だけは`execution_repository_head_mismatch` findingでexit `2`とする。いずれも`artifact_reviewed_commit`とは比較しない。
 
 ### 5.2 Release検証

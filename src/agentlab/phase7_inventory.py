@@ -310,6 +310,8 @@ class ExpectedTree(ContractModel):
         paths = [item.path for item in self.file_artifacts]
         if paths != sorted(set(paths)):
             raise ValueError("ExpectedTree file_artifacts must be unique and sorted")
+        if any(not item.required for item in self.file_artifacts):
+            raise ValueError("ExpectedTree file_artifacts must all have required=True")
         if self.expected_file_count != len(self.file_artifacts):
             raise ValueError("ExpectedTree file count must match file_artifacts")
         return self
@@ -810,12 +812,13 @@ class InventoryFinding(ContractModel):
 class InventorySummary(ContractModel):
     release_count: StrictInt = Field(ge=0)
     campaign_count: StrictInt = Field(ge=0)
-    primary_denominator: StrictInt = Field(ge=0)
+    primary_campaign_count: StrictInt = Field(ge=0)
     classification_counts: dict[StrictStr, StrictInt]
     storage_state_counts: dict[StorageState, StrictInt]
     integrity_state_counts: dict[IntegrityState, StrictInt]
     provider_call_count_observed: StrictInt = Field(ge=0)
-    provider_call_count_unknown: StrictInt = Field(ge=0)
+    provider_call_count_unknown_runs: StrictInt = Field(ge=0)
+    campaigns_without_total: StrictInt = Field(ge=0)
 
 
 class EvidenceInventory(ContractModel):
@@ -1063,6 +1066,99 @@ def _open_snapshot_directory(
         parent_fd = cached
         current_relative = child_relative
     return parent_fd, None
+
+
+def _open_snapshot_directory_ephemeral(
+    snapshot: _InventorySnapshot,
+    relative: str,
+    label: str,
+    *,
+    final_kind: Literal["directory", "parent"] = "directory",
+) -> tuple[int | None, Literal["missing", "unsafe"] | None, tuple[int, ...]]:
+    """Open a directory path without retaining newly opened descriptors.
+
+    The fixed root descriptor and any already-cached parents are reused.  Every
+    new component is kept only for the duration of this call (and the caller's
+    scan), while its identity is retained for final snapshot revalidation.
+    """
+    if relative == "":
+        return snapshot.root_fd, None, ()
+    owned: list[int] = []
+
+    def close_owned() -> None:
+        for descriptor in reversed(owned):
+            with suppress(OSError):
+                os.close(descriptor)
+        owned.clear()
+
+    parts = PurePosixPath(relative).parts
+    current_relative = ""
+    parent_fd = snapshot.root_fd
+    try:
+        for index, component in enumerate(parts):
+            child_relative = (
+                component if not current_relative else f"{current_relative}/{component}"
+            )
+            is_final = index == len(parts) - 1
+            try:
+                before = os.stat(
+                    component,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                close_owned()
+                return None, "missing", ()
+            except OSError as error:
+                raise InventorySafetyError(f"could not inspect {label} parent") from error
+            if stat.S_ISLNK(before.st_mode):
+                if is_final and final_kind == "directory":
+                    close_owned()
+                    return None, "unsafe", ()
+                raise InventorySafetyError(f"{label} contains a symlinked parent")
+            if not stat.S_ISDIR(before.st_mode):
+                if is_final and final_kind == "directory":
+                    close_owned()
+                    return None, "unsafe", ()
+                close_owned()
+                return None, "missing", ()
+
+            descriptor = snapshot.directory_fds.get(child_relative)
+            if descriptor is None:
+                try:
+                    descriptor = os.open(
+                        component,
+                        _directory_open_flags(),
+                        dir_fd=parent_fd,
+                    )
+                except OSError as error:
+                    raise InventorySafetyError(f"could not open {label} directory") from error
+                owned.append(descriptor)
+            opened = os.fstat(descriptor)
+            try:
+                after = os.stat(
+                    component,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise InventorySafetyError(f"{label} directory changed while opening") from error
+            if _identity(before) != _identity(opened) or _identity(after) != _identity(opened):
+                raise InventorySafetyError(f"{label} directory changed while opening")
+            identity = _identity(opened)
+            previous = snapshot.directory_identities.get(child_relative)
+            if previous is not None and previous != identity:
+                raise InventorySafetyError(f"{label} directory identity changed")
+            snapshot.directory_identities[child_relative] = identity
+            parent_fd = descriptor
+            current_relative = child_relative
+    except InventorySafetyError:
+        close_owned()
+        raise
+    except OSError as error:
+        close_owned()
+        raise InventorySafetyError(f"{label} directory could not be revalidated") from error
+    return parent_fd, None, tuple(owned)
 
 
 def _watch_path(
@@ -1372,7 +1468,7 @@ def _snapshot_revalidate(snapshot: _InventorySnapshot) -> None:
         snapshot.directory_identities.items(),
         key=lambda item: (len(PurePosixPath(item[0]).parts), item[0]),
     ):
-        descriptor, state = _open_snapshot_directory(
+        descriptor, state, owned_descriptors = _open_snapshot_directory_ephemeral(
             snapshot,
             relative,
             f"snapshot directory {relative or '.'}",
@@ -1385,39 +1481,48 @@ def _snapshot_revalidate(snapshot: _InventorySnapshot) -> None:
                 raise InventorySafetyError("observed directory identity changed")
         except OSError as error:
             raise InventorySafetyError("observed directory could not be revalidated") from error
+        finally:
+            for owned_descriptor in reversed(owned_descriptors):
+                with suppress(OSError):
+                    os.close(owned_descriptor)
 
     for relative, expected_file_identity in snapshot.file_identities.items():
         parent_relative, filename = _relative_parent(relative)
-        parent_fd, parent_state = _open_snapshot_directory(
+        parent_fd, parent_state, owned_descriptors = _open_snapshot_directory_ephemeral(
             snapshot,
             parent_relative,
             f"snapshot file {relative}",
             final_kind="parent",
         )
-        if parent_state == "missing" or parent_fd is None:
-            if expected_file_identity is None:
-                continue
-            raise InventorySafetyError("observed file parent changed during snapshot")
         try:
-            current = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            if expected_file_identity is None:
-                continue
-            raise InventorySafetyError("observed file disappeared during snapshot") from None
-        except OSError as error:
-            raise InventorySafetyError("observed file could not be revalidated") from error
-        current_identity = _identity(current)
-        if expected_file_identity is None or current_identity != expected_file_identity:
-            raise InventorySafetyError("observed file identity changed during snapshot")
-        held = snapshot.file_fds.get(relative)
-        if held is not None:
+            if parent_state == "missing" or parent_fd is None:
+                if expected_file_identity is None:
+                    continue
+                raise InventorySafetyError("observed file parent changed during snapshot")
             try:
-                if _identity(os.fstat(held)) != expected_file_identity:
-                    raise InventorySafetyError("held file descriptor identity changed")
+                current = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if expected_file_identity is None:
+                    continue
+                raise InventorySafetyError("observed file disappeared during snapshot") from None
             except OSError as error:
-                raise InventorySafetyError(
-                    "held file descriptor could not be revalidated"
-                ) from error
+                raise InventorySafetyError("observed file could not be revalidated") from error
+            current_identity = _identity(current)
+            if expected_file_identity is None or current_identity != expected_file_identity:
+                raise InventorySafetyError("observed file identity changed during snapshot")
+            held = snapshot.file_fds.get(relative)
+            if held is not None:
+                try:
+                    if _identity(os.fstat(held)) != expected_file_identity:
+                        raise InventorySafetyError("held file descriptor identity changed")
+                except OSError as error:
+                    raise InventorySafetyError(
+                        "held file descriptor could not be revalidated"
+                    ) from error
+        finally:
+            for owned_descriptor in reversed(owned_descriptors):
+                with suppress(OSError):
+                    os.close(owned_descriptor)
 
 
 def _safe_json_object(content: bytes) -> dict[str, Any] | None:
@@ -1796,9 +1901,23 @@ def _observe_tree(
     actual_directories: set[str] = set()
     unsafe_paths: set[str] = set()
     scanned_tree_bytes = 0
-    stack: list[tuple[int, str]] = [(tree_fd, "")]
+    stack: list[str] = [""]
     while stack:
-        current_fd, relative_directory = stack.pop()
+        relative_directory = stack.pop()
+        owned_descriptors: tuple[int, ...] = ()
+        if relative_directory:
+            current_fd, child_state, owned_descriptors = _open_snapshot_directory_ephemeral(
+                snapshot,
+                f"{tree.root_path}/{relative_directory}",
+                f"{subject_id} tree child",
+                final_kind="directory",
+            )
+            if child_state is not None or current_fd is None:
+                raise InventorySafetyError(
+                    f"tree changed while opening {subject_id} child"
+                )
+        else:
+            current_fd = tree_fd
         try:
             before_directory = os.fstat(current_fd)
             scan_fd = os.dup(current_fd)
@@ -1887,18 +2006,7 @@ def _observe_tree(
                                     path=f"{tree.root_path}/{relative}",
                                 )
                             )
-                        child_relative = f"{tree.root_path}/{relative}"
-                        child_fd, child_state = _open_snapshot_directory(
-                            snapshot,
-                            child_relative,
-                            f"{subject_id} tree child",
-                            final_kind="directory",
-                        )
-                        if child_state is not None or child_fd is None:
-                            raise InventorySafetyError(
-                                f"tree changed while opening {subject_id} child"
-                            )
-                        stack.append((child_fd, relative))
+                        stack.append(relative)
                     else:
                         actual_files.add(relative)
                         if len(actual_files) + len(unsafe_paths) > MAX_TREE_FILES:
@@ -1929,6 +2037,10 @@ def _observe_tree(
             raise
         except OSError as error:
             raise InventorySafetyError(f"tree changed during scan for {subject_id}") from error
+        finally:
+            for owned_descriptor in reversed(owned_descriptors):
+                with suppress(OSError):
+                    os.close(owned_descriptor)
 
     for relative_directory in sorted(
         set(tree.allowed_directories) - actual_directories - unsafe_paths
@@ -2023,8 +2135,9 @@ def _observe_tree(
                 )
             )
             has_drift = True
-    storage = StorageState.PARTIAL if required_missing else StorageState.PRESENT
-    if required_missing:
+    incomplete = required_missing or optional_missing
+    storage = StorageState.PARTIAL if incomplete else StorageState.PRESENT
+    if incomplete:
         integrity = IntegrityState.NOT_VERIFIABLE
     elif has_drift or any(
         item.code is FindingCode.ARTIFACT_MISSING
@@ -2306,104 +2419,64 @@ def _inventory_entry_states(
     return storage, integrity
 
 
-def _extract_json_objects(content: bytes) -> list[dict[str, Any]]:
-    try:
-        raw = _strict_json_bytes(content, "Artifact")
-        return [raw]
-    except InventoryContractError:
-        objects: list[dict[str, Any]] = []
-        for line in content.splitlines():
-            if not line.strip():
-                continue
-            try:
-                value = _strict_json_bytes(line, "Artifact JSONL")
-            except InventoryContractError:
-                return []
-            objects.append(value)
-        return objects
-
-
 def _provider_counts(
-    contents: Mapping[str, bytes],
-    campaign_contents: Sequence[tuple[str, bytes]] | None = None,
-) -> tuple[int, int]:
-    """Count each declared Campaign's canonical finished event once.
+    *,
+    request: EvidenceInventoryRequest,
+    campaign_outputs: Sequence[InventoryCampaignEntry],
+    subject_contents: Mapping[tuple[str, str], Mapping[str, bytes]],
+) -> tuple[int, int, int]:
+    """Account provider calls from each declared Campaign exactly once.
 
-    Evidence, reports, and public-bundle mirrors are intentionally not input
-    to this accounting path.  They are validation witnesses only.
+    Only the canonical Campaign finished event is an accounting source.
+    Evidence, reports, and public-bundle mirrors are validation witnesses.  A
+    Campaign that is missing, drifted, or cannot be canonically loaded is
+    exposed as ``campaigns_without_total`` instead of being silently removed
+    or converted into a numeric zero.
     """
-    observed = 0
-    unknown = 0
-    if campaign_contents is None:
-        # Compatibility for isolated callers: de-duplicate identical bytes.
-        # The inventory build always supplies the declared, integrity-verified
-        # Campaign set below.
-        campaign_contents = tuple(
-            (digest, content)
-            for digest, content in {
-                _sha256(content): content for content in contents.values()
-            }.items()
-        )
-        strict_phase6_validation = False
-    else:
-        strict_phase6_validation = True
-    if strict_phase6_validation:
-        from agentlab.phase6 import load_phase6_campaign_from_bytes
+    from agentlab.phase6 import load_phase6_campaign_from_bytes
 
-        strict_seen_campaigns: set[str] = set()
-        for campaign_key, content in campaign_contents:
-            if campaign_key in strict_seen_campaigns:
-                continue
-            strict_seen_campaigns.add(campaign_key)
-            validation = load_phase6_campaign_from_bytes(content)
-            if (
-                validation.is_valid
-                and validation.total_status == "determined"
-                and validation.provider_call_count is not None
-                and validation.provider_call_count_unknown_runs is not None
-            ):
-                observed += validation.provider_call_count
-                unknown += validation.provider_call_count_unknown_runs
-            else:
-                unknown += 1
-        return observed, unknown
-    seen_campaigns: set[str] = set()
-    for campaign_key, content in campaign_contents:
-        if campaign_key in seen_campaigns:
+    observed = 0
+    unknown_runs = 0
+    campaigns_without_total = 0
+    outputs_by_id = {item.campaign_id: item for item in campaign_outputs}
+    for campaign_entry in request.campaign_entries:
+        output = outputs_by_id.get(campaign_entry.campaign_id)
+        if (
+            output is None
+            or output.storage_state is not StorageState.PRESENT
+            or output.integrity_state is not IntegrityState.VERIFIED
+        ):
+            campaigns_without_total += 1
             continue
-        seen_campaigns.add(campaign_key)
-        objects = _extract_json_objects(content)
-        finished = [item for item in objects if item.get("event_type") == "campaign_finished"]
-        if len(finished) == 1:
-            raw = finished[0]
-            value = raw.get("provider_call_count")
-            unknown_value = raw.get("provider_call_count_unknown_runs")
-            if (
-                isinstance(value, int)
-                and not isinstance(value, bool)
-                and value >= 0
-                and isinstance(unknown_value, int)
-                and not isinstance(unknown_value, bool)
-                and unknown_value >= 0
-            ):
-                observed += value
-                unknown += unknown_value
-            else:
-                unknown += 1
+        campaign_artifact = next(
+            (
+                artifact
+                for artifact in campaign_entry.file_artifacts
+                if artifact.role == CampaignArtifactRole.CAMPAIGN.value
+            ),
+            None,
+        )
+        if campaign_artifact is None:
+            campaigns_without_total += 1
             continue
-        # A declared Campaign without one canonical finished event has no
-        # trustworthy total; it must remain unknown rather than becoming 0.
-        if len(finished) == 0:
-            top_level = [item for item in objects if "provider_call_count" in item]
-            if len(top_level) == 1:
-                value = top_level[0].get("provider_call_count")
-                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                    observed += value
-                    continue
-            unknown += 1
-        else:
-            unknown += 1
-    return observed, unknown
+        content = subject_contents.get(
+            ("campaign", campaign_entry.campaign_id), {}
+        ).get(campaign_artifact.path)
+        if content is None:
+            campaigns_without_total += 1
+            continue
+        validation = load_phase6_campaign_from_bytes(content)
+        if (
+            not validation.is_valid
+            or validation.total_status != "determined"
+            or validation.provider_call_count is None
+            or validation.provider_call_count_unknown_runs is None
+        ):
+            campaigns_without_total += 1
+            continue
+        observed += validation.provider_call_count
+        unknown_runs += validation.provider_call_count_unknown_runs
+    return observed, unknown_runs, campaigns_without_total
 
 
 def _receipt_result(
@@ -2972,7 +3045,7 @@ def _build_inventory(
         findings.extend(suite_findings)
         if validated is not None:
             validated_releases[release_entry.release_id] = validated
-        else:
+        elif release_entry.verification_profile == "phase6_public_suite":
             manifest_binding_campaign_drift.update(
                 campaign.campaign_id
                 for campaign in request.campaign_entries
@@ -3293,32 +3366,10 @@ def _build_inventory(
             retention_outputs.append(result)
             findings.extend(receipt_findings)
 
-    campaign_accounting: list[tuple[str, bytes]] = []
-    campaign_outputs_by_id = {item.campaign_id: item for item in campaign_outputs}
-    for campaign_entry in request.campaign_entries:
-        campaign_output = campaign_outputs_by_id[campaign_entry.campaign_id]
-        if (
-            campaign_output.storage_state is not StorageState.PRESENT
-            or campaign_output.integrity_state is not IntegrityState.VERIFIED
-        ):
-            continue
-        campaign_file = next(
-            (
-                artifact
-                for artifact in campaign_entry.file_artifacts
-                if artifact.role == CampaignArtifactRole.CAMPAIGN.value
-            ),
-            None,
-        )
-        if campaign_file is not None:
-            content = subject_contents[("campaign", campaign_entry.campaign_id)].get(
-                campaign_file.path
-            )
-            if content is not None:
-                campaign_accounting.append((campaign_entry.campaign_id, content))
-    observed_calls, unknown_calls = _provider_counts(
-        all_contents,
-        campaign_contents=campaign_accounting,
+    observed_calls, unknown_runs, campaigns_without_total = _provider_counts(
+        request=request,
+        campaign_outputs=campaign_outputs,
+        subject_contents=subject_contents,
     )
     classification_counts: dict[str, int] = {}
     for release_entry in request.release_entries:
@@ -3373,14 +3424,15 @@ def _build_inventory(
         summary=InventorySummary(
             release_count=len(release_outputs),
             campaign_count=len(campaign_outputs),
-            primary_denominator=sum(
+            primary_campaign_count=sum(
                 item.included_in_primary_denominator for item in campaign_outputs
             ),
             classification_counts=classification_counts,
             storage_state_counts=storage_counts,
             integrity_state_counts=integrity_counts,
             provider_call_count_observed=observed_calls,
-            provider_call_count_unknown=unknown_calls,
+            provider_call_count_unknown_runs=unknown_runs,
+            campaigns_without_total=campaigns_without_total,
         ),
         verification_status=VerificationStatus.FAILED if findings else VerificationStatus.VERIFIED,
     )
@@ -3409,9 +3461,11 @@ def render_inventory_markdown(inventory: EvidenceInventory) -> bytes:
         "",
         f"- releases: {inventory.summary.release_count}",
         f"- campaigns: {inventory.summary.campaign_count}",
-        f"- primary denominator: {inventory.summary.primary_denominator}",
+        f"- primary campaigns: {inventory.summary.primary_campaign_count}",
         f"- provider call count observed: {inventory.summary.provider_call_count_observed}",
-        f"- provider call count unknown: {inventory.summary.provider_call_count_unknown}",
+        "- provider call count unknown runs: "
+        f"{inventory.summary.provider_call_count_unknown_runs}",
+        f"- campaigns without total: {inventory.summary.campaigns_without_total}",
         "",
         "## Entries",
         "",
