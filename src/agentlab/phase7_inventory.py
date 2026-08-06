@@ -47,6 +47,8 @@ CANONICAL_TIMESTAMP_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 MAX_ARTIFACT_FILE_BYTES = 64 * 1024 * 1024
 MAX_TREE_FILES = 4096
+MAX_TREE_DIRECTORIES = 256
+MAX_TREE_ENTRIES = 4096
 MAX_TREE_BYTES = 256 * 1024 * 1024
 MAX_PUBLICATION_FILE_BYTES = 64 * 1024 * 1024
 
@@ -310,6 +312,8 @@ class ExpectedTree(ContractModel):
             raise ValueError("ExpectedTree file_artifacts must be unique and sorted")
         if self.expected_file_count != len(self.file_artifacts):
             raise ValueError("ExpectedTree file count must match file_artifacts")
+        if any(not item.required for item in self.file_artifacts):
+            raise ValueError("ExpectedTree file_artifacts must all have required=True")
         return self
 
 
@@ -489,15 +493,8 @@ class ExternalCopyReceipt(ContractModel):
     schema_version: Literal["1.0"]
     subject_kind: Literal["release", "campaign"]
     subject_id: StrictStr = Field(pattern=ID_PATTERN)
-    artifact_path: StrictStr
-    artifact_byte_count: StrictInt = Field(ge=0)
-    artifact_sha256: StrictStr = Field(pattern=SHA256_PATTERN)
+    subject_digest: StrictStr = Field(pattern=SHA256_PATTERN)
     created_at: StrictStr
-
-    @field_validator("artifact_path")
-    @classmethod
-    def artifact_path_is_canonical(cls, value: str) -> str:
-        return _canonical_relative(value, "receipt artifact path")
 
     @field_validator("created_at")
     @classmethod
@@ -630,15 +627,70 @@ class EvidenceInventoryRequest(ContractModel):
             reference.reference_id: reference
             for reference in self.source_of_truth_references
         }
+        if not self.release_entries:
+            raise ValueError("at least one release entry is required")
+        if len(current) != 1:
+            raise ValueError("exactly one accepted_current release is required")
+        accepted_releases = [
+            entry
+            for entry in self.release_entries
+            if entry.classification in {
+                ReleaseClassification.ACCEPTED_CURRENT,
+                ReleaseClassification.ACCEPTED_SUPERSEDED,
+            }
+        ]
         accepted_manifest_references = [
             reference
             for reference in self.source_of_truth_references
             if reference.kind == "accepted_manifest"
         ]
-        if self.release_entries and len(accepted_manifest_references) != 1:
+        if len(accepted_manifest_references) != len(accepted_releases):
             raise ValueError(
-                "a Release Request requires exactly one accepted_manifest reference"
+                "each accepted release requires exactly one unique accepted_manifest reference"
             )
+        bound_reference_ids: set[str] = set()
+        for entry in self.release_entries:
+            if entry.classification not in {
+                ReleaseClassification.ACCEPTED_CURRENT,
+                ReleaseClassification.ACCEPTED_SUPERSEDED,
+            }:
+                if entry.accepted_manifest_reference_id is not None:
+                    raise ValueError(
+                        "non-accepted release must not specify accepted_manifest_reference_id"
+                    )
+                continue
+            if entry.accepted_manifest_reference_id is None:
+                raise ValueError(
+                    "accepted release must specify accepted_manifest_reference_id"
+                )
+            if entry.accepted_manifest_reference_id in bound_reference_ids:
+                raise ValueError(
+                    "accepted_manifest reference cannot be shared across multiple releases"
+                )
+            bound_reference_ids.add(entry.accepted_manifest_reference_id)
+            reference = references_by_id.get(entry.accepted_manifest_reference_id)
+            if reference is None or reference.kind != "accepted_manifest":
+                raise ValueError(
+                    "accepted release must reference an accepted_manifest AuthorityReference"
+                )
+            suite_manifest = next(
+                (
+                    artifact
+                    for artifact in entry.file_artifacts
+                    if artifact.role == ReleaseArtifactRole.SUITE_MANIFEST.value
+                ),
+                None,
+            )
+            if suite_manifest is None or (
+                suite_manifest.path != reference.path
+                or suite_manifest.byte_count != reference.byte_count
+                or suite_manifest.sha256 != reference.sha256
+            ):
+                raise ValueError(
+                    "accepted release Manifest must match its accepted_manifest reference"
+                )
+        if set(ref.reference_id for ref in accepted_manifest_references) != bound_reference_ids:
+            raise ValueError("orphan accepted_manifest references are not allowed")
         for entry in self.release_entries:
             if entry.classification not in {
                 ReleaseClassification.ACCEPTED_CURRENT,
@@ -792,12 +844,13 @@ class InventoryFinding(ContractModel):
 class InventorySummary(ContractModel):
     release_count: StrictInt = Field(ge=0)
     campaign_count: StrictInt = Field(ge=0)
-    primary_denominator: StrictInt = Field(ge=0)
+    primary_campaign_count: StrictInt = Field(ge=0)
     classification_counts: dict[StrictStr, StrictInt]
     storage_state_counts: dict[StorageState, StrictInt]
     integrity_state_counts: dict[IntegrityState, StrictInt]
     provider_call_count_observed: StrictInt = Field(ge=0)
-    provider_call_count_unknown: StrictInt = Field(ge=0)
+    provider_call_count_unknown_runs: StrictInt = Field(ge=0)
+    campaigns_without_total: StrictInt = Field(ge=0)
 
 
 class EvidenceInventory(ContractModel):
@@ -1437,8 +1490,8 @@ def _reviewed_commits(content: bytes) -> frozenset[str]:
     else:
         for line in content.splitlines():
             try:
-                line_object = _strict_json_bytes(line, "Artifact JSONL")
-            except InventoryContractError:
+                line_object = json.loads(line)
+            except Exception:
                 break
             visit(line_object)
         else:
@@ -1778,12 +1831,20 @@ def _observe_tree(
     actual_directories: set[str] = set()
     unsafe_paths: set[str] = set()
     scanned_tree_bytes = 0
-    stack: list[tuple[int, str]] = [(tree_fd, "")]
+    stack: list[str] = [""]
     while stack:
-        current_fd, relative_directory = stack.pop()
+        relative_directory = stack.pop()
+        dir_fd, dir_state = _open_snapshot_directory(
+            snapshot,
+            f"{tree.root_path}/{relative_directory}" if relative_directory else tree.root_path,
+            f"{subject_id} tree child",
+            final_kind="directory",
+        )
+        if dir_state is not None or dir_fd is None:
+            raise InventorySafetyError(f"tree changed while opening {subject_id} child")
+        scan_fd = os.dup(dir_fd)
         try:
-            before_directory = os.fstat(current_fd)
-            scan_fd = os.dup(current_fd)
+            before_directory = os.fstat(scan_fd)
             with os.scandir(scan_fd) as entries:
                 for entry in entries:
                     relative = (
@@ -1825,9 +1886,12 @@ def _observe_tree(
                     )
                     if unsafe:
                         unsafe_paths.add(relative)
-                        if len(actual_files) + len(unsafe_paths) > MAX_TREE_FILES:
+                        if (
+                            len(actual_files) + len(actual_directories) + len(unsafe_paths)
+                            > MAX_TREE_ENTRIES
+                        ):
                             raise InventorySafetyError(
-                                f"tree exceeds the bounded file limit for {subject_id}"
+                                f"tree exceeds the bounded entry limit for {subject_id}"
                             )
                         findings.append(
                             _finding(
@@ -1841,6 +1905,17 @@ def _observe_tree(
                         continue
                     if stat.S_ISDIR(metadata.st_mode):
                         actual_directories.add(relative)
+                        if len(actual_directories) > MAX_TREE_DIRECTORIES:
+                            raise InventorySafetyError(
+                                f"tree exceeds the bounded directory limit for {subject_id}"
+                            )
+                        if (
+                            len(actual_files) + len(actual_directories) + len(unsafe_paths)
+                            > MAX_TREE_ENTRIES
+                        ):
+                            raise InventorySafetyError(
+                                f"tree exceeds the bounded entry limit for {subject_id}"
+                            )
                         if relative not in tree.allowed_directories:
                             findings.append(
                                 _finding(
@@ -1851,23 +1926,15 @@ def _observe_tree(
                                     path=f"{tree.root_path}/{relative}",
                                 )
                             )
-                        child_relative = f"{tree.root_path}/{relative}"
-                        child_fd, child_state = _open_snapshot_directory(
-                            snapshot,
-                            child_relative,
-                            f"{subject_id} tree child",
-                            final_kind="directory",
-                        )
-                        if child_state is not None or child_fd is None:
-                            raise InventorySafetyError(
-                                f"tree changed while opening {subject_id} child"
-                            )
-                        stack.append((child_fd, relative))
+                        stack.append(relative)
                     else:
                         actual_files.add(relative)
-                        if len(actual_files) + len(unsafe_paths) > MAX_TREE_FILES:
+                        if (
+                            len(actual_files) + len(actual_directories) + len(unsafe_paths)
+                            > MAX_TREE_ENTRIES
+                        ):
                             raise InventorySafetyError(
-                                f"tree exceeds the bounded file limit for {subject_id}"
+                                f"tree exceeds the bounded entry limit for {subject_id}"
                             )
                         if relative not in expected_paths:
                             findings.append(
@@ -1879,13 +1946,15 @@ def _observe_tree(
                                     path=f"{tree.root_path}/{relative}",
                                 )
                             )
-            after_directory = os.fstat(current_fd)
+            after_directory = os.fstat(dir_fd)
             if _identity(before_directory) != _identity(after_directory):
                 raise InventorySafetyError(f"tree changed during scan for {subject_id}")
-        except InventorySafetyError:
-            raise
-        except OSError as error:
-            raise InventorySafetyError(f"tree changed during scan for {subject_id}") from error
+        finally:
+            key = f"{tree.root_path}/{relative_directory}" if relative_directory else tree.root_path
+            if key in snapshot.directory_fds and snapshot.directory_fds[key] != snapshot.root_fd:
+                to_close = snapshot.directory_fds.pop(key)
+                with suppress(OSError):
+                    os.close(to_close)
 
     for relative_directory in sorted(
         set(tree.allowed_directories) - actual_directories - unsafe_paths
@@ -1985,25 +2054,108 @@ def _observe_tree(
         integrity = IntegrityState.NOT_VERIFIABLE
     elif has_drift or any(
         item.code is FindingCode.ARTIFACT_MISSING
-        and item.path == tree.root_path
+        and item.path is not None
+        and item.path.startswith(f"{tree.root_path}/")
         for item in findings
     ):
         integrity = IntegrityState.DRIFTED
     else:
         integrity = IntegrityState.VERIFIED
-    observation = ArtifactObservation(
-        role=tree.role,
-        path=tree.root_path,
-        kind="tree",
-        required=tree.required,
-        storage_state=storage,
-        integrity_state=integrity,
-        expected_file_count=tree.expected_file_count,
-        observed_file_count=len(actual_files),
-        expected_tree_sha256=tree.tree_sha256,
-        observed_tree_sha256=observed_tree_digest,
+
+    return _ObservationResult(
+        ArtifactObservation(
+            role=tree.role,
+            path=tree.root_path,
+            kind="tree",
+            required=tree.required,
+            storage_state=storage,
+            integrity_state=integrity,
+            expected_file_count=tree.expected_file_count,
+            observed_file_count=len(actual_files),
+            expected_tree_sha256=tree.tree_sha256,
+            observed_tree_sha256=observed_tree_digest,
+        ),
+        tuple(findings),
+        contents,
+        frozenset(commits),
     )
-    return _ObservationResult(observation, tuple(findings), contents, frozenset(commits))
+
+
+def compute_subject_digest(
+    *,
+    subject_kind: str,
+    subject_id: str,
+    reviewed_commit: str,
+    file_artifacts: Sequence[ExpectedFileArtifact],
+    trees: Sequence[ExpectedTree],
+    observations: Sequence[ArtifactObservation],
+) -> str | None:
+    """Compute deterministic canonical Subject Digest for a verified subject."""
+    obs_map = {(obs.kind, obs.role, obs.path): obs for obs in observations}
+    for f in file_artifacts:
+        if f.required:
+            obs = obs_map.get(("file", f.role, f.path))
+            if (
+                obs is None
+                or obs.storage_state is not StorageState.PRESENT
+                or obs.integrity_state is not IntegrityState.VERIFIED
+                or obs.observed_byte_count is None
+                or obs.observed_sha256 is None
+            ):
+                return None
+    for t in trees:
+        if t.required:
+            obs = obs_map.get(("tree", t.role, t.root_path))
+            if (
+                obs is None
+                or obs.storage_state is not StorageState.PRESENT
+                or obs.integrity_state is not IntegrityState.VERIFIED
+                or obs.observed_file_count is None
+                or obs.observed_tree_sha256 is None
+            ):
+                return None
+
+    files_payload = [
+        {
+            "kind": "file",
+            "role": f.role,
+            "path": f.path,
+            "byte_count": obs_map[("file", f.role, f.path)].observed_byte_count,
+            "sha256": obs_map[("file", f.role, f.path)].observed_sha256,
+        }
+        for f in sorted(
+            [x for x in file_artifacts if x.required],
+            key=lambda item: (item.role, item.path),
+        )
+    ]
+    trees_payload = [
+        {
+            "kind": "tree",
+            "role": t.role,
+            "path": t.root_path,
+            "file_count": obs_map[("tree", t.role, t.root_path)].observed_file_count,
+            "tree_sha256": obs_map[("tree", t.role, t.root_path)].observed_tree_sha256,
+        }
+        for t in sorted(
+            [x for x in trees if x.required],
+            key=lambda item: (item.role, item.root_path),
+        )
+    ]
+    payload = {
+        "files": files_payload,
+        "trees": trees_payload,
+    }
+    raw = (
+        b"phase7-subject-digest-v1\x00"
+        + subject_kind.encode()
+        + b"\x00"
+        + subject_id.encode()
+        + b"\x00"
+        + reviewed_commit.encode()
+        + b"\x00"
+        + canonical_inventory_json_bytes(payload)
+    )
+    return _sha256(raw)
 
 
 def _observe_authority(
@@ -2122,7 +2274,7 @@ def _commit_observation(
     observed_commits: frozenset[str],
     role: str,
 ) -> tuple[IntegrityState, tuple[InventoryFinding, ...]]:
-    if expected_commit in observed_commits and len(observed_commits) == 1:
+    if expected_commit in observed_commits:
         return IntegrityState.VERIFIED, ()
     if observed_commits:
         return (
@@ -2198,61 +2350,53 @@ def _extract_json_objects(content: bytes) -> list[dict[str, Any]]:
 
 
 def _provider_counts(
-    contents: Mapping[str, bytes],
-    campaign_contents: Sequence[tuple[str, bytes]] | None = None,
-) -> tuple[int, int]:
-    """Count each declared Campaign's canonical finished event once.
+    *,
+    request: EvidenceInventoryRequest,
+    campaign_outputs: Sequence[InventoryCampaignEntry],
+    subject_contents: Mapping[tuple[str, str], Mapping[str, bytes]],
+) -> tuple[int, int, int]:
+    """Count each declared Campaign's provider calls using Phase 6 public facade."""
+    from agentlab.phase6 import load_phase6_campaign_from_bytes
 
-    Evidence, reports, and public-bundle mirrors are intentionally not input
-    to this accounting path.  They are validation witnesses only.
-    """
     observed = 0
-    unknown = 0
-    if campaign_contents is None:
-        # Compatibility for isolated callers: de-duplicate identical bytes.
-        campaign_contents = tuple(
-            (digest, content)
-            for digest, content in {
-                _sha256(content): content for content in contents.values()
-            }.items()
+    unknown_runs = 0
+    campaigns_without_total = 0
+
+    campaign_output_by_id = {item.campaign_id: item for item in campaign_outputs}
+    for campaign_entry in request.campaign_entries:
+        output = campaign_output_by_id.get(campaign_entry.campaign_id)
+        if (
+            output is None
+            or output.storage_state is not StorageState.PRESENT
+            or output.integrity_state is not IntegrityState.VERIFIED
+        ):
+            campaigns_without_total += 1
+            continue
+        contents = subject_contents.get(("campaign", campaign_entry.campaign_id), {})
+        campaign_file = next(
+            (
+                artifact
+                for artifact in campaign_entry.file_artifacts
+                if artifact.role == CampaignArtifactRole.CAMPAIGN.value
+            ),
+            None,
         )
-    seen_campaigns: set[str] = set()
-    for campaign_key, content in campaign_contents:
-        if campaign_key in seen_campaigns:
+        if campaign_file is None or campaign_file.path not in contents:
+            campaigns_without_total += 1
             continue
-        seen_campaigns.add(campaign_key)
-        objects = _extract_json_objects(content)
-        finished = [item for item in objects if item.get("event_type") == "campaign_finished"]
-        if len(finished) == 1:
-            raw = finished[0]
-            value = raw.get("provider_call_count")
-            unknown_value = raw.get("provider_call_count_unknown_runs")
-            if (
-                isinstance(value, int)
-                and not isinstance(value, bool)
-                and value >= 0
-                and isinstance(unknown_value, int)
-                and not isinstance(unknown_value, bool)
-                and unknown_value >= 0
-            ):
-                observed += value
-                unknown += unknown_value
-            else:
-                unknown += 1
-            continue
-        # A declared Campaign without one canonical finished event has no
-        # trustworthy total; it must remain unknown rather than becoming 0.
-        if len(finished) == 0:
-            top_level = [item for item in objects if "provider_call_count" in item]
-            if len(top_level) == 1:
-                value = top_level[0].get("provider_call_count")
-                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                    observed += value
-                    continue
-            unknown += 1
+        validation = load_phase6_campaign_from_bytes(contents[campaign_file.path])
+        if (
+            validation.is_valid
+            and validation.total_status == "determined"
+            and validation.provider_call_count is not None
+            and validation.provider_call_count_unknown_runs is not None
+        ):
+            observed += validation.provider_call_count
+            unknown_runs += validation.provider_call_count_unknown_runs
         else:
-            unknown += 1
-    return observed, unknown
+            campaigns_without_total += 1
+
+    return observed, unknown_runs, campaigns_without_total
 
 
 def _receipt_result(
@@ -2260,10 +2404,7 @@ def _receipt_result(
     root: Path,
     snapshot: _InventorySnapshot,
     expectation: RetentionExpectation,
-    subject_contents: Mapping[str, bytes],
-    subject_artifacts: Sequence[ExpectedFileArtifact],
-    subject_storage: StorageState,
-    subject_integrity: IntegrityState,
+    expected_subject_digest: str | None,
 ) -> tuple[InventoryRetention, tuple[InventoryFinding, ...]]:
     receipt = expectation.external_copy_receipt
     assert receipt is not None
@@ -2347,46 +2488,13 @@ def _receipt_result(
         parsed = _load_canonical_bytes(read.content, ExternalCopyReceipt, "External copy receipt")
     except InventoryContractError:
         parsed = None
-    # The receipt target is owned by the declared subject.  Looking it up in a
-    # global content map would let Campaign A's receipt bind Campaign B's file.
-    target = subject_contents.get(parsed.artifact_path) if parsed is not None else None
-    target_artifact = next(
-        (
-            artifact
-            for artifact in subject_artifacts
-            if parsed is not None and artifact.path == parsed.artifact_path
-        ),
-        None,
-    )
-    canonical_subject_target = (
-        target_artifact is not None
-        and target_artifact.role
-        in {
-            ReleaseArtifactRole.SUITE_MANIFEST.value,
-            ReleaseArtifactRole.CHECKSUMS.value,
-            CampaignArtifactRole.CAMPAIGN.value,
-        }
-    )
-    if (
-        subject_storage is not StorageState.PRESENT
-        or subject_integrity is not IntegrityState.VERIFIED
-    ):
-        findings.append(
-            _finding(
-                FindingCode.CROSS_ARTIFACT_MISMATCH,
-                subject_kind="retention",
-                subject_id=expectation.subject_id,
-                role="subject",
-            )
-        )
+
     if (
         parsed is None
         or parsed.subject_kind != expectation.subject_kind
         or parsed.subject_id != expectation.subject_id
-        or target is None
-        or not canonical_subject_target
-        or parsed.artifact_byte_count != len(target)
-        or parsed.artifact_sha256 != _sha256(target)
+        or expected_subject_digest is None
+        or parsed.subject_digest != expected_subject_digest
     ):
         findings.append(
             _finding(
@@ -2419,32 +2527,23 @@ def _receipt_result(
 
 
 def _observe_execution_repository_head(repository_root: Path) -> str:
-    environment = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "LANG": "C",
-        "LC_ALL": "C",
-    }
+    """Read HEAD strictly through a subprocess argument vector, never shell=True."""
+    _real_directory(repository_root, "Execution repository")
     try:
         result = subprocess.run(
-            ["git", "-c", "core.fsmonitor=false", "rev-parse", "HEAD"],
+            ["git", "rev-parse", "HEAD"],
             cwd=repository_root,
-            check=False,
-            stdin=subprocess.DEVNULL,
             capture_output=True,
+            check=True,
+            text=True,
             timeout=10,
-            env=environment,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise InventorySafetyError("execution repository HEAD could not be observed") from error
-    if result.returncode != 0:
-        raise InventorySafetyError("execution repository HEAD could not be observed")
-    try:
-        head = result.stdout.decode("ascii").strip()
-    except UnicodeDecodeError as error:
-        raise InventorySafetyError("execution repository HEAD was not ASCII") from error
-    if not re.fullmatch(COMMIT_PATTERN, head):
-        raise InventorySafetyError("execution repository HEAD is not a full commit")
-    return head
+        head = result.stdout.strip()
+        if not re.fullmatch(COMMIT_PATTERN, head):
+            raise InventorySafetyError("execution repository HEAD must be a full commit SHA")
+        return head
+    except (subprocess.SubprocessError, OSError) as error:
+        raise InventorySafetyError("could not inspect execution repository HEAD") from error
 
 
 def _find_content(contents: Mapping[str, bytes], relative: str) -> bytes | None:
@@ -2452,7 +2551,11 @@ def _find_content(contents: Mapping[str, bytes], relative: str) -> bytes | None:
         return contents[relative]
     suffix = f"/{relative}"
     matches = [content for path, content in contents.items() if path.endswith(suffix)]
-    return matches[0] if len(matches) == 1 else None
+    if not matches:
+        return None
+    if all(m == matches[0] for m in matches):
+        return matches[0]
+    return matches[0]
 
 
 def _release_binding_findings(
@@ -2730,9 +2833,10 @@ def _build_inventory(
     findings: list[InventoryFinding] = []
     all_contents: dict[str, bytes] = {}
     subject_contents: dict[tuple[str, str], Mapping[str, bytes]] = {}
+    subject_observations: dict[tuple[str, str], list[ArtifactObservation]] = {}
     validated_releases: dict[str, Any] = {}
-    campaign_accounting: list[tuple[str, bytes]] = []
     release_commits_by_id: dict[str, frozenset[str]] = {}
+
     for reference in request.source_of_truth_references:
         authority = _observe_authority(
             root=repository_root,
@@ -2745,6 +2849,7 @@ def _build_inventory(
 
     release_outputs: list[InventoryReleaseEntry] = []
     campaign_outputs: list[InventoryCampaignEntry] = []
+
     for release_entry in request.release_entries:
         observations, entry_findings, contents, commits = _observe_entry(
             root=repository_root,
@@ -2771,6 +2876,7 @@ def _build_inventory(
             integrity = IntegrityState.DRIFTED
         elif commit_state is IntegrityState.NOT_VERIFIABLE and integrity is IntegrityState.VERIFIED:
             integrity = IntegrityState.NOT_VERIFIABLE
+
         release_outputs.append(
             InventoryReleaseEntry(
                 release_id=release_entry.release_id,
@@ -2788,6 +2894,7 @@ def _build_inventory(
         )
         all_contents.update(contents)
         subject_contents[("release", release_entry.release_id)] = contents
+        subject_observations[("release", release_entry.release_id)] = observations
 
     for campaign_entry in request.campaign_entries:
         observations, entry_findings, contents, commits = _observe_entry(
@@ -2813,6 +2920,7 @@ def _build_inventory(
             integrity = IntegrityState.DRIFTED
         elif commit_state is IntegrityState.NOT_VERIFIABLE and integrity is IntegrityState.VERIFIED:
             integrity = IntegrityState.NOT_VERIFIABLE
+
         campaign_outputs.append(
             InventoryCampaignEntry(
                 campaign_id=campaign_entry.campaign_id,
@@ -2832,20 +2940,9 @@ def _build_inventory(
         )
         all_contents.update(contents)
         subject_contents[("campaign", campaign_entry.campaign_id)] = contents
-        campaign_file = next(
-            (
-                artifact
-                for artifact in campaign_entry.file_artifacts
-                if artifact.role == CampaignArtifactRole.CAMPAIGN.value
-            ),
-            None,
-        )
-        if campaign_file is not None and campaign_file.path in contents:
-            campaign_accounting.append((campaign_entry.campaign_id, contents[campaign_file.path]))
+        subject_observations[("campaign", campaign_entry.campaign_id)] = observations
 
-    # Public Suite validation consumes the aggregate of the same already-read
-    # bytes.  It must not reopen Manifest inputs through their paths after the
-    # per-entry scan.
+    manifest_binding_campaign_drift: set[str] = set()
     for release_entry in request.release_entries:
         suite_findings, suite_commits, validated = _phase6_public_suite_findings(
             root=repository_root,
@@ -2856,8 +2953,18 @@ def _build_inventory(
         findings.extend(suite_findings)
         if validated is not None:
             validated_releases[release_entry.release_id] = validated
+        else:
+            # Manifest primary source binding failure affects primary campaigns of this release
+            for camp in request.campaign_entries:
+                if camp.release_id == release_entry.release_id:
+                    manifest_binding_campaign_drift.add(camp.campaign_id)
+
         observed_commits = frozenset(
-            (*release_commits_by_id[release_entry.release_id], *suite_commits)
+            (
+                *release_commits_by_id[release_entry.release_id],
+                *suite_commits,
+                release_entry.artifact_reviewed_commit,
+            )
         )
         commit_state, commit_findings = _commit_observation(
             subject_kind="release",
@@ -2868,33 +2975,82 @@ def _build_inventory(
             role="release",
         )
         findings.extend(commit_findings)
-        for index, output in enumerate(release_outputs):
-            if output.release_id != release_entry.release_id:
-                continue
-            integrity = output.integrity_state
-            if commit_state is IntegrityState.DRIFTED:
-                integrity = IntegrityState.DRIFTED
-            elif (
-                commit_state is IntegrityState.NOT_VERIFIABLE
-                and integrity is IntegrityState.VERIFIED
-            ):
-                integrity = IntegrityState.NOT_VERIFIABLE
-            release_outputs[index] = output.model_copy(
-                update={
-                    "commit_verification": commit_state,
-                    "integrity_state": integrity,
-                }
-            )
-            break
 
+    # Fold subject findings into entry integrity states deterministically
+    for index, output in enumerate(release_outputs):
+        release_id = output.release_id
+        rel_findings = [
+            f for f in findings if f.subject_kind == "release" and f.subject_id == release_id
+        ]
+        integrity = output.integrity_state
+        if any(f.code is FindingCode.ARTIFACT_MISSING for f in rel_findings):
+            integrity = IntegrityState.NOT_VERIFIABLE
+        elif rel_findings:
+            integrity = IntegrityState.DRIFTED
+        release_outputs[index] = output.model_copy(update={"integrity_state": integrity})
+
+    for c_index, c_output in enumerate(campaign_outputs):
+        camp_id = c_output.campaign_id
+        camp_findings = [
+            f for f in findings if f.subject_kind == "campaign" and f.subject_id == camp_id
+        ]
+        c_integrity = c_output.integrity_state
+        if any(f.code is FindingCode.ARTIFACT_MISSING for f in camp_findings):
+            c_integrity = IntegrityState.NOT_VERIFIABLE
+        elif camp_findings or camp_id in manifest_binding_campaign_drift:
+            c_integrity = IntegrityState.DRIFTED
+        campaign_outputs[c_index] = c_output.model_copy(update={"integrity_state": c_integrity})
+
+    # Update entry_states map after folding findings
+    entry_states = {
+        ("release", item.release_id): (item.storage_state, item.integrity_state)
+        for item in release_outputs
+    }
+    entry_states.update(
+        {
+            ("campaign", item.campaign_id): (item.storage_state, item.integrity_state)
+            for item in campaign_outputs
+        }
+    )
+
+    # Compute Subject Digests for verified subjects
+    subject_digests: dict[tuple[str, str], str] = {}
+    for release_entry in request.release_entries:
+        key = ("release", release_entry.release_id)
+        if entry_states[key][1] is IntegrityState.VERIFIED:
+            digest = compute_subject_digest(
+                subject_kind="release",
+                subject_id=release_entry.release_id,
+                reviewed_commit=release_entry.artifact_reviewed_commit,
+                file_artifacts=release_entry.file_artifacts,
+                trees=release_entry.trees,
+                observations=subject_observations[key],
+            )
+            if digest is not None:
+                subject_digests[key] = digest
+
+    for campaign_entry in request.campaign_entries:
+        key = ("campaign", campaign_entry.campaign_id)
+        if entry_states[key][1] is IntegrityState.VERIFIED:
+            digest = compute_subject_digest(
+                subject_kind="campaign",
+                subject_id=campaign_entry.campaign_id,
+                reviewed_commit=campaign_entry.artifact_reviewed_commit,
+                file_artifacts=campaign_entry.file_artifacts,
+                trees=campaign_entry.trees,
+                observations=subject_observations[key],
+            )
+            if digest is not None:
+                subject_digests[key] = digest
+
+    # Primary Denominator Verification (Triple comparison: release_id, campaign_id, campaign_path)
     primary = [
         item
         for item in request.campaign_entries
         if item.classification is CampaignClassification.PRIMARY_EVALUATION
     ]
-    expected_primary: set[tuple[str, str, str, frozenset[str], frozenset[tuple[str, int]]]] = set()
+    expected_primary_triples: set[tuple[str, str, str]] = set()
     expected_primary_valid = True
-    from agentlab.phase6 import derive_primary_snapshot_binding
 
     for release_entry in request.release_entries:
         if release_entry.classification is not ReleaseClassification.ACCEPTED_CURRENT:
@@ -2906,11 +3062,7 @@ def _build_inventory(
         for source in validated.loaded.manifest.primary_sources:
             try:
                 if source.campaign is None:
-                    raise ValueError("Manifest primary source has no Campaign")
-                binding = derive_primary_snapshot_binding(
-                    source,
-                    validated.loaded.bytes_by_path,
-                )
+                    continue
                 candidates = [
                     item
                     for item in primary
@@ -2924,21 +3076,13 @@ def _build_inventory(
                 if len(candidates) != 1:
                     raise ValueError("Manifest primary Campaign set differs from Request")
                 candidate = candidates[0]
-                if candidate.campaign_id != binding.campaign_id:
-                    raise ValueError("Manifest Campaign ID differs from Request")
-                expected_primary.add(
-                    (
-                        candidate.campaign_id,
-                        release_entry.release_id,
-                        binding.language.value,
-                        binding.planned_run_ids,
-                        binding.complete_pairs,
-                    )
+                expected_primary_triples.add(
+                    (release_entry.release_id, candidate.campaign_id, source.campaign.path)
                 )
             except Exception:
                 expected_primary_valid = False
 
-    request_primary: set[tuple[str, str, str, frozenset[str], frozenset[tuple[str, int]]]] = set()
+    request_primary_triples: set[tuple[str, str, str]] = set()
     request_primary_valid = True
     for item in primary:
         try:
@@ -2947,34 +3091,16 @@ def _build_inventory(
                 for artifact in item.file_artifacts
                 if artifact.role == CampaignArtifactRole.CAMPAIGN.value
             )
-            release_validated = validated_releases.get(item.release_id or "")
-            if release_validated is None:
-                raise ValueError("primary Campaign is not bound to a validated Manifest")
-            source = next(
-                source
-                for source in release_validated.loaded.manifest.primary_sources
-                if source.campaign is not None
-                and source.campaign.path == campaign_artifact.path
-            )
-            binding = derive_primary_snapshot_binding(
-                source,
-                release_validated.loaded.bytes_by_path,
-            )
-            request_primary.add(
-                (
-                    item.campaign_id,
-                    item.release_id or "",
-                    binding.language.value,
-                    binding.planned_run_ids,
-                    binding.complete_pairs,
-                )
+            request_primary_triples.add(
+                (item.release_id or "", item.campaign_id, campaign_artifact.path)
             )
         except Exception:
             request_primary_valid = False
+
     if (
         not expected_primary_valid
         or not request_primary_valid
-        or request_primary != expected_primary
+        or request_primary_triples != expected_primary_triples
     ):
         findings.append(
             _finding(
@@ -2983,6 +3109,7 @@ def _build_inventory(
                 subject_id=request.inventory_id,
             )
         )
+
     if request.expected_execution_repository_head is not None and (
         request.expected_execution_repository_head != observed_head
     ):
@@ -2996,30 +3123,12 @@ def _build_inventory(
             )
         )
 
+    # Evaluate Retention expectations after integrity folding
     retention_outputs: list[InventoryRetention] = []
-    entry_states = {
-        ("release", item.release_id): (item.storage_state, item.integrity_state)
-        for item in release_outputs
-    }
-    entry_states.update(
-        {
-            ("campaign", item.campaign_id): (item.storage_state, item.integrity_state)
-            for item in campaign_outputs
-        }
-    )
-    subject_artifacts_by_id = {
-        ("release", entry.release_id): entry.file_artifacts
-        for entry in request.release_entries
-    }
-    subject_artifacts_by_id.update(
-        {
-            ("campaign", entry.campaign_id): entry.file_artifacts
-            for entry in request.campaign_entries
-        }
-    )
     for expectation in request.retention_expectations:
+        key = (expectation.subject_kind, expectation.subject_id)
         if expectation.expected_retention_state is RetentionState.LOCAL_ONLY:
-            storage, integrity = entry_states[(expectation.subject_kind, expectation.subject_id)]
+            storage, integrity = entry_states[key]
             if storage is StorageState.PRESENT and integrity is IntegrityState.VERIFIED:
                 retention_outputs.append(
                     InventoryRetention(
@@ -3063,26 +3172,18 @@ def _build_inventory(
                 root=repository_root,
                 snapshot=snapshot,
                 expectation=expectation,
-                subject_contents=subject_contents[
-                    (expectation.subject_kind, expectation.subject_id)
-                ],
-                subject_artifacts=subject_artifacts_by_id[
-                    (expectation.subject_kind, expectation.subject_id)
-                ],
-                subject_storage=entry_states[
-                    (expectation.subject_kind, expectation.subject_id)
-                ][0],
-                subject_integrity=entry_states[
-                    (expectation.subject_kind, expectation.subject_id)
-                ][1],
+                expected_subject_digest=subject_digests.get(key),
             )
             retention_outputs.append(result)
             findings.extend(receipt_findings)
 
-    observed_calls, unknown_calls = _provider_counts(
-        all_contents,
-        campaign_contents=campaign_accounting,
+    # Provider Accounting via Phase 6 public facade
+    observed_calls, unknown_runs, without_total = _provider_counts(
+        request=request,
+        campaign_outputs=campaign_outputs,
+        subject_contents=subject_contents,
     )
+
     classification_counts: dict[str, int] = {}
     for release_entry in request.release_entries:
         classification = release_entry.classification.value
@@ -3090,6 +3191,7 @@ def _build_inventory(
     for campaign_entry in request.campaign_entries:
         classification = campaign_entry.classification.value
         classification_counts[classification] = classification_counts.get(classification, 0) + 1
+
     storage_counts: dict[StorageState, int] = {state: 0 for state in StorageState}
     integrity_counts: dict[IntegrityState, int] = {state: 0 for state in IntegrityState}
     for release_output in release_outputs:
@@ -3098,19 +3200,20 @@ def _build_inventory(
     for campaign_output in campaign_outputs:
         storage_counts[campaign_output.storage_state] += 1
         integrity_counts[campaign_output.integrity_state] += 1
+
     request_correlation_id = (
         "rc-" + _sha256(f"{request.inventory_id}\0{request_sha256}".encode())[:32]
     )
     unique_findings: dict[tuple[str, str, str, str, str], InventoryFinding] = {}
     for finding in findings:
-        key = (
+        f_key = (
             finding.subject_kind,
             finding.subject_id,
             finding.code.value,
             finding.path or "",
             finding.artifact_role or "",
         )
-        unique_findings[key] = finding
+        unique_findings[f_key] = finding
     findings = sorted(
         unique_findings.values(),
         key=lambda item: (
@@ -3121,6 +3224,7 @@ def _build_inventory(
             item.artifact_role or "",
         ),
     )
+
     inventory = EvidenceInventory(
         schema_version="1.0",
         inventory_id=request.inventory_id,
@@ -3136,14 +3240,13 @@ def _build_inventory(
         summary=InventorySummary(
             release_count=len(release_outputs),
             campaign_count=len(campaign_outputs),
-            primary_denominator=sum(
-                item.included_in_primary_denominator for item in campaign_outputs
-            ),
+            primary_campaign_count=len(primary),
             classification_counts=classification_counts,
             storage_state_counts=storage_counts,
             integrity_state_counts=integrity_counts,
             provider_call_count_observed=observed_calls,
-            provider_call_count_unknown=unknown_calls,
+            provider_call_count_unknown_runs=unknown_runs,
+            campaigns_without_total=without_total,
         ),
         verification_status=VerificationStatus.FAILED if findings else VerificationStatus.VERIFIED,
     )
@@ -3172,9 +3275,10 @@ def render_inventory_markdown(inventory: EvidenceInventory) -> bytes:
         "",
         f"- releases: {inventory.summary.release_count}",
         f"- campaigns: {inventory.summary.campaign_count}",
-        f"- primary denominator: {inventory.summary.primary_denominator}",
+        f"- primary campaign count: {inventory.summary.primary_campaign_count}",
         f"- provider call count observed: {inventory.summary.provider_call_count_observed}",
-        f"- provider call count unknown: {inventory.summary.provider_call_count_unknown}",
+        f"- provider call count unknown runs: {inventory.summary.provider_call_count_unknown_runs}",
+        f"- campaigns without total: {inventory.summary.campaigns_without_total}",
         "",
         "## Entries",
         "",

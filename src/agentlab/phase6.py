@@ -2883,6 +2883,41 @@ def _load_phase6_campaign_bytes(
     return LoadedPhase6Campaign(tuple(events))
 
 
+@dataclass(frozen=True)
+class Phase6CampaignByteValidation:
+    is_valid: bool
+    provider_call_count: int | None
+    provider_call_count_unknown_runs: int | None
+    total_status: Literal["determined", "unknown"]
+    error_detail: str | None = None
+
+
+def load_phase6_campaign_from_bytes(content: bytes) -> Phase6CampaignByteValidation:
+    """Validate a Phase 6 Campaign from raw bytes and extract provider accounting totals.
+
+    Public facade for external callers (such as Phase 7 inventory validation).
+    """
+    try:
+        loaded = _load_phase6_campaign_bytes(content)
+        finished = loaded.finished
+        return Phase6CampaignByteValidation(
+            is_valid=True,
+            provider_call_count=finished.provider_call_count,
+            provider_call_count_unknown_runs=finished.provider_call_count_unknown_runs,
+            total_status="determined",
+            error_detail=None,
+        )
+    except Exception as error:
+        return Phase6CampaignByteValidation(
+            is_valid=False,
+            provider_call_count=None,
+            provider_call_count_unknown_runs=None,
+            total_status="unknown",
+            error_detail=str(error),
+        )
+
+
+
 def _validate_phase6_campaign(events: list[Phase6CampaignEvent]) -> None:
     if (
         not events

@@ -9,10 +9,12 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 import pytest
+from test_phase6 import COMMIT
 from typer.testing import CliRunner
 
 from agentlab.cli import app
 from agentlab.phase7_inventory import (
+    ArtifactObservation,
     AuthorityReference,
     CampaignClassification,
     CampaignEntry,
@@ -21,6 +23,8 @@ from agentlab.phase7_inventory import (
     ExpectedFileArtifact,
     ExpectedTree,
     ExternalCopyReceipt,
+    IntegrityState,
+    InventoryCampaignEntry,
     InventoryContractError,
     InventoryPublicationError,
     InventorySafetyError,
@@ -29,6 +33,7 @@ from agentlab.phase7_inventory import (
     ReleaseEntry,
     RetentionExpectation,
     RetentionState,
+    StorageState,
     _ObservationResult,
     _observe_tree,
     _provider_counts,
@@ -59,19 +64,115 @@ def _request(
     commit_mode: CommitVerificationMode = CommitVerificationMode.INTERNAL_IF_PRESENT,
     commit: str = HEAD,
 ) -> Path:
+    from test_phase6_public import _ready_suite
+
+    from agentlab.phase6 import (
+        ExternalChecksumAnchor,
+        PublicSuiteManifest,
+        canonical_json_bytes,
+        validate_public_suite_snapshot,
+    )
+    from agentlab.phase6_public import render_public_suite
+
     authority = b"synthetic authority\n"
     (root / "authority.txt").write_bytes(authority)
+
+    inputs_dir, manifest_path = _ready_suite(root)
+    manifest = PublicSuiteManifest.model_validate_json(manifest_path.read_bytes())
+    snapshot: dict[str, bytes] = {}
+    for p in inputs_dir.glob("**/*"):
+        if p.is_file() and p.name != "suite-manifest.json":
+            snapshot[p.relative_to(inputs_dir).as_posix()] = p.read_bytes()
+    validated = validate_public_suite_snapshot(manifest, snapshot)
+    rendered = render_public_suite(validated)
+
+    pub = root / "public"
+    pub.mkdir(exist_ok=True)
+    manifest_bytes = manifest_path.read_bytes()
+    (pub / "manifest.json").write_bytes(manifest_bytes)
+
+    for rel_path, content in rendered.files.items():
+        dest = pub / "bundle" / rel_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(content)
+
+    for ref_path, content in snapshot.items():
+        dest = pub / "bundle" / ref_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(content)
+
+    checksums_content = rendered.files["checksums.json"]
+    (pub / "checksums.json").write_bytes(checksums_content)
+
+    tree_files: dict[str, tuple[int, str]] = {}
+    tree_dirs: set[str] = set()
+    for p in (pub / "bundle").glob("**/*"):
+        rel = p.relative_to(pub / "bundle").as_posix()
+        if p.is_file():
+            tree_files[rel] = (p.stat().st_size, _sha256(p.read_bytes()))
+        elif p.is_dir():
+            tree_dirs.add(rel)
+
+    bundle_sha = compute_tree_sha256(tree_files, tree_dirs)
+
+    anchor_data = ExternalChecksumAnchor(
+        schema_version="1.0",
+        suite_id=manifest.suite_id,
+        checksum_manifest_path="checksums.json",
+        checksum_manifest_sha256=_sha256(checksums_content),
+        authenticity_claimed=False,
+    )
+    anchor_bytes = canonical_json_bytes(anchor_data)
+    (pub / "anchor.json").write_bytes(anchor_bytes)
+
+    role_map = {
+        "checksums.json": "checksums",
+        "release-metadata.json": "release_metadata",
+        "fixture.manifest.json": "fixture_manifest",
+        "fixture.acceptance.json": "fixture_acceptance",
+        "diff-policy.json": "diff_policy",
+        "plan.json": "plan",
+        "workflow.yaml": "spec",
+        "provider-coverage.json": "other_json",
+        "suite.json": "other_json",
+        "suite.md": "report_markdown",
+    }
+    tree_artifacts = [
+        ExpectedFileArtifact(
+            role=role_map.get(rel, "report_markdown" if rel.endswith(".md") else "other_json"),
+            path=rel,
+            byte_count=size,
+            sha256=sha,
+        )
+        for rel, (size, sha) in tree_files.items()
+    ]
+    tree_artifacts.sort(key=lambda x: x.path)
+
+    if artifact_path.endswith(".jsonl"):
+        role = "campaign"
+    elif artifact_path.endswith(".json"):
+        role = "report_json"
+        try:
+            data = json.loads(artifact_bytes)
+            artifact_bytes = canonical_inventory_json_bytes(data)
+        except Exception:
+            role = "report_markdown"
+    else:
+        role = "report_markdown"
+
     artifact = root / artifact_path
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_bytes(artifact_bytes)
+
     files = [
         ExpectedFileArtifact(
-            role="report_json",
+            role=role,
             path=artifact_path,
             byte_count=len(artifact_bytes),
             sha256=_sha256(artifact_bytes),
         )
     ]
+
     request = EvidenceInventoryRequest(
         schema_version="1.0",
         inventory_id="synthetic-inventory",
@@ -79,12 +180,61 @@ def _request(
         scope=InventoryScope.PHASE6,
         source_of_truth_references=[
             AuthorityReference(
+                reference_id="accepted-manifest-ref",
+                kind="accepted_manifest",
+                path="public/manifest.json",
+                byte_count=len(manifest_bytes),
+                sha256=_sha256(manifest_bytes),
+                description="accepted manifest",
+            ),
+            AuthorityReference(
                 reference_id="authority",
                 kind="tracked_closeout",
                 path="authority.txt",
                 byte_count=len(authority),
                 sha256=_sha256(authority),
                 description="synthetic authority",
+            ),
+        ],
+        release_entries=[
+            ReleaseEntry(
+                release_id="release-current",
+                artifact_reviewed_commit=COMMIT,
+                commit_verification_mode=CommitVerificationMode.INTERNAL_REQUIRED,
+                classification=ReleaseClassification.ACCEPTED_CURRENT,
+                verification_profile="phase6_public_suite",
+                declaration_basis="synthetic accepted release",
+                accepted_manifest_reference_id="accepted-manifest-ref",
+                file_artifacts=[
+                    ExpectedFileArtifact(
+                        role="suite_manifest",
+                        path="public/manifest.json",
+                        byte_count=len(manifest_bytes),
+                        sha256=_sha256(manifest_bytes),
+                    ),
+                    ExpectedFileArtifact(
+                        role="checksums",
+                        path="public/checksums.json",
+                        byte_count=len(checksums_content),
+                        sha256=_sha256(checksums_content),
+                    ),
+                    ExpectedFileArtifact(
+                        role="external_anchor",
+                        path="public/anchor.json",
+                        byte_count=len(anchor_bytes),
+                        sha256=_sha256(anchor_bytes),
+                    ),
+                ],
+                trees=[
+                    ExpectedTree(
+                        role="bundle_root",
+                        root_path="public/bundle",
+                        allowed_directories=sorted(tree_dirs),
+                        file_artifacts=tree_artifacts,
+                        expected_file_count=len(tree_artifacts),
+                        tree_sha256=bundle_sha,
+                    )
+                ],
             )
         ],
         campaign_entries=[
@@ -103,6 +253,7 @@ def _request(
     request_path = root / "request.json"
     request_path.write_bytes(canonical_inventory_json_bytes(request))
     return request_path
+
 
 
 def _observe_test_tree(root: Path, tree: ExpectedTree) -> _ObservationResult:
@@ -492,11 +643,11 @@ def test_tree_file_and_byte_limits_are_safety_failures(
             {"entry.txt": (len(content), _sha256(content))}, []
         ),
     )
-    monkeypatch.setattr("agentlab.phase7_inventory.MAX_TREE_FILES", 0)
+    monkeypatch.setattr("agentlab.phase7_inventory.MAX_TREE_ENTRIES", 0)
     with pytest.raises(InventorySafetyError):
         _observe_test_tree(tmp_path, tree)
 
-    monkeypatch.setattr("agentlab.phase7_inventory.MAX_TREE_FILES", 4096)
+    monkeypatch.setattr("agentlab.phase7_inventory.MAX_TREE_ENTRIES", 4096)
     monkeypatch.setattr("agentlab.phase7_inventory.MAX_TREE_BYTES", 1)
     with pytest.raises(InventorySafetyError):
         _observe_test_tree(tmp_path, tree)
@@ -628,73 +779,215 @@ def test_final_hardlink_and_special_files_are_not_read(
     assert any(finding.code.value == "unsafe_artifact" for finding in inventory.findings)
 
 
-def test_optional_tree_file_missing_does_not_become_unexpected_path(
-    tmp_path: Path,
-) -> None:
-    required = (
-        json.dumps({"reviewed_commit": HEAD}, sort_keys=True, indent=2).encode()
-        + b"\n"
-    )
-    optional = b"optional\n"
-    digest = compute_tree_sha256(
+def test_expected_tree_forbids_optional_file_artifacts() -> None:
+    with pytest.raises(ValueError, match="required=True"):
+        ExpectedTree(
+            role="bundle_root",
+            root_path="bundle",
+            file_artifacts=[
+                ExpectedFileArtifact(
+                    role="report_json",
+                    path="entry.json",
+                    byte_count=10,
+                    sha256=_sha256(b"content"),
+                    required=False,
+                )
+            ],
+            expected_file_count=1,
+            tree_sha256=_sha256(b"digest"),
+        )
+
+
+def _valid_campaign_bytes(provider_call_count: int = 3, unknown_runs: int = 0) -> bytes:
+    events = [
         {
-            "entry.json": (len(required), _sha256(required)),
-            "optional.txt": (len(optional), _sha256(optional)),
+            "schema_version": "1.2",
+            "event_type": "campaign_started",
+            "sequence": 0,
+            "occurred_at": "2026-01-01T00:00:00.000000Z",
+            "planned_provider_call_count": 3,
         },
-        [],
+        {
+            "schema_version": "1.2",
+            "event_type": "campaign_finished",
+            "sequence": 1,
+            "occurred_at": "2026-01-01T00:01:00.000000Z",
+            "stop_reason": "completed",
+            "provider_call_count": provider_call_count,
+            "provider_call_count_unknown_runs": unknown_runs,
+        },
+    ]
+    return b"".join(json.dumps(e, sort_keys=True).encode("utf-8") + b"\n" for e in events)
+
+
+def test_provider_accounting_uses_phase6_public_facade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from test_phase6_public import _canonical_jsonl_line, _cross_artifact_case
+
+    case_dir = tmp_path / "case"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    _source, _spec, _plan, campaign, _artifacts, _recordings = _cross_artifact_case(case_dir)
+    campaign_bytes = b"".join(_canonical_jsonl_line(e) for e in campaign.events)
+    report_bytes = canonical_inventory_json_bytes({"reviewed_commit": COMMIT})
+    (tmp_path / "report.json").write_bytes(report_bytes)
+
+    request_path = _request(
+        tmp_path,
+        artifact_path="campaign.jsonl",
+        artifact_bytes=campaign_bytes,
+        commit=COMMIT,
+    )
+    raw_req = json.loads(request_path.read_text())
+    raw_req["campaign_entries"][0]["file_artifacts"].append(
+        {
+            "role": "report_json",
+            "path": "report.json",
+            "byte_count": len(report_bytes),
+            "sha256": _sha256(report_bytes),
+        }
+    )
+    request_path.write_bytes(
+        canonical_inventory_json_bytes(EvidenceInventoryRequest.model_validate(raw_req))
+    )
+
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._observe_execution_repository_head",
+        lambda _root: COMMIT,
+    )
+    inventory = verify_inventory_request(
+        request_path=request_path,
+        repository_root=tmp_path,
+        confirm_local_execution=True,
+    )
+    assert inventory.summary.provider_call_count_observed == 2
+    assert inventory.summary.provider_call_count_unknown_runs == 0
+    assert inventory.summary.campaigns_without_total == 0
+
+
+def test_provider_accounting_uses_one_canonical_campaign_finished_event(tmp_path: Path) -> None:
+    from test_phase6_public import _canonical_jsonl_line, _cross_artifact_case
+
+    case_dir = tmp_path / "case"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    _source, _spec, _plan, campaign, _artifacts, _recordings = _cross_artifact_case(case_dir)
+    campaign_bytes = b"".join(_canonical_jsonl_line(e) for e in campaign.events)
+    evidence_mirror = campaign_bytes.replace(b"completed", b"failed")
+
+    manifest_art = ExpectedFileArtifact(
+        role="suite_manifest",
+        path="public/manifest.json",
+        byte_count=10,
+        sha256=_sha256(b"manifest"),
+    )
+    checksums_art = ExpectedFileArtifact(
+        role="checksums",
+        path="public/checksums.json",
+        byte_count=10,
+        sha256=_sha256(b"checksums"),
+    )
+    anchor_art = ExpectedFileArtifact(
+        role="external_anchor",
+        path="public/anchor.json",
+        byte_count=10,
+        sha256=_sha256(b"anchor"),
     )
     tree = ExpectedTree(
         role="bundle_root",
-        root_path="bundle",
-        file_artifacts=[
-            ExpectedFileArtifact(
-                role="report_json",
-                path="entry.json",
-                byte_count=len(required),
-                sha256=_sha256(required),
-            ),
-            ExpectedFileArtifact(
-                role="release_metadata",
-                path="optional.txt",
-                byte_count=len(optional),
-                sha256=_sha256(optional),
-                required=False,
-            ),
+        root_path="public/bundle",
+        file_artifacts=[],
+        expected_file_count=0,
+        tree_sha256=_sha256(b"bundle"),
+    )
+
+    request = EvidenceInventoryRequest(
+        schema_version="1.0",
+        inventory_id="inv",
+        authoritative=False,
+        scope=InventoryScope.PHASE6,
+        source_of_truth_references=[
+            AuthorityReference(
+                reference_id="accepted-ref",
+                kind="accepted_manifest",
+                path="public/manifest.json",
+                byte_count=10,
+                sha256=_sha256(b"manifest"),
+                description="accepted manifest",
+            )
         ],
-        expected_file_count=2,
-        tree_sha256=digest,
+        release_entries=[
+            ReleaseEntry(
+                release_id="rel-current",
+                artifact_reviewed_commit=HEAD,
+                commit_verification_mode=CommitVerificationMode.INTERNAL_REQUIRED,
+                classification=ReleaseClassification.ACCEPTED_CURRENT,
+                verification_profile="phase6_public_suite",
+                declaration_basis="basis",
+                accepted_manifest_reference_id="accepted-ref",
+                file_artifacts=[manifest_art, checksums_art, anchor_art],
+                trees=[tree],
+            )
+        ],
+        campaign_entries=[
+            CampaignEntry(
+                campaign_id="campaign-a",
+                artifact_reviewed_commit=HEAD,
+                commit_verification_mode=CommitVerificationMode.INTERNAL_IF_PRESENT,
+                classification=CampaignClassification.AUDIT_ONLY_FAILURE,
+                included_in_primary_denominator=False,
+                verification_profile="declared_artifact_set",
+                declaration_basis="basis",
+                file_artifacts=[
+                    ExpectedFileArtifact(
+                        role="campaign",
+                        path="campaign.jsonl",
+                        byte_count=len(campaign_bytes),
+                        sha256=_sha256(campaign_bytes),
+                    )
+                ],
+            )
+        ],
     )
-    _request(
-        tmp_path,
-        artifact_path="bundle/entry.json",
-        artifact_bytes=required,
-    )
-    observed = _observe_test_tree(tmp_path, tree)
-    observation = observed.observation
-    assert observation.integrity_state.value == "verified"
-    assert "unexpected_path" not in {finding.code.value for finding in observed.findings}
-
-
-def test_provider_accounting_deduplicates_mirrors() -> None:
-    campaign = (
-        b'{"event_type":"campaign_finished",'
-        b'"provider_call_count":3,"provider_call_count_unknown_runs":0}\n'
-    )
-
-    assert _provider_counts({"campaign": campaign, "mirror": campaign}) == (3, 0)
-
-
-def test_provider_accounting_uses_one_canonical_campaign_finished_event() -> None:
-    campaign = (
-        b'{"event_type":"campaign_finished",'
-        b'"provider_call_count":4,"provider_call_count_unknown_runs":1}\n'
-    )
-    evidence_mirror = campaign.replace(b"4", b"99")
+    campaign_outputs = [
+        InventoryCampaignEntry(
+            campaign_id="campaign-a",
+            artifact_reviewed_commit=HEAD,
+            commit_verification_mode=CommitVerificationMode.INTERNAL_IF_PRESENT,
+            commit_verification=IntegrityState.VERIFIED,
+            classification=CampaignClassification.AUDIT_ONLY_FAILURE,
+            included_in_primary_denominator=False,
+            verification_profile="declared_artifact_set",
+            storage_state=StorageState.PRESENT,
+            integrity_state=IntegrityState.VERIFIED,
+            artifact_observations=[
+                ArtifactObservation(
+                    role="campaign",
+                    path="campaign.jsonl",
+                    kind="file",
+                    required=True,
+                    storage_state=StorageState.PRESENT,
+                    integrity_state=IntegrityState.VERIFIED,
+                    expected_byte_count=len(campaign_bytes),
+                    observed_byte_count=len(campaign_bytes),
+                    expected_sha256=_sha256(campaign_bytes),
+                    observed_sha256=_sha256(campaign_bytes),
+                )
+            ],
+        )
+    ]
+    subject_contents = {
+        ("campaign", "campaign-a"): {
+            "campaign.jsonl": campaign_bytes,
+            "evidence.json": evidence_mirror,
+        }
+    }
 
     assert _provider_counts(
-        {"campaign.jsonl": campaign, "evidence.json": evidence_mirror},
-        campaign_contents=[("campaign-a", campaign), ("campaign-a", evidence_mirror)],
-    ) == (4, 1)
+        request=request,
+        campaign_outputs=campaign_outputs,
+        subject_contents=subject_contents,
+    ) == (2, 0, 0)
 
 
 def test_output_parent_symlink_is_rejected_before_publication(
@@ -1000,80 +1293,80 @@ def test_receipt_cannot_bind_another_campaign_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    authority = b"authority\n"
-    (tmp_path / "authority.txt").write_bytes(authority)
-    a_bytes = json.dumps({"reviewed_commit": HEAD}, sort_keys=True, indent=2).encode() + b"\n"
-    b_bytes = json.dumps({"reviewed_commit": HEAD}, sort_keys=True, indent=2).encode() + b"\n"
+    a_bytes = canonical_inventory_json_bytes({"reviewed_commit": HEAD})
+    b_bytes = canonical_inventory_json_bytes({"reviewed_commit": HEAD})
     (tmp_path / "a.json").write_bytes(a_bytes)
     (tmp_path / "b.json").write_bytes(b_bytes)
     receipt = ExternalCopyReceipt(
         schema_version="1.0",
         subject_kind="campaign",
         subject_id="campaign-a",
-        artifact_path="b.json",
-        artifact_byte_count=len(b_bytes),
-        artifact_sha256=_sha256(b_bytes),
+        subject_digest=_sha256(b"wrong_subject_digest"),
         created_at="2026-01-01T00:00:00.000000Z",
     )
     receipt_bytes = canonical_inventory_json_bytes(receipt)
     (tmp_path / "receipt.json").write_bytes(receipt_bytes)
-    request = EvidenceInventoryRequest(
-        schema_version="1.0",
-        inventory_id="retention-binding",
-        authoritative=False,
-        scope=InventoryScope.PHASE6,
-        source_of_truth_references=[
-            AuthorityReference(
-                reference_id="authority",
-                kind="tracked_closeout",
-                path="authority.txt",
-                byte_count=len(authority),
-                sha256=_sha256(authority),
-                description="authority",
-            )
-        ],
-        campaign_entries=[
-            CampaignEntry(
-                campaign_id=campaign_id,
-                artifact_reviewed_commit=HEAD,
-                commit_verification_mode=CommitVerificationMode.INTERNAL_IF_PRESENT,
-                classification=CampaignClassification.AUDIT_ONLY_FAILURE,
-                included_in_primary_denominator=False,
-                verification_profile="declared_artifact_set",
-                declaration_basis="declared",
-                file_artifacts=[
-                    ExpectedFileArtifact(
-                        role="report_json",
-                        path=f"{campaign_id[9]}.json",
-                        byte_count=len(data),
-                        sha256=_sha256(data),
-                    )
-                ],
-            )
-            for campaign_id, data in (("campaign-a", a_bytes), ("campaign-b", b_bytes))
-        ],
-        retention_expectations=[
-            RetentionExpectation(
-                subject_kind="campaign",
-                subject_id="campaign-a",
-                expected_retention_state=RetentionState.EXTERNAL_COPY_RECEIPT_VERIFIED,
-                external_copy_receipt=ExpectedFileArtifact(
-                    role="receipt",
-                    path="receipt.json",
-                    byte_count=len(receipt_bytes),
-                    sha256=_sha256(receipt_bytes),
-                ),
-                declaration_basis="receipt declaration",
-            )
-        ],
+
+    request_path = _request(tmp_path, artifact_path="a.json", artifact_bytes=a_bytes)
+    raw_req = json.loads(request_path.read_text(encoding="utf-8"))
+    raw_req["campaign_entries"] = [
+        {
+            "campaign_id": "campaign-a",
+            "artifact_reviewed_commit": HEAD,
+            "commit_verification_mode": "internal_if_present",
+            "classification": "audit_only_failure",
+            "included_in_primary_denominator": False,
+            "verification_profile": "declared_artifact_set",
+            "declaration_basis": "declared",
+            "file_artifacts": [
+                {
+                    "role": "report_json",
+                    "path": "a.json",
+                    "byte_count": len(a_bytes),
+                    "sha256": _sha256(a_bytes),
+                }
+            ],
+        },
+        {
+            "campaign_id": "campaign-b",
+            "artifact_reviewed_commit": HEAD,
+            "commit_verification_mode": "internal_if_present",
+            "classification": "audit_only_failure",
+            "included_in_primary_denominator": False,
+            "verification_profile": "declared_artifact_set",
+            "declaration_basis": "declared",
+            "file_artifacts": [
+                {
+                    "role": "report_json",
+                    "path": "b.json",
+                    "byte_count": len(b_bytes),
+                    "sha256": _sha256(b_bytes),
+                }
+            ],
+        },
+    ]
+    raw_req["retention_expectations"] = [
+        {
+            "subject_kind": "campaign",
+            "subject_id": "campaign-a",
+            "expected_retention_state": "external_copy_receipt_verified",
+            "external_copy_receipt": {
+                "role": "receipt",
+                "path": "receipt.json",
+                "byte_count": len(receipt_bytes),
+                "sha256": _sha256(receipt_bytes),
+            },
+            "declaration_basis": "receipt declaration",
+        }
+    ]
+    request_path.write_bytes(
+        canonical_inventory_json_bytes(EvidenceInventoryRequest.model_validate(raw_req))
     )
-    request_path = tmp_path / "request.json"
-    request_path.write_bytes(canonical_inventory_json_bytes(request))
+
     monkeypatch.setattr(
         "agentlab.phase7_inventory._observe_execution_repository_head",
         lambda _root: HEAD,
     )
-
     inventory = verify_inventory_request(
         request_path=request_path,
         repository_root=tmp_path,
@@ -1082,3 +1375,127 @@ def test_receipt_cannot_bind_another_campaign_artifact(
 
     assert inventory.retention[0].retention_state is RetentionState.UNKNOWN
     assert any(finding.code.value == "retention_receipt_invalid" for finding in inventory.findings)
+
+
+def test_release_only_finding_does_not_propagate_to_campaign(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_bytes = canonical_inventory_json_bytes({"reviewed_commit": HEAD})
+    request_path = _request(tmp_path, artifact_path="artifact.json", artifact_bytes=artifact_bytes)
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._observe_execution_repository_head",
+        lambda _root: HEAD,
+    )
+    inventory = verify_inventory_request(
+        request_path=request_path,
+        repository_root=tmp_path,
+        confirm_local_execution=True,
+    )
+    assert inventory.campaigns[0].integrity_state.value == "verified"
+
+
+def test_accepted_manifest_one_to_one_and_orphan_rejection() -> None:
+    manifest_art = ExpectedFileArtifact(
+        role="suite_manifest",
+        path="public/manifest.json",
+        byte_count=10,
+        sha256=_sha256(b"manifest"),
+    )
+    checksums_art = ExpectedFileArtifact(
+        role="checksums",
+        path="public/checksums.json",
+        byte_count=10,
+        sha256=_sha256(b"checksums"),
+    )
+    anchor_art = ExpectedFileArtifact(
+        role="external_anchor",
+        path="public/anchor.json",
+        byte_count=10,
+        sha256=_sha256(b"anchor"),
+    )
+    rel_files = [manifest_art, checksums_art, anchor_art]
+    ref1 = AuthorityReference(
+        reference_id="accepted-1",
+        kind="accepted_manifest",
+        path="public/manifest.json",
+        byte_count=10,
+        sha256=_sha256(b"manifest"),
+        description="ref 1",
+    )
+    ref2 = AuthorityReference(
+        reference_id="accepted-2",
+        kind="accepted_manifest",
+        path="public/manifest2.json",
+        byte_count=10,
+        sha256=_sha256(b"manifest2"),
+        description="ref 2",
+    )
+    tree = ExpectedTree(
+        role="bundle_root",
+        root_path="public/bundle",
+        file_artifacts=[],
+        expected_file_count=0,
+        tree_sha256=_sha256(b"bundle"),
+    )
+    rel1 = ReleaseEntry(
+        release_id="rel-current",
+        artifact_reviewed_commit=HEAD,
+        commit_verification_mode=CommitVerificationMode.INTERNAL_REQUIRED,
+        classification=ReleaseClassification.ACCEPTED_CURRENT,
+        verification_profile="phase6_public_suite",
+        declaration_basis="basis",
+        accepted_manifest_reference_id="accepted-1",
+        file_artifacts=rel_files,
+        trees=[tree],
+    )
+    # Reject sharing accepted_manifest reference across two accepted releases
+    rel2_shared = ReleaseEntry(
+        release_id="rel-superseded",
+        artifact_reviewed_commit=HEAD,
+        commit_verification_mode=CommitVerificationMode.INTERNAL_REQUIRED,
+        classification=ReleaseClassification.ACCEPTED_SUPERSEDED,
+        superseded_by="rel-current",
+        verification_profile="phase6_public_suite",
+        declaration_basis="basis",
+        accepted_manifest_reference_id="accepted-1",
+        file_artifacts=rel_files,
+        trees=[tree],
+    )
+    with pytest.raises(ValueError, match="unique accepted_manifest"):
+        EvidenceInventoryRequest(
+            schema_version="1.0",
+            inventory_id="req-shared",
+            authoritative=False,
+            scope=InventoryScope.PHASE6,
+            source_of_truth_references=[ref1],
+            release_entries=[rel1, rel2_shared],
+        )
+
+    # Reject orphan accepted_manifest reference
+    with pytest.raises(ValueError, match="unique accepted_manifest"):
+        EvidenceInventoryRequest(
+            schema_version="1.0",
+            inventory_id="req-orphan",
+            authoritative=False,
+            scope=InventoryScope.PHASE6,
+            source_of_truth_references=[ref1, ref2],
+            release_entries=[rel1],
+        )
+
+
+def test_tree_directory_limits_and_fd_safety(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    for i in range(300):
+        (bundle / f"dir_{i}").mkdir()
+    tree = ExpectedTree(
+        role="bundle_root",
+        root_path="bundle",
+        allowed_directories=sorted([f"dir_{i}" for i in range(300)]),
+        file_artifacts=[],
+        expected_file_count=0,
+        tree_sha256=_sha256(b"empty"),
+    )
+    with pytest.raises(InventorySafetyError, match="bounded directory limit"):
+        _observe_test_tree(tmp_path, tree)
