@@ -65,9 +65,11 @@ from agentlab.phase6 import (
     SourceClass,
     _canonical_jsonl_line,
     canonical_json_bytes,
+    derive_primary_snapshot_binding,
     load_historical_verification,
     load_public_suite_inputs,
     validate_public_suite_inputs,
+    validate_public_suite_snapshot,
 )
 from agentlab.phase6_public import (
     RENDERER_VERSION,
@@ -399,6 +401,21 @@ def _validated(root: Path, manifest_path: Path) -> Any:
     return validate_public_suite_inputs(
         load_public_suite_inputs(manifest_path, root=root)
     )
+
+
+def test_public_suite_facades_validate_caller_owned_bytes_only(tmp_path: Path) -> None:
+    root, manifest_path = _evaluated_suite(tmp_path)
+    manifest = PublicSuiteManifest.model_validate_json(manifest_path.read_bytes())
+    loaded = load_public_suite_inputs(manifest_path, root=root)
+    (root / "campaign.jsonl").unlink()
+
+    validated = validate_public_suite_snapshot(manifest, loaded.bytes_by_path)
+    source = manifest.primary_sources[0]
+    binding = derive_primary_snapshot_binding(source, validated.loaded.bytes_by_path)
+
+    assert binding.campaign_id == "workflow-ab-smoke"
+    assert len(binding.planned_run_ids) == 2
+    assert binding.complete_pairs
 
 
 def test_ready_not_run_render_is_deterministic_and_ignores_unlisted_secret(

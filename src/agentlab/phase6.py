@@ -12,7 +12,7 @@ import json
 import os
 import re
 import stat
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -3224,6 +3224,20 @@ class ValidatedPublicSuiteInputs:
     data_cutoff_at: datetime
 
 
+@dataclass(frozen=True)
+class Phase6PrimarySnapshotBinding:
+    """Canonical primary binding facts derived from one byte snapshot."""
+
+    language: Language
+    campaign_path: str
+    campaign_id: str
+    planned_run_ids: frozenset[str]
+    complete_pairs: frozenset[tuple[str, int]]
+    planned_provider_call_count: int
+    provider_call_count: int
+    provider_call_count_unknown_runs: int
+
+
 def load_public_suite_inputs(
     manifest_path: Path,
     *,
@@ -3609,8 +3623,33 @@ def validate_public_suite_inputs(
             HistoricalVerificationRecord,
             "Historical Verification Record",
         )
+        plan = _load_workflow_plan_1_2_bytes(
+            loaded.bytes_by_path[historical_source.plan.path]
+        )
+        campaign = _load_phase6_campaign_bytes(
+            loaded.bytes_by_path[historical_source.campaign.path]
+        )
+        report_raw = _strict_json_bytes(
+            loaded.bytes_by_path[historical_source.report_json.path],
+            "Historical Public Language Report",
+        )
+        report_model_type: type[PublicLanguageReport] | type[PublicLanguageReportV1_1]
+        if report_raw.get("schema_version") == "1.0":
+            report_model_type = PublicLanguageReport
+        elif report_raw.get("schema_version") == "1.1":
+            report_model_type = PublicLanguageReportV1_1
+        else:
+            raise Phase6ContractError("Historical Public Language Report schema is unsupported")
+        report = _load_canonical_model_bytes(
+            loaded.bytes_by_path[historical_source.report_json.path],
+            report_model_type,
+            "Historical Public Language Report",
+        )
         if (
             record.language is not historical_source.language
+            or plan.language is not historical_source.language
+            or campaign.started.experiment_id != plan.experiment_id
+            or report.language is not historical_source.language
             or record.plan_sha256 != historical_source.plan.sha256
             or record.campaign_sha256 != historical_source.campaign.sha256
             or record.report_json_sha256
@@ -3640,9 +3679,162 @@ def validate_public_suite_inputs(
     )
 
 
+def validate_public_suite_snapshot(
+    manifest: PublicSuiteManifest,
+    bytes_by_path: Mapping[str, bytes],
+) -> ValidatedPublicSuiteInputs:
+    """Validate a Public Suite from caller-owned immutable bytes only.
+
+    This facade deliberately performs no filesystem access.  It is the
+    boundary used by read-only inventory tooling so Manifest, Plan, Campaign,
+    Evidence, and Recording validation observes one already-captured byte
+    snapshot.
+    """
+    references = _manifest_references(manifest)
+    expected_paths = {reference.path for reference in references}
+    if set(bytes_by_path) != expected_paths:
+        raise Phase6ContractError("Public Suite snapshot paths differ from Manifest references")
+    for reference in references:
+        content = bytes_by_path[reference.path]
+        if hashlib.sha256(content).hexdigest() != reference.sha256:
+            raise Phase6ContractError(
+                f"Public Suite snapshot hash differs: {reference.path}"
+            )
+    manifest_bytes = canonical_json_bytes(manifest)
+    loaded = LoadedPublicSuiteInputs(
+        manifest=manifest,
+        root=Path("."),
+        directory_snapshots=(),
+        manifest_snapshot=FileSnapshot(
+            path=Path("<manifest>"),
+            identity=FileIdentity(0, 0, 0, 1, len(manifest_bytes), 0, 0),
+            content=manifest_bytes,
+            sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        ),
+        paths={path: Path(path) for path in expected_paths},
+        bytes_by_path=dict(bytes_by_path),
+        snapshots_by_path={},
+    )
+    return validate_public_suite_inputs(loaded)
+
+
+def derive_primary_snapshot_binding(
+    source: PrimarySuiteSource,
+    bytes_by_path: Mapping[str, bytes],
+) -> Phase6PrimarySnapshotBinding:
+    """Validate one complete primary source and return canonical accounting facts."""
+    if (
+        source.spec is None
+        or source.fixture_manifest is None
+        or source.fixture_acceptance is None
+        or source.diff_policy is None
+        or source.plan is None
+        or source.campaign is None
+    ):
+        raise Phase6ContractError("complete primary source is missing Plan-bound inputs")
+
+    def content(reference: ArtifactReference) -> bytes:
+        try:
+            value = bytes_by_path[reference.path]
+        except KeyError as error:
+            raise Phase6ContractError(
+                f"primary snapshot is missing {reference.path}"
+            ) from error
+        if hashlib.sha256(value).hexdigest() != reference.sha256:
+            raise Phase6ContractError(
+                f"primary snapshot hash differs: {reference.path}"
+            )
+        return value
+
+    spec = _load_workflow_spec_contract_bytes(content(source.spec))
+    fixture_manifest = _load_canonical_model_bytes(
+        content(source.fixture_manifest), FixtureManifest, "Fixture Manifest"
+    )
+    fixture_acceptance = _load_canonical_model_bytes(
+        content(source.fixture_acceptance),
+        FixtureAcceptanceRecord,
+        "Fixture Acceptance Record",
+    )
+    diff_policy = _load_canonical_model_bytes(
+        content(source.diff_policy), DiffPolicy, "Diff Policy"
+    )
+    plan = _load_workflow_plan_1_2_bytes(content(source.plan))
+    campaign = _load_phase6_campaign_bytes(content(source.campaign))
+    evidence = [
+        _load_phase6_live_run_artifact_bytes(content(reference))
+        for reference in source.evidence
+    ]
+    recordings = [
+        _load_phase6_recording_bytes(content(reference))
+        for reference in source.recordings
+    ]
+    if not isinstance(spec.spec, WorkflowExperimentSpecV2_1):
+        raise Phase6ContractError("complete primary source requires Spec 2.1")
+    if not isinstance(plan, WorkflowPlanV1_2):
+        raise Phase6ContractError("complete primary source requires Plan 1.2")
+    for spec_relative, reference in (
+        (spec.spec.fixture_manifest_path, source.fixture_manifest),
+        (spec.spec.fixture_acceptance_path, source.fixture_acceptance),
+        (spec.spec.diff_policy_path, source.diff_policy),
+    ):
+        bound = (
+            PurePosixPath(source.spec.path).parent
+            / PurePosixPath(spec_relative)
+        ).as_posix()
+        if bound != reference.path:
+            raise Phase6ContractError(
+                "Workflow Spec input path differs from Manifest reference"
+            )
+    validate_plan_bindings(
+        loaded_spec=spec,
+        plan=plan,
+        fixture_manifest_bytes=content(source.fixture_manifest),
+        fixture_manifest=fixture_manifest,
+        fixture_acceptance_bytes=content(source.fixture_acceptance),
+        fixture_acceptance=fixture_acceptance,
+        diff_policy_bytes=content(source.diff_policy),
+        diff_policy=diff_policy,
+    )
+    _validate_primary_live_bindings(
+        source=source,
+        spec=spec.spec,
+        plan=plan,
+        campaign=campaign,
+        evidence=evidence,
+        recordings=recordings,
+    )
+    complete_pairs: dict[tuple[str, int], set[Workflow]] = {}
+    evidence_ids = {artifact.run_id for artifact in evidence}
+    for event in campaign.events:
+        if (
+            isinstance(event, Phase6CampaignRunEvent)
+            and event.status is CampaignRunStatus.COMPLETED
+            and event.run_id in evidence_ids
+        ):
+            complete_pairs.setdefault(
+                (event.task_id, event.repetition_index), set()
+            ).add(event.workflow)
+    return Phase6PrimarySnapshotBinding(
+        language=source.language,
+        campaign_path=source.campaign.path,
+        campaign_id=campaign.started.experiment_id,
+        planned_run_ids=frozenset(run.run_id for run in plan.runs),
+        complete_pairs=frozenset(
+            pair
+            for pair, workflows in complete_pairs.items()
+            if workflows == {Workflow.ONE_SHOT, Workflow.STAGED}
+        ),
+        planned_provider_call_count=plan.planned_provider_call_count,
+        provider_call_count=campaign.finished.provider_call_count,
+        provider_call_count_unknown_runs=campaign.finished.provider_call_count_unknown_runs,
+    )
+
+
 def _require_loaded_inputs_unchanged(
     loaded: LoadedPublicSuiteInputs,
 ) -> None:
+    if not loaded.directory_snapshots:
+        return
     root_snapshot = loaded.directory_snapshots[0]
     for index, directory_snapshot in enumerate(loaded.directory_snapshots):
         _require_directory_snapshot_unchanged(
@@ -3693,6 +3885,16 @@ def _validate_spec_path_bindings(
         (spec.diff_policy_path, source.diff_policy),
     )
     for spec_relative, reference in bindings:
+        if not loaded.snapshots_by_path:
+            relative = (
+                PurePosixPath(source.spec.path).parent
+                / PurePosixPath(spec_relative)
+            ).as_posix()
+            if relative != reference.path:
+                raise Phase6ContractError(
+                    "Workflow Spec input path differs from Suite Artifact reference"
+                )
+            continue
         try:
             lexical = Path(os.path.abspath(spec_path.parent / spec_relative))
             relative = lexical.relative_to(loaded.root).as_posix()
