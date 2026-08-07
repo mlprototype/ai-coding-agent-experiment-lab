@@ -44,8 +44,11 @@ from agentlab.phase7_inventory import (
     _ObservationResult,
     _observe_file,
     _observe_tree,
+    _open_publication_parent,
     _publish_file_no_replace,
     _read_regular_file,
+    _rollback_file,
+    _rollback_published_outputs,
     _snapshot_revalidate,
     _snapshot_root,
     canonical_inventory_json_bytes,
@@ -1441,12 +1444,20 @@ def test_publication_rolls_back_owned_outputs_after_later_publish_failure(
         relative: str,
         content: bytes,
         label: str,
+        *,
+        publication_parent: Any = None,
     ) -> tuple[int, int, int, int]:
         nonlocal calls
         calls += 1
         if calls == 2:
             raise InventoryPublicationError("synthetic publish failure")
-        return _publish_file_no_replace(snapshot, relative, content, label)
+        return _publish_file_no_replace(
+            snapshot,
+            relative,
+            content,
+            label,
+            publication_parent=publication_parent,
+        )
 
     monkeypatch.setattr(
         "agentlab.phase7_inventory._publish_file_no_replace",
@@ -1464,6 +1475,268 @@ def test_publication_rolls_back_owned_outputs_after_later_publish_failure(
     assert not (tmp_path / "inventory.json").exists()
     assert not (tmp_path / "inventory.md").exists()
     assert not (tmp_path / "inventory.metadata.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("output_relatives", "parent_relatives"),
+    [
+        (
+            (
+                "outputs/inventory.json",
+                "outputs/inventory.md",
+                "outputs/inventory.metadata.json",
+            ),
+            ("outputs",),
+        ),
+        (
+            (
+                "outputs-a/inventory.json",
+                "outputs-b/inventory.md",
+                "outputs-c/inventory.metadata.json",
+            ),
+            ("outputs-a", "outputs-b", "outputs-c"),
+        ),
+    ],
+    ids=["same-parent", "different-parents"],
+)
+def test_publication_allows_owned_parent_metadata_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_relatives: tuple[str, str, str],
+    parent_relatives: tuple[str, ...],
+) -> None:
+    request_path = _request(
+        tmp_path,
+        artifact_path="artifact.json",
+        artifact_bytes=b'{"reviewed_commit":"' + HEAD.encode() + b'"}\n',
+    )
+    for parent_relative in parent_relatives:
+        (tmp_path / parent_relative).mkdir(parents=True)
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._observe_execution_repository_head",
+        lambda _root: HEAD,
+    )
+    before = {
+        relative: os.stat(tmp_path / relative)
+        for relative in parent_relatives
+    }
+
+    create_inventory_publication(
+        request_path=request_path,
+        repository_root=tmp_path,
+        output_path=tmp_path / output_relatives[0],
+        markdown_path=tmp_path / output_relatives[1],
+        metadata_path=tmp_path / output_relatives[2],
+        confirm_local_execution=True,
+    )
+
+    for relative in output_relatives:
+        assert (tmp_path / relative).is_file()
+    after = {relative: os.stat(tmp_path / relative) for relative in parent_relatives}
+    assert all(
+        (before[relative].st_mtime_ns, before[relative].st_ctime_ns, before[relative].st_size)
+        != (after[relative].st_mtime_ns, after[relative].st_ctime_ns, after[relative].st_size)
+        for relative in parent_relatives
+    )
+
+
+@pytest.mark.parametrize("replacement", ["directory", "symlink"])
+def test_publication_parent_rebind_is_rejected(
+    tmp_path: Path,
+    replacement: str,
+) -> None:
+    parent_path = tmp_path / "outputs"
+    parent_path.mkdir()
+    snapshot = _snapshot_root(tmp_path)
+    publication_parent = _open_publication_parent(snapshot, "outputs", "synthetic")
+    replacement_target = tmp_path / "replacement-target"
+    replacement_target.mkdir()
+    try:
+        parent_path.rename(tmp_path / "outputs-original")
+        if replacement == "directory":
+            parent_path.mkdir()
+        else:
+            parent_path.symlink_to(replacement_target, target_is_directory=True)
+        with pytest.raises(InventoryPublicationError, match="parent"):
+            _publish_file_no_replace(
+                snapshot,
+                "outputs/published.json",
+                b"payload",
+                "synthetic",
+                publication_parent=publication_parent,
+            )
+        assert not (replacement_target / "published.json").exists()
+    finally:
+        publication_parent.close()
+        snapshot.close()
+
+
+@pytest.mark.parametrize("mutation", ["replace", "hardlink", "truncate"])
+def test_owned_output_rollback_rejects_changed_file(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    parent_path = tmp_path / "outputs"
+    parent_path.mkdir()
+    snapshot = _snapshot_root(tmp_path)
+    publication_parent = _open_publication_parent(snapshot, "outputs", "synthetic")
+    relative = "outputs/published.json"
+    try:
+        identity = _publish_file_no_replace(
+            snapshot,
+            relative,
+            b"payload",
+            "synthetic",
+            publication_parent=publication_parent,
+        )
+        output_path = parent_path / "published.json"
+        if mutation == "replace":
+            replacement = parent_path / "replacement.json"
+            replacement.write_bytes(b"payload")
+            replacement.replace(output_path)
+        elif mutation == "hardlink":
+            sibling = parent_path / "sibling.json"
+            sibling.write_bytes(b"payload")
+            output_path.unlink()
+            os.link(sibling, output_path)
+        else:
+            with output_path.open("r+b") as handle:
+                handle.truncate(0)
+        with pytest.raises(InventoryPublicationError, match="changed"):
+            _rollback_file(
+                snapshot,
+                relative,
+                identity,
+                publication_parent=publication_parent,
+            )
+        assert output_path.exists()
+    finally:
+        publication_parent.close()
+        snapshot.close()
+
+
+def test_owned_output_rollback_attempts_all_outputs_after_one_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_path = tmp_path / "outputs"
+    parent_path.mkdir()
+    snapshot = _snapshot_root(tmp_path)
+    publication_parent = _open_publication_parent(snapshot, "outputs", "synthetic")
+    try:
+        first_identity = _publish_file_no_replace(
+            snapshot,
+            "outputs/first.json",
+            b"first",
+            "first",
+            publication_parent=publication_parent,
+        )
+        second_identity = _publish_file_no_replace(
+            snapshot,
+            "outputs/second.json",
+            b"second",
+            "second",
+            publication_parent=publication_parent,
+        )
+        original_rollback = _rollback_file
+        calls: list[str] = []
+
+        def fail_first_rollback(
+            snapshot_arg: Any,
+            relative: str,
+            identity: tuple[int, int, int, int],
+            *,
+            publication_parent: Any = None,
+        ) -> None:
+            calls.append(relative)
+            if relative.endswith("first.json"):
+                raise InventoryPublicationError("synthetic rollback failure")
+            original_rollback(
+                snapshot_arg,
+                relative,
+                identity,
+                publication_parent=publication_parent,
+            )
+
+        monkeypatch.setattr(
+            "agentlab.phase7_inventory._rollback_file",
+            fail_first_rollback,
+        )
+        failures = _rollback_published_outputs(
+            snapshot,
+            (
+                ("outputs/first.json", first_identity),
+                ("outputs/second.json", second_identity),
+            ),
+            {"outputs": publication_parent},
+        )
+        assert calls == ["outputs/second.json", "outputs/first.json"]
+        assert not (parent_path / "second.json").exists()
+        assert (parent_path / "first.json").exists()
+        assert len(failures) == 1
+        assert failures[0][0] == "outputs/first.json"
+    finally:
+        publication_parent.close()
+        snapshot.close()
+
+
+def test_publication_reports_original_and_rollback_failures_separately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_path = _request(
+        tmp_path,
+        artifact_path="artifact.json",
+        artifact_bytes=b'{"reviewed_commit":"' + HEAD.encode() + b'"}\n',
+    )
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._observe_execution_repository_head",
+        lambda _root: HEAD,
+    )
+    calls = 0
+
+    def fail_on_second(
+        snapshot: Any,
+        relative: str,
+        content: bytes,
+        label: str,
+        *,
+        publication_parent: Any = None,
+    ) -> tuple[int, int, int, int]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise InventoryPublicationError("synthetic original publication failure")
+        return _publish_file_no_replace(
+            snapshot,
+            relative,
+            content,
+            label,
+            publication_parent=publication_parent,
+        )
+
+    def fail_rollback(*_args: Any, **_kwargs: Any) -> None:
+        raise InventoryPublicationError("synthetic rollback failure")
+
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._publish_file_no_replace",
+        fail_on_second,
+    )
+    monkeypatch.setattr("agentlab.phase7_inventory._rollback_file", fail_rollback)
+    with pytest.raises(InventoryPublicationError) as raised:
+        create_inventory_publication(
+            request_path=request_path,
+            repository_root=tmp_path,
+            output_path=tmp_path / "inventory.json",
+            markdown_path=tmp_path / "inventory.md",
+            metadata_path=tmp_path / "inventory.metadata.json",
+            confirm_local_execution=True,
+        )
+    message = str(raised.value)
+    assert "synthetic original publication failure" in message
+    assert "synthetic rollback failure" in message
+    assert isinstance(raised.value.__cause__, InventoryPublicationError)
+    assert (tmp_path / "inventory.json").exists()
 
 
 def test_release_request_requires_one_current_and_manifest_binding() -> None:
