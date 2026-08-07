@@ -2712,6 +2712,49 @@ def _inventory_entry_states(
     return storage, integrity
 
 
+def _finalize_release_integrity(
+    *,
+    observation_integrity: IntegrityState,
+    commit_verification: IntegrityState,
+    findings: Sequence[InventoryFinding],
+) -> IntegrityState:
+    """Compute one Release state after every Release signal is available.
+
+    A provisional commit state must not downgrade a clean Artifact snapshot
+    permanently, and a later successful commit observation must not erase an
+    Artifact or semantic failure.  The final state therefore follows the
+    contract priority: drift is strongest, unavailable verification is next,
+    and only an entirely clean set of signals is verified.
+    """
+    if observation_integrity is IntegrityState.DRIFTED:
+        return IntegrityState.DRIFTED
+    if commit_verification is IntegrityState.DRIFTED:
+        return IntegrityState.DRIFTED
+    if any(
+        finding.code
+        not in {
+            FindingCode.ARTIFACT_MISSING,
+            FindingCode.ARTIFACT_REVIEWED_COMMIT_NOT_VERIFIABLE,
+        }
+        for finding in findings
+    ):
+        return IntegrityState.DRIFTED
+    if (
+        observation_integrity is IntegrityState.NOT_VERIFIABLE
+        or commit_verification is IntegrityState.NOT_VERIFIABLE
+        or any(
+            finding.code
+            in {
+                FindingCode.ARTIFACT_MISSING,
+                FindingCode.ARTIFACT_REVIEWED_COMMIT_NOT_VERIFIABLE,
+            }
+            for finding in findings
+        )
+    ):
+        return IntegrityState.NOT_VERIFIABLE
+    return IntegrityState.VERIFIED
+
+
 def _provider_counts(
     *,
     request: EvidenceInventoryRequest,
@@ -3385,6 +3428,8 @@ def _build_inventory(
             all_contents[reference.path] = authority.content
 
     release_outputs: list[InventoryReleaseEntry] = []
+    release_observation_integrity: dict[str, IntegrityState] = {}
+    release_commit_verification: dict[str, IntegrityState] = {}
     campaign_outputs: list[InventoryCampaignEntry] = []
     for release_entry in request.release_entries:
         observations, entry_findings, contents = _observe_entry(
@@ -3401,10 +3446,8 @@ def _build_inventory(
         release_commits_by_id[release_entry.release_id] = frozenset()
         commit_state = IntegrityState.NOT_VERIFIABLE
         storage, integrity = _inventory_entry_states(observations)
-        if commit_state is IntegrityState.DRIFTED:
-            integrity = IntegrityState.DRIFTED
-        elif commit_state is IntegrityState.NOT_VERIFIABLE and integrity is IntegrityState.VERIFIED:
-            integrity = IntegrityState.NOT_VERIFIABLE
+        release_observation_integrity[release_entry.release_id] = integrity
+        release_commit_verification[release_entry.release_id] = commit_state
         release_outputs.append(
             InventoryReleaseEntry(
                 release_id=release_entry.release_id,
@@ -3537,21 +3580,13 @@ def _build_inventory(
             role="release",
         )
         findings.extend(commit_findings)
+        release_commit_verification[release_entry.release_id] = commit_state
         for index, output in enumerate(release_outputs):
             if output.release_id != release_entry.release_id:
                 continue
-            integrity = output.integrity_state
-            if commit_state is IntegrityState.DRIFTED:
-                integrity = IntegrityState.DRIFTED
-            elif (
-                commit_state is IntegrityState.NOT_VERIFIABLE
-                and integrity is IntegrityState.VERIFIED
-            ):
-                integrity = IntegrityState.NOT_VERIFIABLE
             release_outputs[index] = output.model_copy(
                 update={
                     "commit_verification": commit_state,
-                    "integrity_state": integrity,
                 }
             )
             break
@@ -3565,12 +3600,14 @@ def _build_inventory(
             if finding.subject_kind == "release"
             and finding.subject_id == release_output.release_id
         ]
-        integrity = release_output.integrity_state
-        if any(finding.code is FindingCode.ARTIFACT_MISSING for finding in release_findings):
-            integrity = IntegrityState.NOT_VERIFIABLE
-        elif release_findings and integrity is IntegrityState.VERIFIED:
-            integrity = IntegrityState.DRIFTED
-        release_outputs[index] = release_output.model_copy(update={"integrity_state": integrity})
+        integrity = _finalize_release_integrity(
+            observation_integrity=release_observation_integrity[release_output.release_id],
+            commit_verification=release_commit_verification[release_output.release_id],
+            findings=release_findings,
+        )
+        release_outputs[index] = release_output.model_copy(
+            update={"integrity_state": integrity}
+        )
 
     for index, campaign_output in enumerate(campaign_outputs):
         campaign_findings = [

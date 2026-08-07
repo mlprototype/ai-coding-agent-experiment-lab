@@ -39,6 +39,7 @@ from agentlab.phase7_inventory import (
     ReleaseEntry,
     RetentionExpectation,
     RetentionState,
+    _finalize_release_integrity,
     _finding,
     _ObservationResult,
     _observe_file,
@@ -1692,6 +1693,187 @@ def test_semantic_finding_propagates_to_entry_and_retention(
         and finding.code is FindingCode.CROSS_ARTIFACT_MISMATCH
         for finding in inventory.findings
     )
+
+
+def test_release_integrity_finalization_obeys_drift_and_unverifiable_priority() -> None:
+    public_suite_finding = _finding(
+        FindingCode.CROSS_ARTIFACT_MISMATCH,
+        subject_kind="release",
+        subject_id="release-current",
+        role="suite_manifest",
+    )
+    missing_finding = _finding(
+        FindingCode.ARTIFACT_MISSING,
+        subject_kind="release",
+        subject_id="release-current",
+        role="bundle_root",
+        path="bundle",
+    )
+
+    assert (
+        _finalize_release_integrity(
+            observation_integrity=IntegrityState.VERIFIED,
+            commit_verification=IntegrityState.VERIFIED,
+            findings=(),
+        )
+        is IntegrityState.VERIFIED
+    )
+    assert (
+        _finalize_release_integrity(
+            observation_integrity=IntegrityState.VERIFIED,
+            commit_verification=IntegrityState.DRIFTED,
+            findings=(),
+        )
+        is IntegrityState.DRIFTED
+    )
+    assert (
+        _finalize_release_integrity(
+            observation_integrity=IntegrityState.VERIFIED,
+            commit_verification=IntegrityState.VERIFIED,
+            findings=(public_suite_finding,),
+        )
+        is IntegrityState.DRIFTED
+    )
+    assert (
+        _finalize_release_integrity(
+            observation_integrity=IntegrityState.DRIFTED,
+            commit_verification=IntegrityState.VERIFIED,
+            findings=(),
+        )
+        is IntegrityState.DRIFTED
+    )
+    assert (
+        _finalize_release_integrity(
+            observation_integrity=IntegrityState.NOT_VERIFIABLE,
+            commit_verification=IntegrityState.VERIFIED,
+            findings=(),
+        )
+        is IntegrityState.NOT_VERIFIABLE
+    )
+    assert (
+        _finalize_release_integrity(
+            observation_integrity=IntegrityState.VERIFIED,
+            commit_verification=IntegrityState.VERIFIED,
+            findings=(missing_finding,),
+        )
+        is IntegrityState.NOT_VERIFIABLE
+    )
+
+
+def test_clean_release_finalization_allows_local_retention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from agentlab import phase7_inventory
+
+    manifest = b"manifest\n"
+    checksums = b"checksums\n"
+    anchor = b"anchor\n"
+    (tmp_path / "manifest.json").write_bytes(manifest)
+    (tmp_path / "checksums.json").write_bytes(checksums)
+    (tmp_path / "anchor.json").write_bytes(anchor)
+    (tmp_path / "bundle").mkdir()
+
+    release = ReleaseEntry(
+        release_id="release-current",
+        artifact_reviewed_commits=[HEAD],
+        commit_verification_mode=CommitVerificationMode.INTERNAL_REQUIRED,
+        classification=ReleaseClassification.ACCEPTED_CURRENT,
+        verification_profile="phase6_public_suite",
+        declaration_basis="clean release finalization regression",
+        accepted_manifest_reference_id="accepted-manifest",
+        file_artifacts=[
+            ExpectedFileArtifact(
+                role="suite_manifest",
+                path="manifest.json",
+                byte_count=len(manifest),
+                sha256=_sha256(manifest),
+            ),
+            ExpectedFileArtifact(
+                role="checksums",
+                path="checksums.json",
+                byte_count=len(checksums),
+                sha256=_sha256(checksums),
+            ),
+            ExpectedFileArtifact(
+                role="external_anchor",
+                path="anchor.json",
+                byte_count=len(anchor),
+                sha256=_sha256(anchor),
+            ),
+        ],
+        trees=[
+            ExpectedTree(
+                role="bundle_root",
+                root_path="bundle",
+                file_artifacts=[],
+                expected_file_count=0,
+                tree_sha256=compute_tree_sha256({}, []),
+            )
+        ],
+    )
+    authority = AuthorityReference(
+        reference_id="accepted-manifest",
+        kind="accepted_manifest",
+        path="manifest.json",
+        byte_count=len(manifest),
+        sha256=_sha256(manifest),
+        description="clean release finalization authority",
+    )
+    request = EvidenceInventoryRequest(
+        schema_version="1.0",
+        inventory_id="clean-release-finalization",
+        authoritative=False,
+        scope=InventoryScope.PHASE6,
+        source_of_truth_references=[authority],
+        release_entries=[release],
+        retention_expectations=[
+            RetentionExpectation(
+                subject_kind="release",
+                subject_id=release.release_id,
+                expected_retention_state=RetentionState.LOCAL_ONLY,
+                declaration_basis="clean release local retention regression",
+            )
+        ],
+    )
+    request_path = tmp_path / "request.json"
+    request_path.write_bytes(canonical_inventory_json_bytes(request))
+    validated = SimpleNamespace(
+        loaded=SimpleNamespace(manifest=SimpleNamespace(primary_sources=[]))
+    )
+    monkeypatch.setattr(
+        phase7_inventory,
+        "_known_contract_is_valid",
+        lambda _role, _content, **_kwargs: True,
+    )
+    monkeypatch.setattr(phase7_inventory, "_release_binding_findings", lambda **_kwargs: ())
+    monkeypatch.setattr(
+        phase7_inventory,
+        "_phase6_public_suite_findings",
+        lambda **_kwargs: (
+            (),
+            (SimpleNamespace(reviewed_commit=HEAD),),
+            validated,
+        ),
+    )
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._observe_execution_repository_head",
+        lambda _root: HEAD,
+    )
+
+    inventory = verify_inventory_request(
+        request_path=request_path,
+        repository_root=tmp_path,
+        confirm_local_execution=True,
+    )
+
+    assert inventory.verification_status.value == "verified"
+    assert inventory.findings == []
+    assert inventory.releases[0].commit_verification is IntegrityState.VERIFIED
+    assert inventory.releases[0].integrity_state is IntegrityState.VERIFIED
+    assert inventory.retention[0].retention_state is RetentionState.LOCAL_ONLY
 
 
 def test_complete_campaign_profile_requires_all_phase6_roles() -> None:
