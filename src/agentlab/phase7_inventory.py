@@ -1086,6 +1086,7 @@ class _PublicationParent:
     relative: str
     path: Path
     fd: int
+    identity: tuple[int, int, int, int]
     components: tuple[tuple[int, str, int, tuple[int, int, int, int]], ...]
     owned_fds: tuple[int, ...]
 
@@ -1094,10 +1095,9 @@ class _PublicationParent:
             if self.relative == "":
                 current_path = self.path.lstat()
                 current_fd = os.fstat(self.fd)
-                expected = _publication_directory_identity(current_fd)
                 if (
-                    _publication_directory_identity(current_path) != expected
-                    or _publication_directory_identity(current_fd) != expected
+                    _publication_directory_identity(current_path) != self.identity
+                    or _publication_directory_identity(current_fd) != self.identity
                 ):
                     raise InventoryPublicationError(
                         f"{label} parent directory identity changed"
@@ -1771,6 +1771,129 @@ def _read_request_file(
     return result.content
 
 
+def _longest_publication_parent(
+    relative: str,
+    publication_parents: Mapping[str, _PublicationParent],
+) -> tuple[str, _PublicationParent] | None:
+    matches = [
+        (parent_relative, parent)
+        for parent_relative, parent in publication_parents.items()
+        if parent_relative == ""
+        or relative == parent_relative
+        or relative.startswith(f"{parent_relative}/")
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda item: len(PurePosixPath(item[0]).parts))
+
+
+def _open_revalidation_directory(
+    snapshot: _InventorySnapshot,
+    relative: str,
+    label: str,
+    publication_parents: Mapping[str, _PublicationParent],
+) -> tuple[int | None, Literal["missing", "unsafe"] | None, tuple[int, ...]]:
+    """Open a tracked directory from the longest fixed publication parent.
+
+    Only the exact publication parent is allowed to relax directory metadata.
+    Every descendant component is opened ephemerally and checked with the
+    complete input-snapshot identity.
+    """
+    match = _longest_publication_parent(relative, publication_parents)
+    if match is None:
+        return _open_snapshot_directory_ephemeral(
+            snapshot,
+            relative,
+            label,
+            final_kind="directory",
+        )
+    parent_relative, publication_parent = match
+    publication_parent.require_stable(label)
+    if relative == parent_relative:
+        return publication_parent.fd, None, ()
+
+    base_parts = PurePosixPath(parent_relative).parts
+    relative_parts = PurePosixPath(relative).parts
+    suffix_parts = relative_parts[len(base_parts) :]
+    parent_fd = publication_parent.fd
+    current_relative = parent_relative
+    owned: list[int] = []
+
+    def close_owned() -> None:
+        for descriptor in reversed(owned):
+            with suppress(OSError):
+                os.close(descriptor)
+        owned.clear()
+
+    try:
+        for index, component in enumerate(suffix_parts):
+            child_relative = (
+                component
+                if not current_relative
+                else f"{current_relative}/{component}"
+            )
+            is_final = index == len(suffix_parts) - 1
+            try:
+                before = os.stat(
+                    component,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                close_owned()
+                return None, "missing", ()
+            except OSError as error:
+                raise InventorySafetyError(
+                    f"could not inspect {label} parent"
+                ) from error
+            if stat.S_ISLNK(before.st_mode):
+                if is_final:
+                    close_owned()
+                    return None, "unsafe", ()
+                raise InventorySafetyError(f"{label} contains a symlinked parent")
+            if not stat.S_ISDIR(before.st_mode):
+                if is_final:
+                    close_owned()
+                    return None, "unsafe", ()
+                close_owned()
+                return None, "missing", ()
+            try:
+                descriptor = os.open(
+                    component,
+                    _directory_open_flags(),
+                    dir_fd=parent_fd,
+                )
+                owned.append(descriptor)
+                opened = os.fstat(descriptor)
+                after = os.stat(
+                    component,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                close_owned()
+                raise InventorySafetyError(
+                    f"{label} directory changed while opening"
+                ) from error
+            if _identity(before) != _identity(opened) or _identity(after) != _identity(opened):
+                close_owned()
+                raise InventorySafetyError(f"{label} directory changed while opening")
+            expected = snapshot.directory_identities.get(child_relative)
+            if expected is not None and _identity(opened) != expected:
+                close_owned()
+                raise InventorySafetyError(f"{label} directory identity changed")
+            parent_fd = descriptor
+            current_relative = child_relative
+        publication_parent.require_stable(label)
+        return parent_fd, None, tuple(owned)
+    except InventorySafetyError:
+        close_owned()
+        raise
+    except OSError as error:
+        close_owned()
+        raise InventorySafetyError(f"{label} directory could not be revalidated") from error
+
+
 def _snapshot_revalidate(
     snapshot: _InventorySnapshot,
     *,
@@ -1796,11 +1919,6 @@ def _snapshot_revalidate(
         except OSError as error:
             raise InventorySafetyError("repository root could not be revalidated") from error
 
-    def is_under_publication_parent(relative: str, parent_relative: str) -> bool:
-        if parent_relative == "":
-            return relative == ""
-        return relative == parent_relative or relative.startswith(f"{parent_relative}/")
-
     # Re-open each named directory from the fixed root descriptor.  This checks
     # the name-to-inode relation as well as the held descriptor identity, so a
     # parent swap cannot silently redirect a later read or publish.
@@ -1808,16 +1926,13 @@ def _snapshot_revalidate(
         snapshot.directory_identities.items(),
         key=lambda item: (len(PurePosixPath(item[0]).parts), item[0]),
     ):
-        if any(
-            is_under_publication_parent(relative, parent_relative)
-            for parent_relative in publication_parents
-        ):
+        if relative in publication_parents:
             continue
-        descriptor, state, directory_owned_descriptors = _open_snapshot_directory_ephemeral(
+        descriptor, state, directory_owned_descriptors = _open_revalidation_directory(
             snapshot,
             relative,
             f"snapshot directory {relative or '.'}",
-            final_kind="directory",
+            publication_parents,
         )
         if state is not None or descriptor is None:
             raise InventorySafetyError("observed directory disappeared during snapshot")
@@ -1833,15 +1948,20 @@ def _snapshot_revalidate(
 
     for relative, expected_file_identity in snapshot.file_identities.items():
         parent_relative, filename = _relative_parent(relative)
-        publication_parent = publication_parents.get(parent_relative)
+        publication_parent = _longest_publication_parent(
+            parent_relative,
+            publication_parents,
+        )
         parent_fd: int | None
         parent_state: Literal["missing", "unsafe"] | None
         file_owned_descriptors: tuple[int, ...]
         if publication_parent is not None:
-            publication_parent.require_stable(f"snapshot file {relative}")
-            parent_fd = publication_parent.fd
-            parent_state = None
-            file_owned_descriptors = ()
+            parent_fd, parent_state, file_owned_descriptors = _open_revalidation_directory(
+                snapshot,
+                parent_relative,
+                f"snapshot file {relative}",
+                publication_parents,
+            )
         else:
             parent_fd, parent_state, file_owned_descriptors = _open_snapshot_directory_ephemeral(
                 snapshot,
@@ -1879,8 +1999,8 @@ def _snapshot_revalidate(
                 with suppress(OSError):
                     os.close(owned_descriptor)
 
-    for publication_parent in publication_parents.values():
-        publication_parent.require_stable("publication")
+    for parent in publication_parents.values():
+        parent.require_stable("publication")
 
 
 def _known_contract_is_valid(
@@ -4325,8 +4445,24 @@ def _preflight_outputs(
     raise InventoryPublicationError("output collision: complete publication already exists")
 
 
-def _publication_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
-    return metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size
+def _publication_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int]:
+    """Capture the complete file identity used for owned-output rollback."""
+    return _identity(metadata)
+
+
+def _same_published_file_object(
+    metadata: os.stat_result,
+    expected: tuple[int, int, int, int, int, int, int],
+) -> bool:
+    """Compare the object fields that survive the staging link transition."""
+    return (
+        metadata.st_dev == expected[0]
+        and metadata.st_ino == expected[1]
+        and metadata.st_mode == expected[2]
+        and metadata.st_size == expected[4]
+    )
 
 
 def _open_publication_parent(
@@ -4343,10 +4479,22 @@ def _open_publication_parent(
     identity is used here.
     """
     if relative == "":
+        try:
+            path_identity = _publication_directory_identity(snapshot.root.lstat())
+            descriptor_identity = _publication_directory_identity(
+                os.fstat(snapshot.root_fd)
+            )
+        except (OSError, ValueError) as error:
+            raise InventoryPublicationError(
+                f"{label} parent could not be opened safely"
+            ) from error
+        if path_identity != descriptor_identity:
+            raise InventoryPublicationError(f"{label} parent changed while being opened")
         return _PublicationParent(
             relative="",
             path=snapshot.root,
             fd=snapshot.root_fd,
+            identity=descriptor_identity,
             components=(),
             owned_fds=(),
         )
@@ -4403,6 +4551,7 @@ def _open_publication_parent(
             relative=relative,
             path=snapshot.root / relative,
             fd=parent_fd,
+            identity=components[-1][3],
             components=tuple(components),
             owned_fds=tuple(owned_fds),
         )
@@ -4413,6 +4562,139 @@ def _open_publication_parent(
         raise
 
 
+def _cleanup_owned_publication_path(
+    parent_fd: int,
+    name: str,
+    expected: tuple[int, int, int, int, int, int, int] | None,
+    label: str,
+) -> tuple[tuple[Exception, ...], bool]:
+    """Remove one owned path only when its complete identity still matches."""
+    def with_cause(message: str, cause: OSError) -> InventoryPublicationError:
+        failure = InventoryPublicationError(message)
+        failure.__cause__ = cause
+        return failure
+
+    failures: list[Exception] = []
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return (), True
+    except OSError as error:
+        return (
+            with_cause(f"{label} cleanup could not inspect path", error),
+        ), False
+    if (
+        expected is None
+        or _publication_identity(current) != expected
+        or not stat.S_ISREG(current.st_mode)
+    ):
+        return (
+            InventoryPublicationError(f"{label} cleanup refused a changed path"),
+        ), False
+    try:
+        os.unlink(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return (), True
+    except OSError as error:
+        failures.append(with_cause(f"{label} cleanup unlink failed", error))
+    try:
+        os.fsync(parent_fd)
+    except OSError as error:
+        failures.append(with_cause(f"{label} cleanup fsync failed", error))
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return tuple(failures), True
+    except OSError as error:
+        failures.append(with_cause(f"{label} cleanup residual check failed", error))
+        return tuple(failures), False
+    failures.append(InventoryPublicationError(f"{label} cleanup left a residual path"))
+    return tuple(failures), False
+
+
+def _cleanup_owned_publication_paths(
+    *,
+    parent_fd: int,
+    filename: str,
+    staging_name: str | None,
+    staging_identity: tuple[int, int, int, int, int, int, int] | None,
+    link_identity: tuple[int, int, int, int, int, int, int] | None,
+    committed_identity: tuple[int, int, int, int, int, int, int] | None,
+    descriptor: int | None,
+) -> tuple[Exception, ...]:
+    """Try final and staging cleanup independently, including hard-link state."""
+    failures: list[Exception] = []
+    if link_identity is None:
+        if staging_name is not None:
+            staging_failures, _ = _cleanup_owned_publication_path(
+                parent_fd,
+                staging_name,
+                staging_identity,
+                "publication staging",
+            )
+            failures.extend(staging_failures)
+        return tuple(failures)
+
+    def descriptor_identity() -> tuple[int, int, int, int, int, int, int] | None:
+        if descriptor is None:
+            return None
+        try:
+            return _publication_identity(os.fstat(descriptor))
+        except OSError as error:
+            failure = InventoryPublicationError(
+                "publication cleanup could not inspect owned descriptor"
+            )
+            failure.__cause__ = error
+            failures.append(failure)
+            return None
+
+    if staging_name is not None:
+        staging_failures, staging_removed = _cleanup_owned_publication_path(
+            parent_fd,
+            staging_name,
+            link_identity,
+            "publication staging",
+        )
+        failures.extend(staging_failures)
+        if staging_removed:
+            expected_final = committed_identity or descriptor_identity()
+            final_failures, _ = _cleanup_owned_publication_path(
+                parent_fd,
+                filename,
+                expected_final,
+                "publication final",
+            )
+            failures.extend(final_failures)
+            return tuple(failures)
+
+        final_failures, final_removed = _cleanup_owned_publication_path(
+            parent_fd,
+            filename,
+            link_identity,
+            "publication final",
+        )
+        failures.extend(final_failures)
+        if final_removed:
+            post_link_identity = committed_identity or descriptor_identity()
+            retry_failures, _ = _cleanup_owned_publication_path(
+                parent_fd,
+                staging_name,
+                post_link_identity,
+                "publication staging",
+            )
+            failures.extend(retry_failures)
+        return tuple(failures)
+
+    final_failures, _ = _cleanup_owned_publication_path(
+        parent_fd,
+        filename,
+        committed_identity or link_identity,
+        "publication final",
+    )
+    failures.extend(final_failures)
+    return tuple(failures)
+
+
 def _publish_file_no_replace(
     snapshot: _InventorySnapshot,
     relative: str,
@@ -4420,7 +4702,7 @@ def _publish_file_no_replace(
     label: str,
     *,
     publication_parent: _PublicationParent | None = None,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int, int, int]:
     parent_relative, filename = _relative_parent(relative)
     if publication_parent is None:
         parent_fd, state = _open_snapshot_directory(
@@ -4438,8 +4720,10 @@ def _publish_file_no_replace(
         parent_fd = publication_parent.fd
     descriptor: int | None = None
     staging_name: str | None = None
-    linked_identity: tuple[int, int, int, int] | None = None
-    published_successfully = False
+    staging_identity: tuple[int, int, int, int, int, int, int] | None = None
+    link_identity: tuple[int, int, int, int, int, int, int] | None = None
+    committed_identity: tuple[int, int, int, int, int, int, int] | None = None
+    original_error: Exception | None = None
     try:
         for _ in range(32):
             candidate = f".{filename}.phase7-{secrets.token_hex(10)}"
@@ -4465,10 +4749,7 @@ def _publish_file_no_replace(
             written = os.write(descriptor, view)
             view = view[written:]
         os.fsync(descriptor)
-        staged = os.fstat(descriptor)
-        linked_identity = _publication_identity(staged)
-        os.close(descriptor)
-        descriptor = None
+        staging_identity = _publication_identity(os.fstat(descriptor))
         os.link(
             staging_name,
             filename,
@@ -4476,13 +4757,17 @@ def _publish_file_no_replace(
             dst_dir_fd=parent_fd,
             follow_symlinks=False,
         )
+        link_identity = _publication_identity(os.fstat(descriptor))
         os.unlink(staging_name, dir_fd=parent_fd)
         staging_name = None
         if publication_parent is not None:
             publication_parent.require_stable(label)
+        committed_identity = _publication_identity(os.fstat(descriptor))
         published = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
         if (
-            _publication_identity(published) != linked_identity
+            committed_identity != _publication_identity(published)
+            or staging_identity is None
+            or not _same_published_file_object(published, staging_identity)
             or not stat.S_ISREG(published.st_mode)
             or published.st_nlink != 1
         ):
@@ -4490,37 +4775,65 @@ def _publish_file_no_replace(
         os.fsync(parent_fd)
         if publication_parent is not None:
             publication_parent.require_stable(label)
-        published_successfully = True
-        return linked_identity
-    except FileExistsError as error:
-        raise InventoryPublicationError(f"{label} already exists") from error
-    except InventoryPublicationError:
-        raise
-    except OSError as error:
-        raise InventoryPublicationError(f"could not publish {label}") from error
-    finally:
-        if not published_successfully and linked_identity is not None:
-            try:
-                current = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
-                if (
-                    _publication_identity(current) == linked_identity
-                    and stat.S_ISREG(current.st_mode)
-                    and current.st_nlink == 1
-                ):
-                    os.unlink(filename, dir_fd=parent_fd)
-            except OSError:
-                pass
-        if descriptor is not None:
+        committed_after = _publication_identity(os.fstat(descriptor))
+        path_after = _publication_identity(
+            os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+        )
+        if committed_after != committed_identity or path_after != committed_identity:
+            raise InventoryPublicationError(f"published {label} changed before completion")
+        committed_identity = committed_after
+    except Exception as error:
+        original_error = error
+
+    cleanup_failures: tuple[Exception, ...] = ()
+    if original_error is not None:
+        cleanup_failures = _cleanup_owned_publication_paths(
+            parent_fd=parent_fd,
+            filename=filename,
+            staging_name=staging_name,
+            staging_identity=staging_identity,
+            link_identity=link_identity,
+            committed_identity=committed_identity,
+            descriptor=descriptor,
+        )
+    if descriptor is not None:
+        try:
             os.close(descriptor)
-        if staging_name is not None:
-            with suppress(OSError):
-                os.unlink(staging_name, dir_fd=parent_fd)
+        except OSError as error:
+            failure = InventoryPublicationError("publication descriptor close failed")
+            failure.__cause__ = error
+            cleanup_failures += (failure,)
+        descriptor = None
+    if cleanup_failures:
+        details = "; ".join(
+            f"{type(error).__name__}: {error}" for error in cleanup_failures
+        )
+        if original_error is None:
+            raise InventoryPublicationError(
+                f"publication cleanup failed; cleanup={details}"
+            )
+        raise InventoryPublicationError(
+            f"publication failed with cleanup failures; "
+            f"original={type(original_error).__name__}: {original_error}; "
+            f"cleanup={details}"
+        ) from original_error
+    if original_error is not None:
+        if isinstance(original_error, InventoryPublicationError):
+            raise original_error
+        if isinstance(original_error, FileExistsError):
+            raise InventoryPublicationError(f"{label} already exists") from original_error
+        if isinstance(original_error, OSError):
+            raise InventoryPublicationError(f"could not publish {label}") from original_error
+        raise InventoryPublicationError(f"could not publish {label}") from original_error
+    if committed_identity is None:
+        raise InventoryPublicationError(f"published {label} has no committed identity")
+    return committed_identity
 
 
 def _rollback_file(
     snapshot: _InventorySnapshot,
     relative: str,
-    identity: tuple[int, int, int, int],
+    identity: tuple[int, int, int, int, int, int, int],
     *,
     publication_parent: _PublicationParent | None = None,
 ) -> None:
@@ -4564,7 +4877,7 @@ def _rollback_file(
 
 def _rollback_published_outputs(
     snapshot: _InventorySnapshot,
-    published: Sequence[tuple[str, tuple[int, int, int, int]]],
+    published: Sequence[tuple[str, tuple[int, int, int, int, int, int, int]]],
     publication_parents: Mapping[str, _PublicationParent],
 ) -> tuple[tuple[str, Exception], ...]:
     """Attempt every owned output and retain each individual rollback error."""
@@ -5179,7 +5492,7 @@ def create_inventory_publication(
                 parent_relative,
                 "output",
             )
-        published: list[tuple[str, tuple[int, int, int, int]]] = []
+        published: list[tuple[str, tuple[int, int, int, int, int, int, int]]] = []
         try:
             for relative, content, label in (
                 (output_relatives[0], inventory_bytes, "Inventory"),

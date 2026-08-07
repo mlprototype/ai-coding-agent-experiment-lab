@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import socket
+import stat
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -45,6 +46,7 @@ from agentlab.phase7_inventory import (
     _observe_file,
     _observe_tree,
     _open_publication_parent,
+    _open_snapshot_directory_ephemeral,
     _publish_file_no_replace,
     _read_regular_file,
     _rollback_file,
@@ -1571,7 +1573,195 @@ def test_publication_parent_rebind_is_rejected(
         snapshot.close()
 
 
-@pytest.mark.parametrize("mutation", ["replace", "hardlink", "truncate"])
+def test_linked_output_cleanup_uses_fixed_parent_after_rebind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_path = tmp_path / "outputs"
+    parent_path.mkdir()
+    snapshot = _snapshot_root(tmp_path)
+    publication_parent = _open_publication_parent(snapshot, "outputs", "synthetic")
+    original_require_stable = publication_parent.require_stable
+    calls = 0
+    try:
+        def rebind_after_link(label: str) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                parent_path.rename(tmp_path / "outputs-original")
+                parent_path.mkdir()
+                raise InventoryPublicationError("synthetic parent rebind after link")
+            original_require_stable(label)
+
+        monkeypatch.setattr(publication_parent, "require_stable", rebind_after_link)
+        with pytest.raises(InventoryPublicationError, match="parent rebind"):
+            _publish_file_no_replace(
+                snapshot,
+                "outputs/published.json",
+                b"payload",
+                "synthetic",
+                publication_parent=publication_parent,
+            )
+        assert not (parent_path / "published.json").exists()
+        assert not (tmp_path / "outputs-original" / "published.json").exists()
+        assert not list((tmp_path / "outputs-original").glob(".published.json.phase7-*"))
+    finally:
+        publication_parent.close()
+        snapshot.close()
+
+
+def test_final_cleanup_failure_is_reported_and_preserves_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_path = tmp_path / "outputs"
+    parent_path.mkdir()
+    snapshot = _snapshot_root(tmp_path)
+    publication_parent = _open_publication_parent(snapshot, "outputs", "synthetic")
+    original_require_stable = publication_parent.require_stable
+    original_unlink = os.unlink
+    calls = 0
+    try:
+        def fail_after_link(label: str) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise InventoryPublicationError("synthetic publication failure")
+            original_require_stable(label)
+
+        def fail_final_unlink(name: str, *args: Any, **kwargs: Any) -> None:
+            if name == "published.json":
+                raise OSError("synthetic final cleanup failure")
+            original_unlink(name, *args, **kwargs)
+
+        monkeypatch.setattr(publication_parent, "require_stable", fail_after_link)
+        monkeypatch.setattr("agentlab.phase7_inventory.os.unlink", fail_final_unlink)
+        with pytest.raises(InventoryPublicationError) as raised:
+            _publish_file_no_replace(
+                snapshot,
+                "outputs/published.json",
+                b"payload",
+                "synthetic",
+                publication_parent=publication_parent,
+            )
+        assert "synthetic publication failure" in str(raised.value)
+        assert "final cleanup unlink failed" in str(raised.value)
+        assert (parent_path / "published.json").exists()
+        assert not list(parent_path.glob(".published.json.phase7-*"))
+    finally:
+        publication_parent.close()
+        snapshot.close()
+
+
+def test_staging_cleanup_failure_is_reported_and_hidden_file_is_preserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_path = tmp_path / "outputs"
+    parent_path.mkdir()
+    snapshot = _snapshot_root(tmp_path)
+    publication_parent = _open_publication_parent(snapshot, "outputs", "synthetic")
+    original_unlink = os.unlink
+    try:
+        def fail_staging_unlink(name: str, *args: Any, **kwargs: Any) -> None:
+            if name.startswith(".published.json.phase7-"):
+                raise OSError("synthetic staging cleanup failure")
+            original_unlink(name, *args, **kwargs)
+
+        monkeypatch.setattr("agentlab.phase7_inventory.os.unlink", fail_staging_unlink)
+        with pytest.raises(InventoryPublicationError) as raised:
+            _publish_file_no_replace(
+                snapshot,
+                "outputs/published.json",
+                b"payload",
+                "synthetic",
+                publication_parent=publication_parent,
+            )
+        assert "staging cleanup unlink failed" in str(raised.value)
+        assert not (parent_path / "published.json").exists()
+        assert list(parent_path.glob(".published.json.phase7-*"))
+    finally:
+        publication_parent.close()
+        snapshot.close()
+
+
+def test_publication_root_mode_change_is_rejected(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot_root(tmp_path)
+    publication_parent = _open_publication_parent(snapshot, "", "synthetic")
+    original_mode = stat.S_IMODE(os.stat(tmp_path).st_mode)
+    changed_mode = original_mode ^ stat.S_IXGRP
+    try:
+        os.chmod(tmp_path, changed_mode)
+        with pytest.raises(InventoryPublicationError, match="identity changed"):
+            _publish_file_no_replace(
+                snapshot,
+                "published.json",
+                b"payload",
+                "synthetic",
+                publication_parent=publication_parent,
+            )
+        assert not (tmp_path / "published.json").exists()
+    finally:
+        os.chmod(tmp_path, original_mode)
+        publication_parent.close()
+        snapshot.close()
+
+
+def test_post_publication_revalidation_handles_nested_file_under_output_parent(
+    tmp_path: Path,
+) -> None:
+    input_tree = tmp_path / "outputs" / "input-tree"
+    input_tree.mkdir(parents=True)
+    input_file = input_tree / "input.json"
+    input_file.write_bytes(b"input")
+    snapshot = _snapshot_root(tmp_path)
+    publication_parent = _open_publication_parent(snapshot, "outputs", "synthetic")
+    try:
+        assert _read_regular_file(
+            tmp_path,
+            "outputs/input-tree/input.json",
+            "synthetic input",
+            snapshot=snapshot,
+        ).content == b"input"
+        (tmp_path / "outputs" / "published.json").write_bytes(b"output")
+        _snapshot_revalidate(snapshot, publication_parents={"outputs": publication_parent})
+    finally:
+        publication_parent.close()
+        snapshot.close()
+
+
+def test_post_publication_revalidation_detects_nested_empty_tree_change(
+    tmp_path: Path,
+) -> None:
+    input_tree = tmp_path / "outputs" / "input-tree"
+    input_tree.mkdir(parents=True)
+    snapshot = _snapshot_root(tmp_path)
+    publication_parent = _open_publication_parent(snapshot, "outputs", "synthetic")
+    try:
+        descriptor, state, owned = _open_snapshot_directory_ephemeral(
+            snapshot,
+            "outputs/input-tree",
+            "synthetic",
+        )
+        assert descriptor is not None
+        assert state is None
+        for owned_descriptor in reversed(owned):
+            os.close(owned_descriptor)
+        (input_tree / "external.txt").write_bytes(b"external")
+        with pytest.raises(InventorySafetyError, match="identity changed"):
+            _snapshot_revalidate(
+                snapshot,
+                publication_parents={"outputs": publication_parent},
+            )
+    finally:
+        publication_parent.close()
+        snapshot.close()
+@pytest.mark.parametrize(
+    "mutation",
+    ["replace", "hardlink", "truncate", "same-size-overwrite"],
+)
 def test_owned_output_rollback_rejects_changed_file(
     tmp_path: Path,
     mutation: str,
@@ -1599,9 +1789,12 @@ def test_owned_output_rollback_rejects_changed_file(
             sibling.write_bytes(b"payload")
             output_path.unlink()
             os.link(sibling, output_path)
-        else:
+        elif mutation == "truncate":
             with output_path.open("r+b") as handle:
                 handle.truncate(0)
+        else:
+            with output_path.open("r+b") as handle:
+                handle.write(b"changed")
         with pytest.raises(InventoryPublicationError, match="changed"):
             _rollback_file(
                 snapshot,
