@@ -64,3 +64,11 @@ Provider accounting scopeは常に`declared_campaign_entries`である。各Camp
 Phase 6固有のcall対応と9/10 Authority値との関係は、read-only declarationである[Provider accounting crosswalk](PHASE7A_PHASE6_PROVIDER_ACCOUNTING_CROSSWALK.md)に固定する。crosswalkはPhase 6 status又は9/10 Authority accountingを変更しない。
 
 Slice 7A-5のcurrent-only pilotは未実行であり、完了扱いではない。accepted superseded mirrorはownership-aware schemaを別途設計するまで未収載、Authorityがないcandidate／空directoryも未収載である。7A-4R2ではProvider、Gate、Replay、network、実Campaign、実Inventory、new model fixingをすべて0件とする。
+
+## Slice 7A-4R3 — Historical Legacy Contract Remediation
+
+Historical Artifactの再収載前には、Phase 6とPhase 7が同じcaller-owned byte snapshotを使う。Historical専用public facadeはPlan／Campaign schema `1.1`／`1.2`をstrict dispatchし、Historical Verification Recordを唯一のsource commit Authorityとして、Experiment ID、Recordの全SHA binding、legacy Campaign finished eventのProvider totalを返す。旧Workflow Report 1.0を含むHistorical Report JSONもtyped／canonical／duplicate-key拒否で検証する。
+
+Primary profileのPlan／Campaign 1.2限定は変更しない。Phase 7はprivate Phase 6 loaderやpath再読込を使わず、Historical profileのfile contract、Campaign provenance、Public Suite binding、Provider accounting、Retentionをこのfacadeの判定に束縛する。Historical facade検証が失敗したCampaignは`DRIFTED`としてfindingを持ち、Provider totalを0へ変換せず`unavailable`／`campaigns_without_total`へ伝播する。
+
+7A-4R3ではRequest作成、Request publisher、Inventory publication、Pilot、実Artifact変更、`.artifacts/phase7`作成、Provider／Gate／Replay／network実行、commit／pushを行わない。accepted superseded、candidate、Authorityのない空directoryは引き続き未収載であり、別承認・別schemaの対象である。

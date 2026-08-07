@@ -1774,12 +1774,20 @@ def _snapshot_revalidate(snapshot: _InventorySnapshot) -> None:
                     os.close(owned_descriptor)
 
 
-def _known_contract_is_valid(role: str, content: bytes) -> bool:
+def _known_contract_is_valid(
+    role: str,
+    content: bytes,
+    *,
+    verification_profile: str | None = None,
+) -> bool:
     """Use Phase 6 strict loaders for roles whose contract is known."""
-    if role == "report_markdown":
+    if role == "report_markdown" and verification_profile != "historical_verification":
         return True
     try:
-        from agentlab.phase6 import validate_phase6_snapshot_contract
+        from agentlab.phase6 import (
+            validate_historical_phase6_artifact_contract,
+            validate_phase6_snapshot_contract,
+        )
 
         known_roles = {
             "suite_manifest",
@@ -1795,7 +1803,14 @@ def _known_contract_is_valid(role: str, content: bytes) -> bool:
             "evidence",
             "spec",
         }
-        if role in known_roles:
+        if verification_profile == "historical_verification" and role in {
+            "plan",
+            "campaign",
+            "historical_verification",
+            "report_json",
+        }:
+            validate_historical_phase6_artifact_contract(role, content)
+        elif role in known_roles:
             validate_phase6_snapshot_contract(role, content)
         elif role in {"report_json", "diff_policy"}:
             raw = _strict_json_bytes(content, role)
@@ -1897,6 +1912,7 @@ def _observe_file(
     subject_id: str,
     expected: ExpectedFileArtifact,
     role_prefix: str | None = None,
+    verification_profile: str | None = None,
 ) -> _ObservationResult:
     read = _read_regular_file(
         root,
@@ -1974,7 +1990,15 @@ def _observe_file(
                 observed=read.sha256,
             )
         )
-    if not _known_contract_is_valid(expected.role, read.content):
+    if verification_profile == "historical_verification":
+        contract_valid = _known_contract_is_valid(
+            expected.role,
+            read.content,
+            verification_profile=verification_profile,
+        )
+    else:
+        contract_valid = _known_contract_is_valid(expected.role, read.content)
+    if not contract_valid:
         findings.append(
             _finding(
                 FindingCode.CANONICAL_LOAD_FAILED,
@@ -2032,6 +2056,7 @@ def _observe_tree(
     subject_kind: Literal["release", "campaign"],
     subject_id: str,
     tree: ExpectedTree,
+    verification_profile: str | None = None,
 ) -> _ObservationResult:
     findings: list[InventoryFinding] = []
     _watch_snapshot_entry(snapshot, tree.root_path, f"{subject_id} tree")
@@ -2266,6 +2291,7 @@ def _observe_tree(
             subject_kind=subject_kind,
             subject_id=subject_id,
             expected=full_expected,
+            verification_profile=verification_profile,
         )
         findings.extend(result.findings)
         contents.update(result.contents)
@@ -2519,6 +2545,7 @@ def _observe_entry(
     subject_id: str,
     file_artifacts: Sequence[ExpectedFileArtifact],
     trees: Sequence[ExpectedTree],
+    verification_profile: str | None = None,
 ) -> tuple[list[ArtifactObservation], list[InventoryFinding], dict[str, bytes]]:
     observations: list[ArtifactObservation] = []
     findings: list[InventoryFinding] = []
@@ -2530,6 +2557,7 @@ def _observe_entry(
             subject_kind=subject_kind,
             subject_id=subject_id,
             expected=expected,
+            verification_profile=verification_profile,
         )
         observations.append(result.observation)
         findings.extend(result.findings)
@@ -2541,6 +2569,7 @@ def _observe_entry(
             subject_kind=subject_kind,
             subject_id=subject_id,
             tree=tree,
+            verification_profile=verification_profile,
         )
         observations.append(result.observation)
         findings.extend(result.findings)
@@ -2607,19 +2636,19 @@ def _single_role_content(
 def _campaign_typed_provenance(
     entry: CampaignEntry,
     contents: Mapping[str, bytes],
-) -> tuple[frozenset[str], str | None]:
+) -> tuple[frozenset[str], str | None, bool]:
     """Derive only role-authorized Campaign provenance from stable bytes."""
     try:
         from agentlab.phase6 import (
-            derive_historical_source_reviewed_commit_from_bytes,
             derive_phase6_campaign_experiment_id_from_bytes,
             derive_primary_reviewed_commit_from_bytes,
+            validate_historical_phase6_snapshot,
         )
 
-        experiment_id = derive_phase6_campaign_experiment_id_from_bytes(
-            _single_role_content(entry, contents, CampaignArtifactRole.CAMPAIGN)
-        )
         if entry.verification_profile == "phase6_campaign_complete":
+            experiment_id = derive_phase6_campaign_experiment_id_from_bytes(
+                _single_role_content(entry, contents, CampaignArtifactRole.CAMPAIGN)
+            )
             reviewed_commit = derive_primary_reviewed_commit_from_bytes(
                 spec_bytes=_single_role_content(entry, contents, CampaignArtifactRole.SPEC),
                 fixture_manifest_bytes=_single_role_content(
@@ -2633,17 +2662,34 @@ def _campaign_typed_provenance(
                 ),
                 plan_bytes=_single_role_content(entry, contents, CampaignArtifactRole.PLAN),
             )
-            return frozenset({reviewed_commit}), experiment_id
+            return frozenset({reviewed_commit}), experiment_id, True
         if entry.verification_profile == "historical_verification":
-            reviewed_commit = derive_historical_source_reviewed_commit_from_bytes(
-                _single_role_content(
+            historical = validate_historical_phase6_snapshot(
+                record_bytes=_single_role_content(
                     entry, contents, CampaignArtifactRole.HISTORICAL_VERIFICATION
-                )
+                ),
+                plan_bytes=_single_role_content(entry, contents, CampaignArtifactRole.PLAN),
+                campaign_bytes=_single_role_content(
+                    entry, contents, CampaignArtifactRole.CAMPAIGN
+                ),
+                report_json_bytes=_single_role_content(
+                    entry, contents, CampaignArtifactRole.REPORT_JSON
+                ),
+                report_markdown_bytes=_single_role_content(
+                    entry, contents, CampaignArtifactRole.REPORT_MARKDOWN
+                ),
             )
-            return frozenset({reviewed_commit}), experiment_id
-        return frozenset(), experiment_id
+            return (
+                frozenset({historical.source_reviewed_commit}),
+                historical.experiment_id,
+                True,
+            )
+        experiment_id = derive_phase6_campaign_experiment_id_from_bytes(
+            _single_role_content(entry, contents, CampaignArtifactRole.CAMPAIGN)
+        )
+        return frozenset(), experiment_id, True
     except Exception:
-        return frozenset(), None
+        return frozenset(), None, False
 
 
 def _inventory_entry_states(
@@ -2679,7 +2725,10 @@ def _provider_counts(
     exposed as ``campaigns_without_total`` instead of being silently removed
     or converted into a numeric zero.
     """
-    from agentlab.phase6 import load_phase6_campaign_from_bytes
+    from agentlab.phase6 import (
+        load_phase6_campaign_from_bytes,
+        validate_historical_phase6_snapshot,
+    )
 
     observed = 0
     unknown_runs = 0
@@ -2743,12 +2792,55 @@ def _provider_counts(
                 )
             )
             continue
-        validation = load_phase6_campaign_from_bytes(content)
+        if campaign_entry.verification_profile == "historical_verification":
+            try:
+                historical = validate_historical_phase6_snapshot(
+                    record_bytes=_single_role_content(
+                        campaign_entry,
+                        subject_contents[("campaign", campaign_entry.campaign_id)],
+                        CampaignArtifactRole.HISTORICAL_VERIFICATION,
+                    ),
+                    plan_bytes=_single_role_content(
+                        campaign_entry,
+                        subject_contents[("campaign", campaign_entry.campaign_id)],
+                        CampaignArtifactRole.PLAN,
+                    ),
+                    campaign_bytes=content,
+                    report_json_bytes=_single_role_content(
+                        campaign_entry,
+                        subject_contents[("campaign", campaign_entry.campaign_id)],
+                        CampaignArtifactRole.REPORT_JSON,
+                    ),
+                    report_markdown_bytes=_single_role_content(
+                        campaign_entry,
+                        subject_contents[("campaign", campaign_entry.campaign_id)],
+                        CampaignArtifactRole.REPORT_MARKDOWN,
+                    ),
+                )
+                validation_is_valid = True
+                validation_total_status = "determined"
+                validation_provider_call_count = historical.provider_call_count
+                validation_provider_call_count_unknown_runs = (
+                    historical.provider_call_count_unknown_runs
+                )
+            except Exception:
+                validation_is_valid = False
+                validation_total_status = "unknown"
+                validation_provider_call_count = None
+                validation_provider_call_count_unknown_runs = None
+        else:
+            validation = load_phase6_campaign_from_bytes(content)
+            validation_is_valid = validation.is_valid
+            validation_total_status = validation.total_status
+            validation_provider_call_count = validation.provider_call_count
+            validation_provider_call_count_unknown_runs = (
+                validation.provider_call_count_unknown_runs
+            )
         if (
-            not validation.is_valid
-            or validation.total_status != "determined"
-            or validation.provider_call_count is None
-            or validation.provider_call_count_unknown_runs is None
+            not validation_is_valid
+            or validation_total_status != "determined"
+            or validation_provider_call_count is None
+            or validation_provider_call_count_unknown_runs is None
         ):
             campaigns_without_total += 1
             assert output is not None
@@ -2757,7 +2849,7 @@ def _provider_counts(
                 "provider_call_count_observed": None,
                 "provider_call_count_unknown_runs": None,
             }
-            if not validation.is_valid:
+            if not validation_is_valid:
                 # A Campaign accounting source which cannot satisfy its strict
                 # contract invalidates the subject itself.  This must happen
                 # before subject digests and retention are derived.
@@ -2775,20 +2867,22 @@ def _provider_counts(
                 output.model_copy(update=updates)
             )
             continue
-        observed += validation.provider_call_count
-        unknown_runs += validation.provider_call_count_unknown_runs
+        assert validation_provider_call_count is not None
+        assert validation_provider_call_count_unknown_runs is not None
+        observed += validation_provider_call_count
+        unknown_runs += validation_provider_call_count_unknown_runs
         assert output is not None
         total_status = (
             ProviderTotalStatus.OBSERVED
-            if validation.provider_call_count_unknown_runs == 0
+            if validation_provider_call_count_unknown_runs == 0
             else ProviderTotalStatus.PARTIALLY_UNKNOWN
         )
         updated_outputs.append(
             output.model_copy(
                 update={
                     "provider_total_status": total_status,
-                    "provider_call_count_observed": validation.provider_call_count,
-                    "provider_call_count_unknown_runs": validation.provider_call_count_unknown_runs,
+                    "provider_call_count_observed": validation_provider_call_count,
+                    "provider_call_count_unknown_runs": validation_provider_call_count_unknown_runs,
                 }
             )
         )
@@ -3299,6 +3393,7 @@ def _build_inventory(
             subject_id=release_entry.release_id,
             file_artifacts=release_entry.file_artifacts,
             trees=release_entry.trees,
+            verification_profile=release_entry.verification_profile,
         )
         findings.extend(entry_findings)
         findings.extend(_release_binding_findings(entry=release_entry, contents=contents))
@@ -3336,9 +3431,12 @@ def _build_inventory(
             subject_id=campaign_entry.campaign_id,
             file_artifacts=campaign_entry.file_artifacts,
             trees=campaign_entry.trees,
+            verification_profile=campaign_entry.verification_profile,
         )
         findings.extend(entry_findings)
-        commits, observed_experiment_id = _campaign_typed_provenance(campaign_entry, contents)
+        commits, observed_experiment_id, provenance_valid = _campaign_typed_provenance(
+            campaign_entry, contents
+        )
         commit_state, commit_findings = _commit_observation(
             subject_kind="campaign",
             subject_id=campaign_entry.campaign_id,
@@ -3358,6 +3456,25 @@ def _build_inventory(
                 )
             )
         storage, integrity = _inventory_entry_states(observations)
+        if (
+            campaign_entry.verification_profile == "historical_verification"
+            and not provenance_valid
+        ):
+            integrity = IntegrityState.DRIFTED
+            if not any(
+                finding.code is FindingCode.CANONICAL_LOAD_FAILED
+                and finding.subject_kind == "campaign"
+                and finding.subject_id == campaign_entry.campaign_id
+                for finding in findings
+            ):
+                findings.append(
+                    _finding(
+                        FindingCode.CANONICAL_LOAD_FAILED,
+                        subject_kind="campaign",
+                        subject_id=campaign_entry.campaign_id,
+                        role="historical_verification",
+                    )
+                )
         if commit_state is IntegrityState.DRIFTED:
             integrity = IntegrityState.DRIFTED
         elif commit_state is IntegrityState.NOT_VERIFIABLE and integrity is IntegrityState.VERIFIED:

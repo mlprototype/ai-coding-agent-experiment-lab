@@ -345,10 +345,11 @@ def _append_campaign(path: Path, event: CampaignRunEvent | CampaignFinishedEvent
                 os.close(descriptor)
 
 
-def load_campaign(path: Path) -> list[CampaignEvent]:
+def load_campaign_from_bytes(content: bytes) -> list[CampaignEvent]:
+    """Strictly load one legacy Campaign snapshot from caller-owned bytes."""
     try:
-        lines = path.read_bytes().decode("utf-8").splitlines()
-    except (OSError, UnicodeError) as error:
+        lines = content.decode("utf-8").splitlines()
+    except UnicodeError as error:
         raise CampaignError("could not read Campaign JSONL") from error
     if not lines:
         raise CampaignError("Campaign JSONL must not be empty")
@@ -437,6 +438,14 @@ def load_campaign(path: Path) -> list[CampaignEvent]:
     ):
         raise CampaignError("Campaign stop reason must match every not_run state")
     return events
+
+
+def load_campaign(path: Path) -> list[CampaignEvent]:
+    try:
+        content = path.read_bytes()
+    except (OSError, UnicodeError) as error:
+        raise CampaignError("could not read Campaign JSONL") from error
+    return load_campaign_from_bytes(content)
 
 
 def _plan_digest(plan: WorkflowPlan) -> str:

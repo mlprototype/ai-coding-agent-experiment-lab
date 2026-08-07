@@ -49,6 +49,7 @@ from agentlab.models import (
 )
 from agentlab.phase6 import (
     ArtifactReference,
+    HistoricalSuiteSource,
     HistoricalVerificationRecord,
     Language,
     LanguageStatus,
@@ -69,6 +70,9 @@ from agentlab.phase6 import (
     derive_public_suite_source_provenance,
     load_historical_verification,
     load_public_suite_inputs,
+    validate_historical_phase6_artifact_contract,
+    validate_historical_phase6_snapshot,
+    validate_phase6_snapshot_contract,
     validate_public_suite_inputs,
     validate_public_suite_snapshot,
 )
@@ -1373,6 +1377,265 @@ def _completed_historical_fixture(
         report_markdown_path,
         plan,
     )
+
+
+def _historical_record_for_fixture(
+    root: Path,
+    plan_path: str,
+    campaign_path: str,
+    report_json_path: str,
+    report_markdown_path: str,
+    plan: Any,
+) -> bytes:
+    plan_bytes = (root / plan_path).read_bytes()
+    campaign_bytes = (root / campaign_path).read_bytes()
+    report_json_bytes = (root / report_json_path).read_bytes()
+    report_markdown_bytes = (root / report_markdown_path).read_bytes()
+    return canonical_json_bytes(
+        HistoricalVerificationRecord(
+            schema_version="1.0",
+            source_class=SourceClass.HISTORICAL,
+            language=Language.PYTHON,
+            experiment_id=plan.experiment_id,
+            source_reviewed_commit=COMMIT,
+            verification_agentlab_commit=COMMIT,
+            toolchain_version_status="unknown",
+            plan_sha256=hashlib.sha256(plan_bytes).hexdigest(),
+            campaign_sha256=hashlib.sha256(campaign_bytes).hexdigest(),
+            report_json_sha256=hashlib.sha256(report_json_bytes).hexdigest(),
+            report_markdown_sha256=hashlib.sha256(report_markdown_bytes).hexdigest(),
+            strict_schema_validation_passed=True,
+            cross_artifact_validation_passed=True,
+            artifact_regenerated=False,
+            campaign_reexecuted=False,
+            validation_commands=[["python", "-m", "pytest"]],
+            verified_at=T1,
+        )
+    )
+
+
+def test_historical_legacy_byte_facade_validates_bindings_and_provider_counts(
+    tmp_path: Path,
+) -> None:
+    (
+        root,
+        plan_path,
+        campaign_path,
+        report_json_path,
+        report_markdown_path,
+        plan,
+    ) = _completed_historical_fixture(tmp_path / "repository")
+    record_bytes = _historical_record_for_fixture(
+        root,
+        plan_path,
+        campaign_path,
+        report_json_path,
+        report_markdown_path,
+        plan,
+    )
+
+    result = validate_historical_phase6_snapshot(
+        record_bytes=record_bytes,
+        plan_bytes=(root / plan_path).read_bytes(),
+        campaign_bytes=(root / campaign_path).read_bytes(),
+        report_json_bytes=(root / report_json_path).read_bytes(),
+        report_markdown_bytes=(root / report_markdown_path).read_bytes(),
+        expected_language=Language.PYTHON,
+    )
+
+    assert result.plan.schema_version == "1.1"
+    assert result.campaign[0].schema_version == "1.1"
+    assert result.experiment_id == plan.experiment_id
+    assert result.source_reviewed_commit == COMMIT
+    assert result.provider_call_count == plan.planned_provider_call_count
+    assert result.provider_call_count == len(plan.runs)
+    assert result.provider_call_count_unknown_runs == 0
+    assert not hasattr(result.plan, "reviewed_commit")
+    assert not hasattr(result.campaign[0], "source_reviewed_commit")
+
+
+def test_historical_legacy_facade_rejects_binding_mismatches(
+    tmp_path: Path,
+) -> None:
+    (
+        root,
+        plan_path,
+        campaign_path,
+        report_json_path,
+        report_markdown_path,
+        plan,
+    ) = _completed_historical_fixture(tmp_path / "repository")
+    record_bytes = _historical_record_for_fixture(
+        root,
+        plan_path,
+        campaign_path,
+        report_json_path,
+        report_markdown_path,
+        plan,
+    )
+    record = HistoricalVerificationRecord.model_validate_json(record_bytes)
+    kwargs = {
+        "record_bytes": record_bytes,
+        "plan_bytes": (root / plan_path).read_bytes(),
+        "campaign_bytes": (root / campaign_path).read_bytes(),
+        "report_json_bytes": (root / report_json_path).read_bytes(),
+        "report_markdown_bytes": (root / report_markdown_path).read_bytes(),
+    }
+
+    with pytest.raises(Phase6ContractError, match="experiment ID"):
+        validate_historical_phase6_snapshot(
+            **{**kwargs, "record_bytes": canonical_json_bytes(
+                record.model_copy(update={"experiment_id": "other-experiment"})
+            )}
+        )
+    with pytest.raises(Phase6ContractError, match="SHA bindings"):
+        validate_historical_phase6_snapshot(
+            **{**kwargs, "record_bytes": canonical_json_bytes(
+                record.model_copy(update={"plan_sha256": "0" * 64})
+            )}
+        )
+
+
+def test_historical_legacy_facade_rejects_noncanonical_and_duplicate_inputs(
+    tmp_path: Path,
+) -> None:
+    (
+        root,
+        plan_path,
+        campaign_path,
+        _report_json_path,
+        _report_markdown_path,
+        _plan,
+    ) = _completed_historical_fixture(tmp_path / "repository")
+    plan_bytes = (root / plan_path).read_bytes()
+    campaign_bytes = (root / campaign_path).read_bytes()
+    first_line, remainder = campaign_bytes.split(b"\n", 1)
+    noncanonical_campaign = (
+        json.dumps(json.loads(first_line), sort_keys=True).encode()
+        + b"\n"
+        + remainder
+    )
+
+    with pytest.raises(Phase6ContractError, match="canonical JSON serialization"):
+        validate_historical_phase6_artifact_contract(
+            "plan", json.dumps(json.loads(plan_bytes)).encode()
+        )
+    with pytest.raises(Phase6ContractError, match="canonical JSONL serialization"):
+        validate_historical_phase6_artifact_contract("campaign", noncanonical_campaign)
+    with pytest.raises(Phase6ContractError, match="duplicate key"):
+        validate_historical_phase6_artifact_contract(
+            "plan", b'{"schema_version":"1.1","schema_version":"1.1"}'
+        )
+    with pytest.raises(Phase6ContractError, match="duplicate key"):
+        validate_historical_phase6_artifact_contract(
+            "campaign", b'{"schema_version":"1.1","schema_version":"1.1"}\n'
+        )
+
+
+def test_primary_snapshot_facade_remains_1_2_only(tmp_path: Path) -> None:
+    (
+        root,
+        plan_path,
+        campaign_path,
+        _report_json_path,
+        _report_markdown_path,
+        _plan,
+    ) = _completed_historical_fixture(tmp_path / "repository")
+    with pytest.raises(Phase6ContractError, match="unsupported Workflow Plan"):
+        validate_phase6_snapshot_contract("plan", (root / plan_path).read_bytes())
+    with pytest.raises(Phase6ContractError, match="supported schema version"):
+        validate_phase6_snapshot_contract(
+            "campaign", (root / campaign_path).read_bytes()
+        )
+
+
+def test_public_suite_historical_validation_uses_the_typed_legacy_facade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    suite_root, manifest_path = _evaluated_suite(tmp_path / "suite")
+    (
+        historical_root,
+        plan_path,
+        campaign_path,
+        report_json_path,
+        report_markdown_path,
+        plan,
+    ) = _completed_historical_fixture(tmp_path / "historical")
+    record_bytes = _historical_record_for_fixture(
+        historical_root,
+        plan_path,
+        campaign_path,
+        report_json_path,
+        report_markdown_path,
+        plan,
+    )
+    historical_files = {
+        "historical/verification.json": record_bytes,
+        "historical/plan.json": (historical_root / plan_path).read_bytes(),
+        "historical/campaign.jsonl": (historical_root / campaign_path).read_bytes(),
+        "historical/report.json": (historical_root / report_json_path).read_bytes(),
+        "historical/report.md": (historical_root / report_markdown_path).read_bytes(),
+    }
+    for relative, content in historical_files.items():
+        _write(suite_root / relative, content)
+
+    def reference(role: str, path: str) -> ArtifactReference:
+        content = historical_files[path]
+        return ArtifactReference(
+            role=role,
+            path=path,
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+
+    historical_source = HistoricalSuiteSource(
+        source_class=SourceClass.HISTORICAL,
+        language=Language.PYTHON,
+        verification_record=reference(
+            "historical_verification", "historical/verification.json"
+        ),
+        plan=reference("plan", "historical/plan.json"),
+        campaign=reference("campaign", "historical/campaign.jsonl"),
+        report_json=reference("report_json", "historical/report.json"),
+        report_markdown=reference("report_markdown", "historical/report.md"),
+        included_in_primary_denominator=False,
+    )
+    manifest = PublicSuiteManifest.model_validate_json(manifest_path.read_bytes())
+    manifest = manifest.model_copy(
+        update={
+            "data_cutoff_at": datetime.fromisoformat(T1.replace("Z", "+00:00")),
+            "historical_sources": [historical_source],
+        }
+    )
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+
+    original_facade = validate_historical_phase6_snapshot
+    calls: list[tuple[bytes, bytes, bytes, bytes, bytes]] = []
+
+    def recording_facade(**kwargs: Any) -> Any:
+        calls.append(
+            (
+                kwargs["record_bytes"],
+                kwargs["plan_bytes"],
+                kwargs["campaign_bytes"],
+                kwargs["report_json_bytes"],
+                kwargs["report_markdown_bytes"],
+            )
+        )
+        return original_facade(**kwargs)
+
+    monkeypatch.setattr(
+        "agentlab.phase6.validate_historical_phase6_snapshot",
+        recording_facade,
+    )
+    validated = validate_public_suite_inputs(
+        load_public_suite_inputs(manifest_path, root=suite_root)
+    )
+    provenance = derive_public_suite_source_provenance(validated)
+
+    assert len(calls) >= 2
+    assert all(call[0] == record_bytes for call in calls)
+    assert any(item.role == "historical" for item in provenance)
 
 
 def test_historical_verification_uses_saved_bytes_and_create_only_output(

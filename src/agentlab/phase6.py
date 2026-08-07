@@ -32,12 +32,15 @@ from pydantic import (
 )
 
 from agentlab.campaign import (
+    CampaignError,
     CampaignEvent,
     CampaignFinishedEvent,
     CampaignRunEvent,
     CampaignRunStatus,
+    CampaignStartedEvent,
     CampaignStopReason,
     load_campaign,
+    load_campaign_from_bytes,
 )
 from agentlab.models import (
     CodexCleanupState,
@@ -2787,6 +2790,34 @@ def _load_workflow_plan_1_2_bytes(content: bytes) -> WorkflowPlanV1_2:
     return plan
 
 
+def _load_historical_workflow_plan_bytes(
+    content: bytes,
+) -> WorkflowPlanContract:
+    """Strictly dispatch a Historical Plan without reopening a path.
+
+    Historical Phase 6 predates the Plan 1.2 binding fields, so its typed
+    facade accepts the existing Plan 1.1 contract as well as Plan 1.2.  The
+    generic primary validation path continues to call the 1.2-only loader.
+    """
+    raw = _strict_json_bytes(content, "Historical Workflow Plan")
+    version = raw.get("schema_version")
+    if version == "1.1":
+        try:
+            plan = WorkflowPlan.model_validate(raw)
+        except ValidationError as error:
+            raise Phase6ContractError(
+                f"invalid Historical Workflow Plan 1.1: {error}"
+            ) from error
+        if content != canonical_json_bytes(plan):
+            raise Phase6ContractError(
+                "Historical Workflow Plan 1.1 must use canonical JSON serialization"
+            )
+        return plan
+    if version == "1.2":
+        return _load_workflow_plan_1_2_bytes(content)
+    raise Phase6ContractError("unsupported Historical Workflow Plan schema_version")
+
+
 class _DuplicateKeyError(ValueError):
     pass
 
@@ -2840,7 +2871,11 @@ def _load_jsonl_objects_bytes(
                 object_pairs_hook=_unique_object,
                 parse_constant=_reject_non_finite,
             )
-        except (json.JSONDecodeError, _DuplicateKeyError, ValueError) as error:
+        except _DuplicateKeyError as error:
+            raise Phase6ContractError(
+                f"{label} contains duplicate key {error} at line {index}"
+            ) from error
+        except (json.JSONDecodeError, ValueError) as error:
             raise Phase6ContractError(
                 f"invalid {label} JSON at line {index}"
             ) from error
@@ -2883,6 +2918,32 @@ def _load_phase6_campaign_bytes(
     return LoadedPhase6Campaign(tuple(events))
 
 
+def _load_historical_campaign_bytes(content: bytes) -> CampaignContract:
+    """Strictly dispatch a Historical Campaign from caller-owned bytes."""
+    raw_events = _load_jsonl_objects_bytes(content, "Historical Campaign")
+    version = raw_events[0].get("schema_version")
+    if version == "1.1":
+        if any(event.get("schema_version") != "1.1" for event in raw_events):
+            raise Phase6ContractError(
+                "Historical Campaign must use one supported schema version"
+            )
+        try:
+            events = load_campaign_from_bytes(content)
+        except CampaignError as error:
+            raise Phase6ContractError(
+                f"invalid Historical Campaign 1.1: {error}"
+            ) from error
+        canonical = b"".join(_canonical_jsonl_line(event) for event in events)
+        if content != canonical:
+            raise Phase6ContractError(
+                "Historical Campaign 1.1 must use canonical JSONL serialization"
+            )
+        return events
+    if version == "1.2":
+        return _load_phase6_campaign_bytes(content, raw_events)
+    raise Phase6ContractError("unsupported Historical Campaign schema_version")
+
+
 @dataclass(frozen=True)
 class Phase6CampaignByteValidation:
     """Read-only validation result for an in-memory Campaign snapshot."""
@@ -2892,6 +2953,158 @@ class Phase6CampaignByteValidation:
     provider_call_count_unknown_runs: int | None
     total_status: Literal["determined", "unknown"]
     error_detail: str | None = None
+
+
+@dataclass(frozen=True)
+class HistoricalPhase6SnapshotValidation:
+    """Typed facts derived from one Historical Phase 6 byte snapshot."""
+
+    record: HistoricalVerificationRecord
+    plan: WorkflowPlanContract
+    campaign: CampaignContract
+    report: ContractModel
+    experiment_id: str
+    source_reviewed_commit: str
+    provider_call_count: int
+    provider_call_count_unknown_runs: int
+    plan_sha256: str
+    campaign_sha256: str
+    report_json_sha256: str
+    report_markdown_sha256: str
+
+
+def _historical_campaign_finished(
+    campaign: CampaignContract,
+) -> tuple[str, CampaignFinishedEvent | Phase6CampaignFinishedEvent]:
+    if isinstance(campaign, LoadedPhase6Campaign):
+        return campaign.started.experiment_id, campaign.finished
+    if (
+        not campaign
+        or not isinstance(campaign[0], CampaignStartedEvent)
+        or not isinstance(campaign[-1], CampaignFinishedEvent)
+    ):
+        raise Phase6ContractError("Historical Campaign lacks typed boundaries")
+    return campaign[0].experiment_id, campaign[-1]
+
+
+def _load_historical_report_json_bytes(
+    content: bytes,
+) -> ContractModel:
+    raw = _strict_json_bytes(content, "Historical Public Language Report")
+    version = raw.get("schema_version")
+    if version == "1.0":
+        if "workflows" in raw and "pairing" in raw:
+            from agentlab.workflow_report import WorkflowReport
+
+            model: type[ContractModel] = WorkflowReport
+        else:
+            model = PublicLanguageReport
+    elif version == "1.1":
+        model = PublicLanguageReportV1_1
+    else:
+        raise Phase6ContractError(
+            "Historical Public Language Report schema is unsupported"
+        )
+    return _load_canonical_model_bytes(
+        content,
+        model,
+        "Historical Public Language Report",
+    )
+
+
+def validate_historical_phase6_snapshot(
+    *,
+    record_bytes: bytes,
+    plan_bytes: bytes,
+    campaign_bytes: bytes,
+    report_json_bytes: bytes,
+    report_markdown_bytes: bytes,
+    expected_language: Language | None = None,
+) -> HistoricalPhase6SnapshotValidation:
+    """Validate Historical Phase 6 bytes through one typed public facade.
+
+    Historical inputs use strict version dispatch for Plan and Campaign 1.1
+    or 1.2.  Plan/Campaign 1.1 is accepted here only; primary validation
+    remains bound to Plan/Campaign 1.2.  The Historical Verification Record is
+    the sole source of ``source_reviewed_commit``.
+    """
+    record = _load_canonical_model_bytes(
+        record_bytes,
+        HistoricalVerificationRecord,
+        "Historical Verification Record",
+    )
+    plan = _load_historical_workflow_plan_bytes(plan_bytes)
+    campaign = _load_historical_campaign_bytes(campaign_bytes)
+    report = _load_historical_report_json_bytes(report_json_bytes)
+    try:
+        report_markdown_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise Phase6ContractError(
+            "Historical Public Language Report Markdown must be UTF-8"
+        ) from error
+    if not report_markdown_bytes:
+        raise Phase6ContractError(
+            "Historical Public Language Report Markdown must not be empty"
+        )
+
+    experiment_id, finished = _historical_campaign_finished(campaign)
+    report_experiment_id = getattr(report, "experiment_id", record.experiment_id)
+    if (
+        record.experiment_id != plan.experiment_id
+        or record.experiment_id != experiment_id
+        or report_experiment_id != record.experiment_id
+    ):
+        raise Phase6ContractError(
+            "Historical experiment ID differs across Record, Plan, and Campaign"
+        )
+    if expected_language is not None:
+        plan_language = getattr(plan, "language", expected_language)
+        if (
+            record.language is not expected_language
+            or (
+                hasattr(report, "language")
+                and report.language is not expected_language
+            )
+            or plan_language is not expected_language
+        ):
+            raise Phase6ContractError(
+                "Historical language differs across the typed Artifact snapshot"
+            )
+
+    plan_sha256 = hashlib.sha256(plan_bytes).hexdigest()
+    campaign_sha256 = hashlib.sha256(campaign_bytes).hexdigest()
+    report_json_sha256 = hashlib.sha256(report_json_bytes).hexdigest()
+    report_markdown_sha256 = hashlib.sha256(report_markdown_bytes).hexdigest()
+    if (
+        record.plan_sha256 != plan_sha256
+        or record.campaign_sha256 != campaign_sha256
+        or record.report_json_sha256 != report_json_sha256
+        or record.report_markdown_sha256 != report_markdown_sha256
+    ):
+        raise Phase6ContractError(
+            "Historical Verification Record SHA bindings differ from the byte snapshot"
+        )
+    report_plan_sha256 = getattr(report, "plan_sha256", plan_sha256)
+    report_campaign_sha256 = getattr(report, "campaign_sha256", campaign_sha256)
+    if report_plan_sha256 != plan_sha256 or report_campaign_sha256 != campaign_sha256:
+        raise Phase6ContractError(
+            "Historical report SHA bindings differ from the byte snapshot"
+        )
+
+    return HistoricalPhase6SnapshotValidation(
+        record=record,
+        plan=plan,
+        campaign=campaign,
+        report=report,
+        experiment_id=experiment_id,
+        source_reviewed_commit=record.source_reviewed_commit,
+        provider_call_count=finished.provider_call_count,
+        provider_call_count_unknown_runs=finished.provider_call_count_unknown_runs,
+        plan_sha256=plan_sha256,
+        campaign_sha256=campaign_sha256,
+        report_json_sha256=report_json_sha256,
+        report_markdown_sha256=report_markdown_sha256,
+    )
 
 
 def load_phase6_campaign_from_bytes(content: bytes) -> Phase6CampaignByteValidation:
@@ -3668,38 +3881,30 @@ def validate_public_suite_inputs(
         statuses[source.language] = status
 
     for historical_source in loaded.manifest.historical_sources:
-        record = _load_canonical_model_bytes(
-            loaded.bytes_by_path[historical_source.verification_record.path],
-            HistoricalVerificationRecord,
-            "Historical Verification Record",
+        historical = validate_historical_phase6_snapshot(
+            record_bytes=loaded.bytes_by_path[
+                historical_source.verification_record.path
+            ],
+            plan_bytes=loaded.bytes_by_path[historical_source.plan.path],
+            campaign_bytes=loaded.bytes_by_path[historical_source.campaign.path],
+            report_json_bytes=loaded.bytes_by_path[historical_source.report_json.path],
+            report_markdown_bytes=loaded.bytes_by_path[
+                historical_source.report_markdown.path
+            ],
+            expected_language=historical_source.language,
         )
-        plan = _load_workflow_plan_1_2_bytes(
-            loaded.bytes_by_path[historical_source.plan.path]
-        )
-        campaign = _load_phase6_campaign_bytes(
-            loaded.bytes_by_path[historical_source.campaign.path]
-        )
-        report_raw = _strict_json_bytes(
-            loaded.bytes_by_path[historical_source.report_json.path],
-            "Historical Public Language Report",
-        )
-        report_model_type: type[PublicLanguageReport] | type[PublicLanguageReportV1_1]
-        if report_raw.get("schema_version") == "1.0":
-            report_model_type = PublicLanguageReport
-        elif report_raw.get("schema_version") == "1.1":
-            report_model_type = PublicLanguageReportV1_1
-        else:
-            raise Phase6ContractError("Historical Public Language Report schema is unsupported")
-        report = _load_canonical_model_bytes(
-            loaded.bytes_by_path[historical_source.report_json.path],
-            report_model_type,
-            "Historical Public Language Report",
-        )
+        record = historical.record
+        historical_plan = historical.plan
+        historical_report = historical.report
         if (
             record.language is not historical_source.language
-            or plan.language is not historical_source.language
-            or campaign.started.experiment_id != plan.experiment_id
-            or report.language is not historical_source.language
+            or getattr(historical_plan, "language", historical_source.language)
+            is not historical_source.language
+            or historical.experiment_id != historical_plan.experiment_id
+            or (
+                hasattr(historical_report, "language")
+                and historical_report.language is not historical_source.language
+            )
             or record.plan_sha256 != historical_source.plan.sha256
             or record.campaign_sha256 != historical_source.campaign.sha256
             or record.report_json_sha256
@@ -3909,21 +4114,21 @@ def derive_public_suite_source_provenance(
             )
         )
     for historical_source in validated.loaded.manifest.historical_sources:
-        record = _load_canonical_model_bytes(
-            bytes_by_path[historical_source.verification_record.path],
-            HistoricalVerificationRecord,
-            "Historical Verification Record",
-        )
-        campaign = _load_phase6_campaign_bytes(
-            bytes_by_path[historical_source.campaign.path]
+        historical = validate_historical_phase6_snapshot(
+            record_bytes=bytes_by_path[historical_source.verification_record.path],
+            plan_bytes=bytes_by_path[historical_source.plan.path],
+            campaign_bytes=bytes_by_path[historical_source.campaign.path],
+            report_json_bytes=bytes_by_path[historical_source.report_json.path],
+            report_markdown_bytes=bytes_by_path[historical_source.report_markdown.path],
+            expected_language=historical_source.language,
         )
         provenance.append(
             Phase6SourceProvenance(
                 language=historical_source.language,
                 source_class=SourceClass.HISTORICAL,
                 role="historical",
-                reviewed_commit=record.source_reviewed_commit,
-                experiment_id=campaign.started.experiment_id,
+                reviewed_commit=historical.source_reviewed_commit,
+                experiment_id=historical.experiment_id,
                 campaign_path=historical_source.campaign.path,
             )
         )
@@ -4448,3 +4653,32 @@ def validate_phase6_snapshot_contract(role: str, content: bytes) -> None:
         _load_workflow_spec_contract_bytes(content)
     else:
         raise ValueError(f"unsupported Phase 6 snapshot contract role: {role}")
+
+
+def validate_historical_phase6_artifact_contract(role: str, content: bytes) -> None:
+    """Strictly validate one Historical Artifact role from caller-owned bytes."""
+    if role == "plan":
+        _load_historical_workflow_plan_bytes(content)
+    elif role == "campaign":
+        _load_historical_campaign_bytes(content)
+    elif role == "historical_verification":
+        _load_canonical_model_bytes(
+            content,
+            HistoricalVerificationRecord,
+            "Historical Verification Record",
+        )
+    elif role == "report_json":
+        _load_historical_report_json_bytes(content)
+    elif role == "report_markdown":
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise Phase6ContractError(
+                "Historical Public Language Report Markdown must be UTF-8"
+            ) from error
+        if not content:
+            raise Phase6ContractError(
+                "Historical Public Language Report Markdown must not be empty"
+            )
+    else:
+        raise ValueError(f"unsupported Historical Phase 6 Artifact role: {role}")

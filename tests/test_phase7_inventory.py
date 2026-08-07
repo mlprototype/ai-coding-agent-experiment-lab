@@ -9,6 +9,11 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 import pytest
+from test_phase6 import COMMIT
+from test_phase6_public import (
+    _completed_historical_fixture,
+    _historical_record_for_fixture,
+)
 from typer.testing import CliRunner
 
 from agentlab.cli import app
@@ -951,6 +956,169 @@ def test_provider_strict_load_failure_drifts_campaign_before_retention(
         finding.code is FindingCode.CANONICAL_LOAD_FAILED
         and finding.subject_kind == "campaign"
         and finding.subject_id == campaign.campaign_id
+        for finding in inventory.findings
+    )
+
+
+def _historical_inventory_request(
+    root: Path,
+    *,
+    corrupt_record: bool = False,
+) -> tuple[Path, Any, str]:
+    (
+        source_root,
+        plan_path,
+        campaign_path,
+        report_json_path,
+        report_markdown_path,
+        plan,
+    ) = _completed_historical_fixture(root / "source")
+    inventory_root = root / "inventory"
+    inventory_root.mkdir()
+    relative_paths = {
+        "historical_verification": "historical-verification-record.json",
+        "plan": "plan.json",
+        "campaign": "campaign.jsonl",
+        "report_json": "report.json",
+        "report_markdown": "report.md",
+    }
+    source_paths = {
+        "plan": source_root / plan_path,
+        "campaign": source_root / campaign_path,
+        "report_json": source_root / report_json_path,
+        "report_markdown": source_root / report_markdown_path,
+    }
+    record_bytes = _historical_record_for_fixture(
+        source_root,
+        plan_path,
+        campaign_path,
+        report_json_path,
+        report_markdown_path,
+        plan,
+    )
+    if corrupt_record:
+        record = json.loads(record_bytes)
+        record["plan_sha256"] = "0" * 64
+        record_bytes = canonical_inventory_json_bytes(record)
+    contents = {
+        **{role: path.read_bytes() for role, path in source_paths.items()},
+        "historical_verification": record_bytes,
+    }
+    artifacts = []
+    for role, relative in relative_paths.items():
+        path = inventory_root / relative
+        path.write_bytes(contents[role])
+        artifacts.append(
+            ExpectedFileArtifact(
+                role=role,
+                path=relative,
+                byte_count=len(contents[role]),
+                sha256=_sha256(contents[role]),
+            )
+        )
+    authority = b"historical authority\n"
+    (inventory_root / "authority.txt").write_bytes(authority)
+    campaign_id = "workflow-ab-codex-live-002"
+    campaign = CampaignEntry(
+        campaign_id=campaign_id,
+        experiment_id=plan.experiment_id,
+        artifact_reviewed_commit=COMMIT,
+        commit_verification_mode=CommitVerificationMode.INTERNAL_IF_PRESENT,
+        classification=CampaignClassification.HISTORICAL_NON_PRIMARY,
+        included_in_primary_denominator=False,
+        verification_profile="historical_verification",
+        declaration_basis="legacy historical byte facade regression",
+        file_artifacts=artifacts,
+    )
+    request = EvidenceInventoryRequest(
+        schema_version="1.0",
+        inventory_id="historical-legacy-regression",
+        authoritative=False,
+        scope=InventoryScope.PHASE6,
+        source_of_truth_references=[
+            AuthorityReference(
+                reference_id="authority",
+                kind="tracked_closeout",
+                path="authority.txt",
+                byte_count=len(authority),
+                sha256=_sha256(authority),
+                description="synthetic historical authority",
+            )
+        ],
+        campaign_entries=[campaign],
+        retention_expectations=[
+            RetentionExpectation(
+                subject_kind="campaign",
+                subject_id=campaign_id,
+                expected_retention_state=RetentionState.LOCAL_ONLY,
+                declaration_basis="legacy local retention regression",
+            )
+        ],
+    )
+    request_path = inventory_root / "request.json"
+    request_path.write_bytes(canonical_inventory_json_bytes(request))
+
+    return request_path, plan, campaign_id
+
+
+def test_historical_legacy_campaign_is_verified_and_accounted_from_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_path, plan, _campaign_id = _historical_inventory_request(tmp_path)
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._observe_execution_repository_head",
+        lambda _root: HEAD,
+    )
+
+    inventory = verify_inventory_request(
+        request_path=request_path,
+        repository_root=request_path.parent,
+        confirm_local_execution=True,
+    )
+
+    assert inventory.verification_status.value == "verified"
+    assert inventory.findings == []
+    assert inventory.campaigns[0].integrity_state.value == "verified"
+    assert inventory.campaigns[0].provider_total_status is ProviderTotalStatus.OBSERVED
+    assert (
+        inventory.campaigns[0].provider_call_count_observed
+        == plan.planned_provider_call_count
+    )
+    assert inventory.campaigns[0].provider_call_count_unknown_runs == 0
+    assert inventory.summary.campaigns_without_total == 0
+    assert inventory.retention[0].retention_state is RetentionState.LOCAL_ONLY
+
+
+def test_historical_facade_failure_drifts_campaign_before_retention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_path, _plan, campaign_id = _historical_inventory_request(
+        tmp_path,
+        corrupt_record=True,
+    )
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._observe_execution_repository_head",
+        lambda _root: HEAD,
+    )
+
+    inventory = verify_inventory_request(
+        request_path=request_path,
+        repository_root=request_path.parent,
+        confirm_local_execution=True,
+    )
+
+    assert inventory.verification_status.value == "failed"
+    campaign = inventory.campaigns[0]
+    assert campaign.integrity_state.value == "drifted"
+    assert campaign.provider_total_status is ProviderTotalStatus.UNAVAILABLE
+    assert inventory.summary.campaigns_without_total == 1
+    assert inventory.retention[0].retention_state is RetentionState.UNKNOWN
+    assert any(
+        finding.code is FindingCode.CANONICAL_LOAD_FAILED
+        and finding.subject_kind == "campaign"
+        and finding.subject_id == campaign_id
         for finding in inventory.findings
     )
 

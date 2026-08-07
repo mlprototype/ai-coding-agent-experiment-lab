@@ -1,6 +1,6 @@
 # Phase 7A: Evidence Inventory & Retention Policy — 実装計画書
 
-**Status:** Slice 7A-1〜7A-4実装済み。Slice 7A-4R2はreal Artifact contract remediationであり、real ArtifactのRequest生成／Inventory実行とPhase status変更は未実施。
+**Status:** Slice 7A-1〜7A-4実装済み。Slice 7A-4R2および7A-4R3はreal Artifact contract remediationであり、real ArtifactのRequest生成／Inventory実行とPhase status変更は未実施。
 **対象branch:** `feature/phase7`
 **対象scope:** Phase 6の保存Artifactだけ
 **設計原則:** Catalogは新しいstatus正本ではなく、既存正本と保存Artifactの一致を検証して表示する、非権威的な派生成果物である。
@@ -45,6 +45,16 @@ publisherはstdinを`MAX_REQUEST_BYTES + 1`まで一度だけ読み、strict/can
 - accepted supersededはmirror ownership schemaが未設計のため未収載、Authority不足のcandidate／空directoryも未収載対象として明記する。
 
 7A-4R2及び将来pilotともProvider、Gate、Replay、network、Live、Report／Public Suite再生成、新しいmodel fixingは0件である。crosswalk上のPhase 6 `9または10` Authority値を、pilot Request scopeの合計へ再解釈・変更しない。
+
+## Slice 7A-4R3 — Historical Legacy Contract Remediation
+
+7A-4R3は、既存Historical ArtifactをRequestへ再収載する前のPhase 6／Phase 7共通契約修正である。実Artifact、Request、Inventory、Pilot、Provider、Gate、Replay、network、`.artifacts/phase7`には書き込まない。
+
+- Phase 6にcaller-owned bytesだけを受け取るtyped Historical facadeを追加する。Plan／Campaignはschema `1.1`／`1.2`をstrict dispatchし、Historical Verification Recordの`experiment_id`、`source_reviewed_commit`、Plan／Campaign／Report JSON／Report MarkdownのSHA binding、Campaign finished eventのProvider accountingを同じsnapshotで検証する。
+- Historical Report JSONは保存Artifactのtyped legacy contractをdispatchし、旧Workflow Report 1.0とPublic Language Report 1.0／1.1をcanonical／duplicate-key拒否で扱う。Campaignのlegacy 1.1はbytesからloadし、source commitをPlan／Campaign／Report／mirrorから導出しない。
+- Primaryのgeneric Phase 6 facadeとPublic Suite bindingはPlan／Campaign 1.2限定を維持する。generic `plan`／`campaign` loaderを無条件にlegacy対応へ緩和しない。
+- Phase 7はHistorical profileでこのpublic facadeだけを利用し、file contract、typed Campaign provenance、Public Suite historical validation、Provider accounting、Retention前のsubject integrityへ同じ判定を伝播する。invalid／drifted Historical Campaignは`DRIFTED`、Provider totalは`unavailable`、`campaigns_without_total`へ残す。
+- 回帰テストはHistorical 1.1成功、Experiment ID／Record SHA不一致、Record由来source commit、legacy Provider count、Primary 1.1拒否、malformed／noncanonical／duplicate-key拒否、Phase 7のverified／retention／Provider stateを対象にする。実Artifactの確認はread-only facade呼出しに限定する。
 
 ## 2. Authority境界（最初に固定するDecision）
 
@@ -354,6 +364,14 @@ Phase 7側がPhase 6 private helperへ依存することや、既存Artifactの�
 3. CLI出力にはProvider、Prompt、Gate、Campaign、networkが0件であることを明示する。
 
 **完了基準:** 出力collision、process内publish失敗、既存のincomplete publicationで既存fileを変更せず、finding時だけexit `2`とfailure Inventoryを残す。クラッシュ後のpartial outputを自動削除しない。
+
+### Slice 7A-4R3 — Historical Legacy Contract Remediation
+
+1. Phase 6にHistorical専用のcaller-owned byte facadeを追加し、Plan／Campaign 1.1／1.2、Historical Verification Record、legacy Report、Experiment ID、source commit、SHA binding、Provider finished totalを一つのtyped snapshotとして検証する。
+2. Public Suite Historical検証とPhase 7 Historical profileを同じpublic facadeへ接続する。PrimaryのPlan／Campaign 1.2限定、private loader非依存、path再読込非依存を回帰テストで固定する。
+3. facade失敗をCampaign finding／`DRIFTED`／Provider `unavailable`／`campaigns_without_total`／Retention `unknown`へ順序どおり伝播する。
+
+**完了基準:** Historical legacy synthetic suite、malformed／duplicate-key／noncanonical／cross-binding failure、Primary legacy rejection、Public Suite／Phase 7 shared facade、provider accounting／retention propagationのテストと品質確認が通過し、実Artifactへの書込みが0件である。
 
 ### Slice 7A-5 — 実Artifactのread-only Inventory（別Approval）
 
