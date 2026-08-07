@@ -34,6 +34,7 @@ from agentlab.campaign import (
     CampaignRunStatus,
     CampaignStartedEvent,
     CampaignStopReason,
+    load_campaign_from_bytes,
 )
 from agentlab.cli import app
 from agentlab.models import (
@@ -1493,6 +1494,80 @@ def test_historical_legacy_facade_rejects_binding_mismatches(
             **{**kwargs, "record_bytes": canonical_json_bytes(
                 record.model_copy(update={"plan_sha256": "0" * 64})
             )}
+        )
+
+
+@pytest.mark.parametrize("tamper", ["plan_sha256", "planned_counts"])
+def test_historical_facade_rejects_campaign_plan_binding_with_updated_record_shas(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    (
+        root,
+        plan_path,
+        campaign_path,
+        report_json_path,
+        report_markdown_path,
+        plan,
+    ) = _completed_historical_fixture(tmp_path / "repository")
+    plan_bytes = (root / plan_path).read_bytes()
+    campaign_bytes = (root / campaign_path).read_bytes()
+    events = load_campaign_from_bytes(campaign_bytes)
+    if tamper == "plan_sha256":
+        assert isinstance(events[0], CampaignStartedEvent)
+        mutated_events = [
+            events[0].model_copy(update={"plan_sha256": "f" * 64}),
+            *events[1:],
+        ]
+    else:
+        assert isinstance(events[0], CampaignStartedEvent)
+        assert len(events) >= 5
+        retained = [events[0], *events[1:3], events[-1]]
+        mutated_events = [
+            event.model_copy(update={"sequence": sequence})
+            for sequence, event in enumerate(retained)
+        ]
+        mutated_events[0] = mutated_events[0].model_copy(
+            update={"planned_run_count": 1, "planned_provider_call_count": 1}
+        )
+        mutated_events[-1] = mutated_events[-1].model_copy(
+            update={
+                "attempted_run_count": 1,
+                "provider_call_count": 1,
+                "provider_call_count_unknown_runs": 0,
+            }
+        )
+    mutated_campaign_bytes = b"".join(
+        _canonical_jsonl_line(event) for event in mutated_events
+    )
+    load_campaign_from_bytes(mutated_campaign_bytes)
+
+    report_raw = json.loads((root / report_json_path).read_bytes())
+    report_raw["campaign_sha256"] = hashlib.sha256(mutated_campaign_bytes).hexdigest()
+    mutated_report_bytes = canonical_json_bytes(report_raw)
+    record = HistoricalVerificationRecord.model_validate_json(
+        _historical_record_for_fixture(
+            root,
+            plan_path,
+            campaign_path,
+            report_json_path,
+            report_markdown_path,
+            plan,
+        )
+    ).model_copy(
+        update={
+            "campaign_sha256": hashlib.sha256(mutated_campaign_bytes).hexdigest(),
+            "report_json_sha256": hashlib.sha256(mutated_report_bytes).hexdigest(),
+        }
+    )
+
+    with pytest.raises(Phase6ContractError, match="Campaign started event"):
+        validate_historical_phase6_snapshot(
+            record_bytes=canonical_json_bytes(record),
+            plan_bytes=plan_bytes,
+            campaign_bytes=mutated_campaign_bytes,
+            report_json_bytes=mutated_report_bytes,
+            report_markdown_bytes=(root / report_markdown_path).read_bytes(),
         )
 
 

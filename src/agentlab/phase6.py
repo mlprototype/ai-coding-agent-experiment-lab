@@ -2973,18 +2973,21 @@ class HistoricalPhase6SnapshotValidation:
     report_markdown_sha256: str
 
 
-def _historical_campaign_finished(
+def _historical_campaign_boundaries(
     campaign: CampaignContract,
-) -> tuple[str, CampaignFinishedEvent | Phase6CampaignFinishedEvent]:
+) -> tuple[
+    CampaignStartedEvent | Phase6CampaignStartedEvent,
+    CampaignFinishedEvent | Phase6CampaignFinishedEvent,
+]:
     if isinstance(campaign, LoadedPhase6Campaign):
-        return campaign.started.experiment_id, campaign.finished
+        return campaign.started, campaign.finished
     if (
         not campaign
         or not isinstance(campaign[0], CampaignStartedEvent)
         or not isinstance(campaign[-1], CampaignFinishedEvent)
     ):
         raise Phase6ContractError("Historical Campaign lacks typed boundaries")
-    return campaign[0].experiment_id, campaign[-1]
+    return campaign[0], campaign[-1]
 
 
 def _load_historical_report_json_bytes(
@@ -3047,7 +3050,8 @@ def validate_historical_phase6_snapshot(
             "Historical Public Language Report Markdown must not be empty"
         )
 
-    experiment_id, finished = _historical_campaign_finished(campaign)
+    campaign_started, finished = _historical_campaign_boundaries(campaign)
+    experiment_id = campaign_started.experiment_id
     report_experiment_id = getattr(report, "experiment_id", record.experiment_id)
     if (
         record.experiment_id != plan.experiment_id
@@ -3075,6 +3079,19 @@ def validate_historical_phase6_snapshot(
     campaign_sha256 = hashlib.sha256(campaign_bytes).hexdigest()
     report_json_sha256 = hashlib.sha256(report_json_bytes).hexdigest()
     report_markdown_sha256 = hashlib.sha256(report_markdown_bytes).hexdigest()
+    if campaign_started.schema_version != plan.schema_version:
+        raise Phase6ContractError(
+            "Historical Plan and Campaign schema versions must match"
+        )
+    if (
+        campaign_started.plan_sha256 != plan_sha256
+        or campaign_started.planned_run_count != plan.planned_run_count
+        or campaign_started.planned_provider_call_count
+        != plan.planned_provider_call_count
+    ):
+        raise Phase6ContractError(
+            "Historical Campaign started event does not match Plan"
+        )
     if (
         record.plan_sha256 != plan_sha256
         or record.campaign_sha256 != campaign_sha256

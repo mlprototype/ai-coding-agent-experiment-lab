@@ -28,6 +28,7 @@ from agentlab.phase7_inventory import (
     ExpectedTree,
     ExternalCopyReceipt,
     FindingCode,
+    IntegrityState,
     InventoryContractError,
     InventoryPublicationError,
     InventoryReleaseEntry,
@@ -964,6 +965,7 @@ def _historical_inventory_request(
     root: Path,
     *,
     corrupt_record: bool = False,
+    report_markdown_override: bytes | None = None,
 ) -> tuple[Path, Any, str]:
     (
         source_root,
@@ -1004,6 +1006,8 @@ def _historical_inventory_request(
         **{role: path.read_bytes() for role, path in source_paths.items()},
         "historical_verification": record_bytes,
     }
+    if report_markdown_override is not None:
+        contents["report_markdown"] = report_markdown_override
     artifacts = []
     for role, relative in relative_paths.items():
         path = inventory_root / relative
@@ -1119,6 +1123,46 @@ def test_historical_facade_failure_drifts_campaign_before_retention(
         finding.code is FindingCode.CANONICAL_LOAD_FAILED
         and finding.subject_kind == "campaign"
         and finding.subject_id == campaign_id
+        for finding in inventory.findings
+    )
+
+
+@pytest.mark.parametrize("bad_markdown", [b"", b"\xff"])
+def test_historical_markdown_contract_failure_is_individual_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_markdown: bytes,
+) -> None:
+    request_path, _plan, campaign_id = _historical_inventory_request(
+        tmp_path,
+        report_markdown_override=bad_markdown,
+    )
+    monkeypatch.setattr(
+        "agentlab.phase7_inventory._observe_execution_repository_head",
+        lambda _root: HEAD,
+    )
+
+    inventory = verify_inventory_request(
+        request_path=request_path,
+        repository_root=request_path.parent,
+        confirm_local_execution=True,
+    )
+    campaign = next(
+        item for item in inventory.campaigns if item.campaign_id == campaign_id
+    )
+    observation = next(
+        item
+        for item in campaign.artifact_observations
+        if item.role == "report_markdown"
+    )
+
+    assert observation.integrity_state is IntegrityState.DRIFTED
+    assert any(
+        finding.code is FindingCode.CANONICAL_LOAD_FAILED
+        and finding.subject_kind == "campaign"
+        and finding.subject_id == campaign_id
+        and finding.artifact_role == "report_markdown"
+        and finding.path == "report.md"
         for finding in inventory.findings
     )
 

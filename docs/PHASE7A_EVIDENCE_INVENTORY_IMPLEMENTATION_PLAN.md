@@ -50,10 +50,10 @@ publisherはstdinを`MAX_REQUEST_BYTES + 1`まで一度だけ読み、strict/can
 
 7A-4R3は、既存Historical ArtifactをRequestへ再収載する前のPhase 6／Phase 7共通契約修正である。実Artifact、Request、Inventory、Pilot、Provider、Gate、Replay、network、`.artifacts/phase7`には書き込まない。
 
-- Phase 6にcaller-owned bytesだけを受け取るtyped Historical facadeを追加する。Plan／Campaignはschema `1.1`／`1.2`をstrict dispatchし、Historical Verification Recordの`experiment_id`、`source_reviewed_commit`、Plan／Campaign／Report JSON／Report MarkdownのSHA binding、Campaign finished eventのProvider accountingを同じsnapshotで検証する。
+- Phase 6にcaller-owned bytesだけを受け取るtyped Historical facadeを追加する。Plan／Campaignはschema `1.1`／`1.2`をstrict dispatchし、Campaign started eventのPlan SHA、planned run count、planned Provider call countをPlanへ内部bindingする。Historical Verification Recordの`experiment_id`、`source_reviewed_commit`、Plan／Campaign／Report JSON／Report MarkdownのSHA binding、Campaign finished eventのProvider accountingを同じsnapshotで検証する。
 - Historical Report JSONは保存Artifactのtyped legacy contractをdispatchし、旧Workflow Report 1.0とPublic Language Report 1.0／1.1をcanonical／duplicate-key拒否で扱う。Campaignのlegacy 1.1はbytesからloadし、source commitをPlan／Campaign／Report／mirrorから導出しない。
 - Primaryのgeneric Phase 6 facadeとPublic Suite bindingはPlan／Campaign 1.2限定を維持する。generic `plan`／`campaign` loaderを無条件にlegacy対応へ緩和しない。
-- Phase 7はHistorical profileでこのpublic facadeだけを利用し、file contract、typed Campaign provenance、Public Suite historical validation、Provider accounting、Retention前のsubject integrityへ同じ判定を伝播する。invalid／drifted Historical Campaignは`DRIFTED`、Provider totalは`unavailable`、`campaigns_without_total`へ残す。
+- Phase 7はHistorical profileでこのpublic facadeだけを利用し、`report_markdown`を含む全file roleの個別file contract、typed Campaign provenance、Public Suite historical validation、Provider accounting、Retention前のsubject integrityへ同じ判定を伝播する。invalid／drifted Historical Campaignは`DRIFTED`、Provider totalは`unavailable`、`campaigns_without_total`へ残す。
 - 回帰テストはHistorical 1.1成功、Experiment ID／Record SHA不一致、Record由来source commit、legacy Provider count、Primary 1.1拒否、malformed／noncanonical／duplicate-key拒否、Phase 7のverified／retention／Provider stateを対象にする。実Artifactの確認はread-only facade呼出しに限定する。
 
 ## 2. Authority境界（最初に固定するDecision）
@@ -367,7 +367,7 @@ Phase 7側がPhase 6 private helperへ依存することや、既存Artifactの�
 
 ### Slice 7A-4R3 — Historical Legacy Contract Remediation
 
-1. Phase 6にHistorical専用のcaller-owned byte facadeを追加し、Plan／Campaign 1.1／1.2、Historical Verification Record、legacy Report、Experiment ID、source commit、SHA binding、Provider finished totalを一つのtyped snapshotとして検証する。
+1. Phase 6にHistorical専用のcaller-owned byte facadeを追加し、Plan／Campaign 1.1／1.2、Campaign started eventのPlan binding、Historical Verification Record、legacy Report、Experiment ID、source commit、SHA binding、Provider finished totalを一つのtyped snapshotとして検証する。
 2. Public Suite Historical検証とPhase 7 Historical profileを同じpublic facadeへ接続する。PrimaryのPlan／Campaign 1.2限定、private loader非依存、path再読込非依存を回帰テストで固定する。
 3. facade失敗をCampaign finding／`DRIFTED`／Provider `unavailable`／`campaigns_without_total`／Retention `unknown`へ順序どおり伝播する。
 

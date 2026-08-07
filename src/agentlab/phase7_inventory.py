@@ -1808,6 +1808,7 @@ def _known_contract_is_valid(
             "campaign",
             "historical_verification",
             "report_json",
+            "report_markdown",
         }:
             validate_historical_phase6_artifact_contract(role, content)
         elif role in known_roles:
