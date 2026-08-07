@@ -4465,6 +4465,19 @@ def _same_published_file_object(
     )
 
 
+def _same_publication_object_identity(
+    current: tuple[int, int, int, int, int, int, int],
+    expected: tuple[int, int, int, int, int, int, int] | None,
+) -> bool:
+    if expected is None:
+        return False
+    return (
+        current[0] == expected[0]
+        and current[1] == expected[1]
+        and stat.S_IFMT(current[2]) == stat.S_IFMT(expected[2])
+    )
+
+
 def _open_publication_parent(
     snapshot: _InventorySnapshot,
     relative: str,
@@ -4617,6 +4630,7 @@ def _cleanup_owned_publication_paths(
     parent_fd: int,
     filename: str,
     staging_name: str | None,
+    owned_staging_identity: tuple[int, int, int, int, int, int, int] | None,
     staging_identity: tuple[int, int, int, int, int, int, int] | None,
     link_identity: tuple[int, int, int, int, int, int, int] | None,
     committed_identity: tuple[int, int, int, int, int, int, int] | None,
@@ -4624,17 +4638,6 @@ def _cleanup_owned_publication_paths(
 ) -> tuple[Exception, ...]:
     """Try final and staging cleanup independently, including hard-link state."""
     failures: list[Exception] = []
-    if link_identity is None:
-        if staging_name is not None:
-            staging_failures, _ = _cleanup_owned_publication_path(
-                parent_fd,
-                staging_name,
-                staging_identity,
-                "publication staging",
-            )
-            failures.extend(staging_failures)
-        return tuple(failures)
-
     def descriptor_identity() -> tuple[int, int, int, int, int, int, int] | None:
         if descriptor is None:
             return None
@@ -4647,6 +4650,32 @@ def _cleanup_owned_publication_paths(
             failure.__cause__ = error
             failures.append(failure)
             return None
+
+    if link_identity is None:
+        if staging_name is not None:
+            expected_staging_identity = staging_identity
+            if expected_staging_identity is None:
+                current_descriptor_identity = descriptor_identity()
+                if current_descriptor_identity is not None:
+                    if _same_publication_object_identity(
+                        current_descriptor_identity,
+                        owned_staging_identity,
+                    ):
+                        expected_staging_identity = current_descriptor_identity
+                    else:
+                        failures.append(
+                            InventoryPublicationError(
+                                "publication staging ownership identity changed"
+                            )
+                        )
+            staging_failures, _ = _cleanup_owned_publication_path(
+                parent_fd,
+                staging_name,
+                expected_staging_identity,
+                "publication staging",
+            )
+            failures.extend(staging_failures)
+        return tuple(failures)
 
     if staging_name is not None:
         staging_failures, staging_removed = _cleanup_owned_publication_path(
@@ -4720,6 +4749,7 @@ def _publish_file_no_replace(
         parent_fd = publication_parent.fd
     descriptor: int | None = None
     staging_name: str | None = None
+    owned_staging_identity: tuple[int, int, int, int, int, int, int] | None = None
     staging_identity: tuple[int, int, int, int, int, int, int] | None = None
     link_identity: tuple[int, int, int, int, int, int, int] | None = None
     committed_identity: tuple[int, int, int, int, int, int, int] | None = None
@@ -4744,9 +4774,12 @@ def _publish_file_no_replace(
             break
         if descriptor is None or staging_name is None:
             raise InventoryPublicationError(f"could not create {label} staging file")
+        owned_staging_identity = _publication_identity(os.fstat(descriptor))
         view = memoryview(content)
         while view:
             written = os.write(descriptor, view)
+            if written <= 0:
+                raise InventoryPublicationError(f"{label} write made no progress")
             view = view[written:]
         os.fsync(descriptor)
         staging_identity = _publication_identity(os.fstat(descriptor))
@@ -4785,17 +4818,35 @@ def _publish_file_no_replace(
     except Exception as error:
         original_error = error
 
+    if original_error is None:
+        if committed_identity is None:
+            original_error = InventoryPublicationError(
+                f"published {label} has no committed identity"
+            )
+        elif descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                close_failure = InventoryPublicationError(
+                    "publication descriptor close failed"
+                )
+                close_failure.__cause__ = error
+                original_error = close_failure
+            else:
+                descriptor = None
+
     cleanup_failures: tuple[Exception, ...] = ()
     if original_error is not None:
         cleanup_failures = _cleanup_owned_publication_paths(
             parent_fd=parent_fd,
             filename=filename,
             staging_name=staging_name,
+            owned_staging_identity=owned_staging_identity,
             staging_identity=staging_identity,
             link_identity=link_identity,
             committed_identity=committed_identity,
             descriptor=descriptor,
-        )
+            )
     if descriptor is not None:
         try:
             os.close(descriptor)
@@ -4825,8 +4876,7 @@ def _publish_file_no_replace(
         if isinstance(original_error, OSError):
             raise InventoryPublicationError(f"could not publish {label}") from original_error
         raise InventoryPublicationError(f"could not publish {label}") from original_error
-    if committed_identity is None:
-        raise InventoryPublicationError(f"published {label} has no committed identity")
+    assert committed_identity is not None
     return committed_identity
 
 
@@ -4854,25 +4904,21 @@ def _rollback_file(
             )
         publication_parent.require_stable("owned-output rollback")
         parent_fd = publication_parent.fd
-    try:
-        metadata = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return
-    except OSError as error:
-        raise InventoryPublicationError("owned-output rollback could not inspect path") from error
-    if (
-        _publication_identity(metadata) != identity
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_nlink != 1
-    ):
-        raise InventoryPublicationError("owned-output rollback refused a changed path")
-    try:
-        os.unlink(filename, dir_fd=parent_fd)
-        os.fsync(parent_fd)
-        if publication_parent is not None:
-            publication_parent.require_stable("owned-output rollback")
-    except OSError as error:
-        raise InventoryPublicationError("owned-output rollback failed") from error
+    failures, _ = _cleanup_owned_publication_path(
+        parent_fd,
+        filename,
+        identity,
+        "owned-output rollback",
+    )
+    if failures:
+        detail = "; ".join(
+            f"{type(error).__name__}: {error}" for error in failures
+        )
+        raise InventoryPublicationError(
+            f"owned-output rollback failed: {detail}"
+        ) from failures[0]
+    if publication_parent is not None:
+        publication_parent.require_stable("owned-output rollback")
 
 
 def _rollback_published_outputs(

@@ -1685,6 +1685,143 @@ def test_staging_cleanup_failure_is_reported_and_hidden_file_is_preserved(
         snapshot.close()
 
 
+@pytest.mark.parametrize(
+    "failure",
+    ["first-write", "partial-write", "fsync", "zero-write"],
+)
+def test_owned_staging_cleanup_handles_write_path_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    parent_path = tmp_path / "outputs"
+    parent_path.mkdir()
+    snapshot = _snapshot_root(tmp_path)
+    publication_parent = _open_publication_parent(snapshot, "outputs", "synthetic")
+    original_write = os.write
+    original_fsync = os.fsync
+    write_calls = 0
+    fsync_calls = 0
+    try:
+        def fail_write(fd: int, content: Any) -> int:
+            nonlocal write_calls
+            write_calls += 1
+            if failure == "first-write":
+                raise OSError("synthetic first write failure")
+            if failure == "partial-write":
+                if write_calls == 1:
+                    return min(2, len(content))
+                raise OSError("synthetic partial write failure")
+            if failure == "zero-write":
+                return 0
+            return original_write(fd, content)
+
+        def fail_fsync(fd: int) -> None:
+            nonlocal fsync_calls
+            fsync_calls += 1
+            if failure == "fsync" and fsync_calls == 1:
+                raise OSError("synthetic staging fsync failure")
+            original_fsync(fd)
+
+        monkeypatch.setattr("agentlab.phase7_inventory.os.write", fail_write)
+        monkeypatch.setattr("agentlab.phase7_inventory.os.fsync", fail_fsync)
+        with pytest.raises(InventoryPublicationError):
+            _publish_file_no_replace(
+                snapshot,
+                "outputs/published.json",
+                b"payload",
+                "synthetic",
+                publication_parent=publication_parent,
+            )
+        assert not (parent_path / "published.json").exists()
+        assert not list(parent_path.glob(".published.json.phase7-*"))
+    finally:
+        publication_parent.close()
+        snapshot.close()
+
+
+def test_descriptor_close_failure_rolls_back_committed_final_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_path = tmp_path / "outputs"
+    parent_path.mkdir()
+    snapshot = _snapshot_root(tmp_path)
+    publication_parent = _open_publication_parent(snapshot, "outputs", "synthetic")
+    original_close = os.close
+    failed = False
+    try:
+        def fail_publication_close(fd: int) -> None:
+            nonlocal failed
+            if not failed and fd != snapshot.root_fd:
+                failed = True
+                original_close(fd)
+                raise OSError("synthetic descriptor close failure")
+            original_close(fd)
+
+        monkeypatch.setattr("agentlab.phase7_inventory.os.close", fail_publication_close)
+        with pytest.raises(InventoryPublicationError, match="descriptor close failed"):
+            _publish_file_no_replace(
+                snapshot,
+                "outputs/published.json",
+                b"payload",
+                "synthetic",
+                publication_parent=publication_parent,
+            )
+        assert not (parent_path / "published.json").exists()
+        assert not list(parent_path.glob(".published.json.phase7-*"))
+    finally:
+        publication_parent.close()
+        snapshot.close()
+
+
+def test_rollback_reports_path_recreated_after_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_path = tmp_path / "outputs"
+    parent_path.mkdir()
+    snapshot = _snapshot_root(tmp_path)
+    publication_parent = _open_publication_parent(snapshot, "outputs", "synthetic")
+    original_unlink = os.unlink
+    original_close = os.close
+    try:
+        identity = _publish_file_no_replace(
+            snapshot,
+            "outputs/published.json",
+            b"payload",
+            "synthetic",
+            publication_parent=publication_parent,
+        )
+
+        def unlink_and_recreate(name: str, *args: Any, **kwargs: Any) -> None:
+            original_unlink(name, *args, **kwargs)
+            if name == "published.json":
+                recreated = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=kwargs["dir_fd"],
+                )
+                original_close(recreated)
+
+        monkeypatch.setattr(
+            "agentlab.phase7_inventory.os.unlink",
+            unlink_and_recreate,
+        )
+        with pytest.raises(InventoryPublicationError, match="residual"):
+            _rollback_file(
+                snapshot,
+                "outputs/published.json",
+                identity,
+                publication_parent=publication_parent,
+            )
+        assert (parent_path / "published.json").exists()
+    finally:
+        publication_parent.close()
+        snapshot.close()
+
+
 def test_publication_root_mode_change_is_rejected(
     tmp_path: Path,
 ) -> None:
