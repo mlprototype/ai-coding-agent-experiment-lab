@@ -4824,16 +4824,16 @@ def _publish_file_no_replace(
                 f"published {label} has no committed identity"
             )
         elif descriptor is not None:
+            descriptor_to_close = descriptor
+            descriptor = None
             try:
-                os.close(descriptor)
+                os.close(descriptor_to_close)
             except OSError as error:
                 close_failure = InventoryPublicationError(
                     "publication descriptor close failed"
                 )
                 close_failure.__cause__ = error
                 original_error = close_failure
-            else:
-                descriptor = None
 
     cleanup_failures: tuple[Exception, ...] = ()
     if original_error is not None:
@@ -4848,13 +4848,14 @@ def _publish_file_no_replace(
             descriptor=descriptor,
             )
     if descriptor is not None:
+        descriptor_to_close = descriptor
+        descriptor = None
         try:
-            os.close(descriptor)
+            os.close(descriptor_to_close)
         except OSError as error:
             failure = InventoryPublicationError("publication descriptor close failed")
             failure.__cause__ = error
             cleanup_failures += (failure,)
-        descriptor = None
     if cleanup_failures:
         details = "; ".join(
             f"{type(error).__name__}: {error}" for error in cleanup_failures

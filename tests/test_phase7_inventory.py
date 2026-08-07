@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import stat
+from contextlib import suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -1749,18 +1750,27 @@ def test_descriptor_close_failure_rolls_back_committed_final_output(
     snapshot = _snapshot_root(tmp_path)
     publication_parent = _open_publication_parent(snapshot, "outputs", "synthetic")
     original_close = os.close
-    failed = False
+    injected = False
+    publication_fd: int | None = None
+    publication_close_calls = 0
     try:
         def fail_publication_close(fd: int) -> None:
-            nonlocal failed
-            if not failed and fd != snapshot.root_fd:
-                failed = True
+            nonlocal injected, publication_close_calls, publication_fd
+            if not injected and fd != snapshot.root_fd:
+                injected = True
+                publication_fd = fd
+                publication_close_calls += 1
                 original_close(fd)
                 raise OSError("synthetic descriptor close failure")
+            if fd == publication_fd:
+                publication_close_calls += 1
+                with suppress(OSError):
+                    original_close(fd)
+                return
             original_close(fd)
 
         monkeypatch.setattr("agentlab.phase7_inventory.os.close", fail_publication_close)
-        with pytest.raises(InventoryPublicationError, match="descriptor close failed"):
+        with pytest.raises(InventoryPublicationError, match="descriptor close failed") as raised:
             _publish_file_no_replace(
                 snapshot,
                 "outputs/published.json",
@@ -1768,6 +1778,8 @@ def test_descriptor_close_failure_rolls_back_committed_final_output(
                 "synthetic",
                 publication_parent=publication_parent,
             )
+        assert publication_close_calls == 1
+        assert isinstance(raised.value.__cause__, OSError)
         assert not (parent_path / "published.json").exists()
         assert not list(parent_path.glob(".published.json.phase7-*"))
     finally:
