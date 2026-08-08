@@ -46,6 +46,14 @@ publisherはstdinを`MAX_REQUEST_BYTES + 1`まで一度だけ読み、strict/can
 
 7A-4R2及び将来pilotともProvider、Gate、Replay、network、Live、Report／Public Suite再生成、新しいmodel fixingは0件である。crosswalk上のPhase 6 `9または10` Authority値を、pilot Request scopeの合計へ再解釈・変更しない。
 
+### Slice 7A-5R1 — Pilot 001 publication incident documentation
+
+`phase6-accepted-current-pilot-001`は、承認済みRequestとread-only input verificationが成功した後、Inventory JSONの公開中にexit `1`となった。Inventory JSONはpartial outputとして残ったが、Markdown／metadataがないためcomplete publication triadは成立していない。詳細なbytes／SHA、root状態、post-input verification、根本原因、remediation commit列は[Phase 7A Pilot 001 publication incident record](PHASE7A_PUBLICATION_INCIDENT_001.md)を正本とする。
+
+7A-5R1の修復では、入力snapshot用の完全directory identityをpublication parentへそのまま適用せず、publication専用の固定親FDを使う。親自身はdevice／inode／file type／modeで束縛し、publisher自身によるsize／mtime／ctimeの変化を置換判定に使わない。親のdescendantは固定FD起点で従来の完全snapshot identityを再検証し、output fileはfull identityで追跡する。final／stagingのowned cleanupは各対象を最後まで試行し、unlink後の残存を検出する。descriptor closeは試行前に管理参照を切り離し、close error後に同じFDを再closeしない。
+
+7A-5R1のimplementation reviewは承認済みである。ただしPilot 001は不完全公開として未完了であり、001 rootを再利用しない。次の作業は`phase6-accepted-current-pilot-002`のRequest Candidate Reconciliation Onlyであり、文書化commit後に確定した新しい最終HEAD、全input bytes／SHA、tree digestからRequestを再構築する。002 Request publisher、Inventory CLI、Pilot実行は別々の人間承認後に限る。accepted superseded、candidate、Authorityのない空directoryは引き続きこのPilotの対象外である。
+
 ## Slice 7A-4R3 — Historical Legacy Contract Remediation
 
 7A-4R3は、既存Historical ArtifactをRequestへ再収載する前のPhase 6／Phase 7共通契約修正である。実Artifact、Request、Inventory、Pilot、Provider、Gate、Replay、network、`.artifacts/phase7`には書き込まない。

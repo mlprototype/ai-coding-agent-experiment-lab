@@ -65,6 +65,16 @@ Phase 6固有のcall対応と9/10 Authority値との関係は、read-only declar
 
 Slice 7A-5のcurrent-only pilotは未実行であり、完了扱いではない。accepted superseded mirrorはownership-aware schemaを別途設計するまで未収載、Authorityがないcandidate／空directoryも未収載である。7A-4R2ではProvider、Gate、Replay、network、実Campaign、実Inventory、new model fixingをすべて0件とする。
 
+## Slice 7A-5R1 — Pilot 001 publication incident
+
+`phase6-accepted-current-pilot-001`は、承認済みRequestの検証とInventory JSONの生成までは成功したが、Markdown／metadataを含むcomplete publicationを成立させずexit `1`で終了した。根本原因、再発防止、保存方針は[Phase 7A Pilot 001 publication incident record](PHASE7A_PUBLICATION_INCIDENT_001.md)に固定する。
+
+- 001は`request.json`（承認済み入力）とpartial `evidence-inventory.json`（失敗証拠）だけを保持する。Markdown、metadata、hidden stagingは存在しない。
+- 001はcomplete triadでもaccepted Inventoryでもなく、再利用、削除、修復、補完、再実行を行わない。
+- 7A-5R1のpublication remediationは、publication専用の固定親FD、親のdevice／inode／type／mode identity、descendantの完全snapshot identity、output fileの完全identity、final／staging cleanup、unlink後の残存検出、descriptor closeの再試行禁止を含む。
+- 7A-5R1のimplementation reviewは承認済みだが、Slice 7A-5 Pilotは未完了である。次回は`phase6-accepted-current-pilot-002`として、文書化commit後の新しい最終HEADへRequestをモデルから再構築する。Request publisherとInventory実行は、それぞれ別の人間承認を要する。
+- Incident recordは非権威的なPhase 7 publication記録であり、Phase 6の9/10 Provider Authority、accepted release、Phase 6 status、current又はsupersessionを変更しない。
+
 ## Slice 7A-4R3 — Historical Legacy Contract Remediation
 
 Historical Artifactの再収載前には、Phase 6とPhase 7が同じcaller-owned byte snapshotを使う。Historical専用public facadeはPlan／Campaign schema `1.1`／`1.2`をstrict dispatchし、Campaign started eventのPlan SHA／planned run count／planned Provider call countを渡されたPlanへ内部bindingする。Historical Verification Recordを唯一のsource commit Authorityとして、Experiment ID、Recordの全SHA binding、legacy Campaign finished eventのProvider totalを返す。旧Workflow Report 1.0を含むHistorical Report JSONもtyped／canonical／duplicate-key拒否で検証する。
