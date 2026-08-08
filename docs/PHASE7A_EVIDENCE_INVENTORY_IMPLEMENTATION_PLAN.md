@@ -1,6 +1,6 @@
 # Phase 7A: Evidence Inventory & Retention Policy — 実装計画書
 
-**Status:** Slice 7A-1〜7A-4実装済み。Slice 7A-4R2および7A-4R3はreal Artifact contract remediationであり、real ArtifactのRequest生成／Inventory実行とPhase status変更は未実施。
+**Status:** Slice 7A-1〜7A-4実装済み。Slice 7A-4R2および7A-4R3のremediation後、`phase6-accepted-current-pilot-002` current-only real Artifact pilotを別承認で実行し、complete publicationとstrict verificationを完了した。accepted supersededを含むSlice 7A-5全体とPhase status変更は未実施。
 **対象branch:** `feature/phase7`
 **対象scope:** Phase 6の保存Artifactだけ
 **設計原則:** Catalogは新しいstatus正本ではなく、既存正本と保存Artifactの一致を検証して表示する、非権威的な派生成果物である。
@@ -36,13 +36,13 @@ publisherはstdinを`MAX_REQUEST_BYTES + 1`まで一度だけ読み、strict/can
 
 ### 7A-5 is not complete
 
-次の実行は**別の人間承認**を要するcurrent-only pilotであり、Phase 7A-5完了ではない。
+`phase6-accepted-current-pilot-002`は**別の人間承認**を経て実行されたcurrent-only pilotであり、成功したがPhase 7A-5全体の完了ではない。
 
-- Pilot IDは`phase6-accepted-current-pilot-001`のように対象を明示し、Phase 6全体Inventoryと誤認させない。
-- approved Request SHA、clean reviewed full HEAD、全入力のbytes／SHA／tree digestをpreflightで再観測し、leafが不存在のときだけRequestをcreate-onlyでprepareする。
-- 実行は一回だけ。exit `0`とexit `2`の両方で、Requestを含むpublic strict publication verifier、Markdown re-render、metadata hash/correlation、declared inputsのpost-checkを行う。exit `1`はcomplete publicationなしとして分離する。
-- post-checkは同じ共通snapshot verifierを使い、Requestのexpected bytes／SHA／treeに対するcall時一致を検証する。Phase 6 Artifactの別call間inode不変又はremote livenessは主張しない。
-- accepted supersededはmirror ownership schemaが未設計のため未収載、Authority不足のcandidate／空directoryも未収載対象として明記する。
+- Pilot IDは`phase6-accepted-current-pilot-002`として対象を明示し、Phase 6全体Inventoryと誤認させない。
+- approved Request SHA、clean reviewed full HEAD、全入力のbytes／SHA／tree digestをpreflightで再観測し、既存leafを再利用せずにRequestをcreate-onlyでprepareした。
+- Inventory CLIは一回だけ実行しexit `0`。pre／post input verification、Request bindingを含むpublic strict publication verifier、Markdown re-render、metadata hash／correlation／HEAD attestationをすべて検証した。
+- 成果物は`authoritative=false`であり、Release `1`、Campaign `3`、primary `2`、Provider `10 observed / 0 unknown`、`campaigns_without_total=0`、integrity verified `4`、Retention `local_only` `4`である。remote livenessは`not_checked`である。
+- Request／Inventory JSON／Markdown／metadataのbytes／SHAと、001 incident evidenceの保存状態は[Phase 7A Pilot 002 closeout](PHASE7A_PILOT_002_CLOSEOUT.md)に固定する。Pilot 001は再利用せず、accepted supersededはmirror ownership schemaが未設計のため未収載、Authority不足のcandidate／空directoryも未収載対象として明記する。
 
 7A-4R2及び将来pilotともProvider、Gate、Replay、network、Live、Report／Public Suite再生成、新しいmodel fixingは0件である。crosswalk上のPhase 6 `9または10` Authority値を、pilot Request scopeの合計へ再解釈・変更しない。
 
@@ -52,7 +52,31 @@ publisherはstdinを`MAX_REQUEST_BYTES + 1`まで一度だけ読み、strict/can
 
 7A-5R1の修復では、入力snapshot用の完全directory identityをpublication parentへそのまま適用せず、publication専用の固定親FDを使う。親自身はdevice／inode／file type／modeで束縛し、publisher自身によるsize／mtime／ctimeの変化を置換判定に使わない。親のdescendantは固定FD起点で従来の完全snapshot identityを再検証し、output fileはfull identityで追跡する。final／stagingのowned cleanupは各対象を最後まで試行し、unlink後の残存を検出する。descriptor closeは試行前に管理参照を切り離し、close error後に同じFDを再closeしない。
 
-7A-5R1のimplementation reviewは承認済みである。ただしPilot 001は不完全公開として未完了であり、001 rootを再利用しない。次の作業は`phase6-accepted-current-pilot-002`のRequest Candidate Reconciliation Onlyであり、文書化commit後に確定した新しい最終HEAD、全input bytes／SHA、tree digestからRequestを再構築する。002 Request publisher、Inventory CLI、Pilot実行は別々の人間承認後に限る。accepted superseded、candidate、Authorityのない空directoryは引き続きこのPilotの対象外である。
+7A-5R1のimplementation reviewは承認済みである。Pilot 001は不完全公開として未完了のincident evidenceであり、001 rootを再利用しない。その後の`phase6-accepted-current-pilot-002` current-only pilotは、別承認のRequest publisher／Inventory実行とcloseoutを完了した。accepted superseded、candidate、Authorityのない空directoryは引き続きこのPilotの対象外である。
+
+### Slice 7A-5 — Pilot 002 Current-Only Inventory Closeout
+
+`phase6-accepted-current-pilot-002`は、accepted-current Release 1件、Primary
+Campaign 2件、Manifest必須Historical Campaign 1件を対象にしたcurrent-only pilot
+である。Request publisher後、Inventory CLIを一回だけ実行し、exit `0`でcomplete
+publication triadを生成した。詳細な実行境界、bytes／SHA、strict publication
+reload、summary、Provider内訳、Retention、Pilot 001保存状態は[Phase 7A Pilot
+002 closeout](PHASE7A_PILOT_002_CLOSEOUT.md)に記録する。
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `request.json` | 20,278 | `38a0aa3aa16a13fa7b7b572b67fe0060844af920770ba6f2ad2e51348357fbb0` |
+| `evidence-inventory.json` | 29,348 | `c3db26f020b44b24a063a7299a7d615dfab281e938aedc9b7aded4f856e0cd6d` |
+| `evidence-inventory.md` | 2,417 | `546f9f417b2db279c080bbf1790d15cbc5834921efbfa5fd10e5d49d8da622f2` |
+| `evidence-inventory.metadata.json` | 677 | `5b4c9164135896fa387611497f7e2b213449264f11b44671802547b0f59137c4` |
+
+Inventoryは`authoritative=false`、`verified`、findings `0`であり、Release／Campaign
+全件が`present`／`verified`、Providerは`10 observed / 0 unknown`、Retentionは4件
+すべて`local_only`／`local_artifact_only`／`not_checked`である。この10件はRequestに
+宣言したCampaign集合の合計であり、Phase 6の`9または10` Provider Authorityを変更・
+再解釈しない。Pilot 002の成功だけでSlice 7A-5全体を完了扱いにせず、accepted
+supersededを含むmirror-aware Inventoryを次の設計課題とする。Authorityのない
+candidate／空directoryの扱いも未決定である。
 
 ## Slice 7A-4R3 — Historical Legacy Contract Remediation
 
@@ -477,4 +501,4 @@ Phase 7A CLIのsynthetic実行は`tmp_path`内だけで行い、0・2・1の各c
 
 ## 13. この計画の完了条件
 
-本計画に基づくSlice 7A-1〜7A-4の実装、synthetic検証、CLIのread-only契約確認は完了している。実Phase 6 Artifactに対するInventory生成（Slice 7A-5）は、別の人間承認後にのみ実施する。Catalogの結果によるPhase status、current、supersession、既存Artifactの更新は行わない。
+本計画に基づくSlice 7A-1〜7A-4の実装、synthetic検証、CLIのread-only契約確認は完了している。current-onlyのPilot 002は別の人間承認後に実施し、closeout文書へ固定したが、accepted supersededを含むSlice 7A-5全体は未完了である。Catalogの結果によるPhase status、current、supersession、既存Artifactの更新は行わない。

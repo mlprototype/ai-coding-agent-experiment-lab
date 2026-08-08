@@ -63,7 +63,7 @@ Provider accounting scopeは常に`declared_campaign_entries`である。各Camp
 
 Phase 6固有のcall対応と9/10 Authority値との関係は、read-only declarationである[Provider accounting crosswalk](PHASE7A_PHASE6_PROVIDER_ACCOUNTING_CROSSWALK.md)に固定する。crosswalkはPhase 6 status又は9/10 Authority accountingを変更しない。
 
-Slice 7A-5のcurrent-only pilotは未実行であり、完了扱いではない。accepted superseded mirrorはownership-aware schemaを別途設計するまで未収載、Authorityがないcandidate／空directoryも未収載である。7A-4R2ではProvider、Gate、Replay、network、実Campaign、実Inventory、new model fixingをすべて0件とする。
+Slice 7A-5の`phase6-accepted-current-pilot-002` current-only pilotは、別承認された一回の実行として成功し、complete publication triadとstrict verificationを成立させた。ただしcurrent-onlyのためSlice 7A-5全体は完了扱いではない。accepted superseded mirrorはownership-aware schemaを別途設計するまで未収載、Authorityがないcandidate／空directoryも未収載である。Pilot 002の詳細は[Current-Only Inventory closeout](PHASE7A_PILOT_002_CLOSEOUT.md)に固定する。
 
 ## Slice 7A-5R1 — Pilot 001 publication incident
 
@@ -72,8 +72,39 @@ Slice 7A-5のcurrent-only pilotは未実行であり、完了扱いではない�
 - 001は`request.json`（承認済み入力）とpartial `evidence-inventory.json`（失敗証拠）だけを保持する。Markdown、metadata、hidden stagingは存在しない。
 - 001はcomplete triadでもaccepted Inventoryでもなく、再利用、削除、修復、補完、再実行を行わない。
 - 7A-5R1のpublication remediationは、publication専用の固定親FD、親のdevice／inode／type／mode identity、descendantの完全snapshot identity、output fileの完全identity、final／staging cleanup、unlink後の残存検出、descriptor closeの再試行禁止を含む。
-- 7A-5R1のimplementation reviewは承認済みだが、Slice 7A-5 Pilotは未完了である。次回は`phase6-accepted-current-pilot-002`として、文書化commit後の新しい最終HEADへRequestをモデルから再構築する。Request publisherとInventory実行は、それぞれ別の人間承認を要する。
+- 7A-5R1のimplementation reviewは承認済みであり、その後の`phase6-accepted-current-pilot-002` current-only pilotもcloseout済みである。ただしaccepted supersededを含むSlice 7A-5全体は未完了である。
 - Incident recordは非権威的なPhase 7 publication記録であり、Phase 6の9/10 Provider Authority、accepted release、Phase 6 status、current又はsupersessionを変更しない。
+
+## Slice 7A-5 — Pilot 002 Current-Only Inventory Closeout
+
+`phase6-accepted-current-pilot-002`は、accepted-current Release 1件、primary
+Campaign 2件、Manifest必須のhistorical non-primary Campaign 1件だけを対象にした
+非権威的なcurrent-only pilotである。Request、Inventory JSON、Markdown、metadata
+のcomplete publication triadを一回のCLI実行（exit `0`）で生成し、public byte
+facadeによるstrict reload、pre／post input verification、Markdown再renderを
+成功させた。`authoritative=false`、verification statusは`verified`、findingsは
+`0`である。
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `request.json` | 20,278 | `38a0aa3aa16a13fa7b7b572b67fe0060844af920770ba6f2ad2e51348357fbb0` |
+| `evidence-inventory.json` | 29,348 | `c3db26f020b44b24a063a7299a7d615dfab281e938aedc9b7aded4f856e0cd6d` |
+| `evidence-inventory.md` | 2,417 | `546f9f417b2db279c080bbf1790d15cbc5834921efbfa5fd10e5d49d8da622f2` |
+| `evidence-inventory.metadata.json` | 677 | `5b4c9164135896fa387611497f7e2b213449264f11b44671802547b0f59137c4` |
+
+SummaryはRelease `1`、Campaign `3`、primary `2`、
+`provider_accounting_scope=declared_campaign_entries`、Provider `10 observed / 0
+unknown`、`campaigns_without_total=0`、storage present `4`、integrity verified
+`4`である。Campaign別ProviderはJava `2`、Python `2`、Historical `6`であり、
+Request-scoped合計であってPhase 6 project全体の`9または10` Authority値を変更・
+再解釈しない。Release 1件とCampaign 3件のRetentionはすべて
+`local_only`／`local_artifact_only`／`not_checked`である。
+
+Pilot 001はincomplete incident evidenceとして不変に保持する。Pilot 002は
+accepted supersededを含むmirror-aware Inventoryではなく、この成功だけでSlice
+7A-5全体を完了扱いにしない。次の設計課題はaccepted supersededのmirror-aware
+ownership契約であり、Authorityのないcandidate／空directoryの扱いも未決定である。
+全詳細は[Pilot 002 closeout](PHASE7A_PILOT_002_CLOSEOUT.md)に記録する。
 
 ## Slice 7A-4R3 — Historical Legacy Contract Remediation
 
